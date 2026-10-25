@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 확정 간호기록 JSON·PDF(로컬 실행 기본 경로)
+data/artifacts/

@@ -1,0 +1,14 @@
+.git
+.env
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+data
+data_sample
+docs
+tests
+*.docx
+*.pdf
+*.xlsx
+!forms/**/*.pdf

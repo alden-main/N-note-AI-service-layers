@@ -1,0 +1,27 @@
+[project]
+name = "n-note-ai-service-layers"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "alden-main", email = "alden@gkmain.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "files-to-prompt>=0.6",
+    "openai>=2.0.0",
+    "pypdf>=5.0",
+    "python-multipart>=0.0.20",
+    "reportlab>=4.2",
+    "uvicorn>=0.30.0",
+]
+
+[project.scripts]
+n-note-ai-service-layers = "n_note_ai_service_layers:main"
+n-note-synthetic-openai = "n_note_ai_service_layers.run_synthetic_openai:main"
+n-note-api = "n_note_ai_service_layers.api:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"

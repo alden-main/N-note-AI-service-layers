@@ -1,0 +1,24 @@
+services:
+  ai-service:
+    build: .
+    environment:
+      MCP_GATEWAY_URL: http://gateway:8080/mcp
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      OPENAI_STT_MODEL: ${OPENAI_STT_MODEL:-gpt-4o-transcribe}
+      OPENAI_DRAFT_MODEL: ${OPENAI_DRAFT_MODEL:-gpt-4o-mini}
+      # 운영 양식 7종 중 기본 양식과 활성화할 양식 목록(쉼표 구분, 비우면 전체)이다.
+      N_NOTE_DEFAULT_FORM: ${N_NOTE_DEFAULT_FORM:-nursing-daily-note}
+      N_NOTE_ENABLED_FORMS: ${N_NOTE_ENABLED_FORMS:-}
+    volumes:
+      - ./forms:/app/forms:ro
+      - n-note-artifacts:/var/lib/n-note/artifacts
+    networks:
+      - ai-gateway-network
+
+volumes:
+  n-note-artifacts:
+
+networks:
+  ai-gateway-network:
+    external: true
+    name: ai-gateway-network

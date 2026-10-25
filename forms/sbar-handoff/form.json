@@ -1,0 +1,55 @@
+{
+  "schema_id": "sbar-handoff",
+  "version": "sbar-handoff/v1",
+  "purpose": "SBAR_HANDOFF",
+  "title": "간호 인수인계(SBAR)",
+  "instructions": "근무 교대 인계 구술을 SBAR 구조로 정리한다. 병동에서 통용되는 약어(POD, NPO, I/O 등)는 그대로 둔다.",
+  "pdf": {},
+  "sections": [
+    {
+      "section_id": "situation",
+      "label": "S (Situation)",
+      "display_order": 1,
+      "fields": [
+        {"field_id": "s.patient_summary", "type": "text", "label": "기본정보", "required": true, "description": "병실, 성별/나이 등 구술된 기본정보", "display_order": 1},
+        {"field_id": "s.diagnosis", "type": "text", "label": "진단명", "required": true, "display_order": 2},
+        {"field_id": "s.operation", "type": "text", "label": "수술명·POD", "description": "수술명과 수술 후 경과일(POD)", "display_order": 3},
+        {"field_id": "s.admission_date", "type": "date", "label": "입원일", "display_order": 4},
+        {"field_id": "s.attending", "type": "text", "label": "담당의", "display_order": 5}
+      ]
+    },
+    {
+      "section_id": "background",
+      "label": "B (Background)",
+      "display_order": 2,
+      "fields": [
+        {"field_id": "b.history", "type": "text", "label": "과거력", "display_order": 1},
+        {"field_id": "b.allergy", "type": "text", "label": "알레르기", "display_order": 2},
+        {"field_id": "b.isolation", "type": "text", "label": "격리", "display_order": 3},
+        {"field_id": "b.code_status", "type": "text", "label": "Code status", "display_order": 4},
+        {"field_id": "b.caregiver", "type": "text", "label": "보호자", "display_order": 5}
+      ]
+    },
+    {
+      "section_id": "assessment",
+      "label": "A (Assessment)",
+      "display_order": 3,
+      "fields": [
+        {"field_id": "a.status", "type": "text", "label": "상태", "required": true, "description": "의식, V/S, 통증, I/O, 식이, 배설", "display_order": 1},
+        {"field_id": "a.treatment", "type": "text", "label": "치료·라인", "description": "투약, 수액, 배액관·카테터 등 라인", "display_order": 2},
+        {"field_id": "a.tests", "type": "text", "label": "검사", "display_order": 3},
+        {"field_id": "a.risk", "type": "text", "label": "위험사정", "description": "낙상·욕창 등 구술된 위험사정 결과", "display_order": 4}
+      ]
+    },
+    {
+      "section_id": "recommendation",
+      "label": "R (Recommendation)",
+      "display_order": 4,
+      "fields": [
+        {"field_id": "r.pending", "type": "text", "label": "미완료 항목", "display_order": 1},
+        {"field_id": "r.physician_check", "type": "text", "label": "의사 확인 필요", "display_order": 2},
+        {"field_id": "r.next_plan", "type": "text", "label": "다음 근무 계획", "required": true, "display_order": 3}
+      ]
+    }
+  ]
+}
