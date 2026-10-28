@@ -68,12 +68,9 @@ class OpenAiDraftGenerationAdapter:
         입력: ``payload``는 전사문과 사용 가능한 사실이고, ``schema``는 허용 필드를 정한다.
         출력: 검증된 구조화 응답을 변환한 ``DraftResult``이며, 잘못된 응답은 ``ValueError``를 발생시킨다.
         """
-        instructions = BASE_INSTRUCTIONS + f" The form is '{schema.display_title}'."
-        if schema.instructions:
-            instructions += " Form-specific instructions: " + schema.instructions
         request = {
             "model": self._model,
-            "instructions": instructions,
+            "instructions": self._instructions(schema),
             "input": json.dumps(payload, ensure_ascii=False),
             "text": {"format": self._output_format(schema)},
         }
@@ -83,12 +80,29 @@ class OpenAiDraftGenerationAdapter:
         response = self._client.responses.create(**request)
         if tools:
             response = self._run_tool_loop(response, request)
+        return self._draft_result(getattr(response, "output_text", None), schema)
+
+    @staticmethod
+    def _instructions(schema: FormSchema) -> str:
+        """공통 작성 지침에 양식 제목과 양식별 지침을 덧붙인다."""
+        instructions = BASE_INSTRUCTIONS + f" The form is '{schema.display_title}'."
+        if schema.instructions:
+            instructions += " Form-specific instructions: " + schema.instructions
+        return instructions
+
+    def _draft_result(self, output_text: Any, schema: FormSchema) -> DraftResult:
+        """구조화 응답 JSON을 검증하고 스키마의 LLM 허용 필드만 남긴다."""
         try:
-            parsed = json.loads(response.output_text)
-        except (AttributeError, TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("OpenAI response did not contain valid structured draft output") from exc
+            parsed = json.loads(output_text)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("LLM response did not contain valid structured draft output") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("structured draft output must be an object")
+        if "proposed_fields" not in parsed:
+            # 구조화 출력을 강제하지 못하는 서버에서 모델이 임의 구조를 내면 빈 초안으로 오인하지 않는다.
+            raise ValueError("structured draft output did not follow the draft schema")
         allowed = {field.field_id for field in schema.fields if field.llm_allowed}
-        proposed = parsed.get("proposed_fields", {})
+        proposed = parsed["proposed_fields"]
         if not isinstance(proposed, dict):
             raise ValueError("proposed_fields must be an object")
         evidence = parsed.get("evidence_refs", {})

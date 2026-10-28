@@ -14,7 +14,7 @@ class OpenAiSpeechToTextAdapter:
     입력: OpenAI 클라이언트와 사용할 모델명이다.
     출력: ``transcribe`` 호출 시 전사 텍스트와 언어 정보를 담은 ``Transcript``이다.
     """
-    def __init__(self, client: Any | None = None, model: str = "gpt-4o-transcribe", prompt: str | None = None) -> None:
+    def __init__(self, client: Any | None = None, model: str = "gpt-4o-transcribe", prompt: str | None = None, provider: str = "openai") -> None:
         if client is None:
             from openai import OpenAI
             client = OpenAI()
@@ -22,6 +22,8 @@ class OpenAiSpeechToTextAdapter:
         self._model = model
         # 병동 약어·의학용어 인식률을 높이기 위한 선택 문맥 힌트다(OPENAI_STT_PROMPT).
         self._prompt = prompt
+        # OpenAI 또는 OpenAI 호환 로컬 서버(vLLM Whisper 등)를 구분해 전사 결과에 남긴다.
+        self._provider = provider
 
     def transcribe(self, audio: AudioInput) -> Transcript:
         """음성 바이트를 전사하여 도메인 전사 결과로 반환한다.
@@ -39,4 +41,4 @@ class OpenAiSpeechToTextAdapter:
         response = self._client.audio.transcriptions.create(**request)
         languages = getattr(response, "languages", None) or []
         language = languages[0].code if languages and hasattr(languages[0], "code") else None
-        return Transcript(text=response.text, provider="openai", model=self._model, language=language)
+        return Transcript(text=response.text, provider=self._provider, model=self._model, language=language)

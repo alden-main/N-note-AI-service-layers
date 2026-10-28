@@ -15,12 +15,22 @@ from n_note_ai_service_layers.contracts.draft_review import (
     FinalizedNursingNote,
 )
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
+from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
 from n_note_ai_service_layers.services.audit import AuditTrail
 from n_note_ai_service_layers.services.draft_document import is_filled
+from n_note_ai_service_layers.services.numeric_verification import NumericVerifier
 
 
 class DraftAlreadyFinalized(ValueError):
     """확정된 초안을 다시 수정하거나 확정하려 할 때 발생한다."""
+
+
+class NumericReviewRequired(ValueError):
+    """출처에 없는 수치가 남아 있는데 확정자가 수치 확인을 표시하지 않았을 때 발생한다."""
+
+    def __init__(self, findings: tuple[NumericFinding, ...]) -> None:
+        super().__init__("numeric values not found in the transcript need confirmation")
+        self.findings = findings
 
 
 class InMemoryDraftReviewStore:
@@ -43,6 +53,8 @@ class InMemoryDraftReviewStore:
         candidates: tuple[DraftCandidate, ...] = (),
         patient_id: str | None = None,
         encounter_id: str | None = None,
+        numeric_sources: tuple[str, ...] = (),
+        reference_time: datetime | None = None,
     ) -> DraftReviewRecord:
         """초안 생성 결과를 첫 revision으로 저장한다.
 
@@ -53,7 +65,10 @@ class InMemoryDraftReviewStore:
         draft_id = str(uuid4())
         now = datetime.now(timezone.utc)
         initial = DraftRevision(draft_id, 1, dict(fields), {candidate_id: "pending" for candidate_id in candidate_ids}, "system", now)
-        record = DraftReviewRecord(draft_id, schema.schema_id, schema.version, transcript, candidate_ids, (initial,), candidates, patient_id, encounter_id)
+        record = DraftReviewRecord(
+            draft_id, schema.schema_id, schema.version, transcript, candidate_ids, (initial,), candidates, patient_id, encounter_id,
+            numeric_sources=numeric_sources or (transcript,), reference_time=reference_time,
+        )
         self.items[draft_id] = record
         self.audit.record(trace_id, "draft_created", schema.schema_id, schema.version)
         return record
@@ -136,10 +151,19 @@ class InMemoryDraftReviewStore:
         self.audit.record(trace_id, "draft_revised", schema.schema_id, schema.version)
         return updated
 
-    def finalize(self, draft_id: str, schema: FormSchema, finalized_by: str, trace_id: str) -> FinalizedNursingNote:
-        """최신 revision을 확정본으로 만든다. 필수 필드가 비어 있으면 확정하지 않는다.
+    def numeric_findings(self, record: DraftReviewRecord, schema: FormSchema) -> tuple[NumericFinding, ...]:
+        """최신 revision의 필드 값 중 출처(전사문·사실)에 없는 수치다."""
+        return NumericVerifier().check(schema, record.revisions[-1].fields, record.numeric_sources, record.reference_time)
 
-        입력: 초안 ID, 초안과 같은 template, 확정자와 추적 ID이다.
+    def finalize(
+        self, draft_id: str, schema: FormSchema, finalized_by: str, trace_id: str, numeric_review_confirmed: bool = False,
+    ) -> FinalizedNursingNote:
+        """최신 revision을 확정본으로 만든다.
+
+        필수 필드가 비어 있거나, 출처에 없는 수치가 남아 있는데 ``numeric_review_confirmed``가 아니면
+        확정하지 않는다. 확인한 수치는 확정본에 남긴다.
+
+        입력: 초안 ID, 초안과 같은 template, 확정자와 추적 ID, 수치 확인 여부이다.
         출력: 이후 수정할 수 없는 ``FinalizedNursingNote``이다.
         """
         record = self.get(draft_id)
@@ -153,11 +177,15 @@ class InMemoryDraftReviewStore:
         missing = [field.field_id for field in schema.fields if field.required and not is_filled(latest.fields.get(field.field_id))]
         if missing:
             raise ValueError("required fields are empty: " + ", ".join(missing))
+        numeric = self.numeric_findings(record, schema)
+        if numeric and not numeric_review_confirmed:
+            raise NumericReviewRequired(numeric)
         applied = {key: value for revision in record.revisions for key, value in revision.applied_suggestions.items()}
         note = FinalizedNursingNote(
             str(uuid4()), draft_id, latest.revision, schema.schema_id, schema.version, schema.display_title,
             record.patient_id, record.encounter_id, dict(latest.fields), dict(latest.candidate_decisions), applied,
             finalized_by, datetime.now(timezone.utc), trace_id,
+            tuple(f"{item.field_id}: {item.text}" for item in numeric),
         )
         self.items[draft_id] = replace(record, finalized_note_id=note.note_id)
         self.audit.record(trace_id, "draft_finalized", schema.schema_id, schema.version)

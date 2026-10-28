@@ -26,7 +26,7 @@ class TranscriptRedactionTests(unittest.TestCase):
 
         class Projector:
             def __init__(self): self.transcript = None
-            def project(self, snapshot, transcript, selected_schema, term_review_hints=()):
+            def project(self, snapshot, transcript, selected_schema, term_review_hints=(), reference_time=None):
                 self.transcript = transcript
                 return {"transcript": transcript}
 

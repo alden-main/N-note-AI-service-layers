@@ -62,6 +62,9 @@ class DraftReviewRecord:
     patient_id: str | None = None
     encounter_id: str | None = None
     finalized_note_id: str | None = None
+    # 수치 대조 출처(전사문·사실)와 구술 기준 시각이다. revision마다 최신 필드 값으로 다시 대조한다.
+    numeric_sources: tuple[str, ...] = ()
+    reference_time: datetime | None = None
 
     def candidate(self, candidate_id: str) -> DraftCandidate | None:
         return next((item for item in self.candidates if item.candidate_id == candidate_id), None)
@@ -84,6 +87,8 @@ class FinalizedNursingNote:
     finalized_by: str
     finalized_at: datetime
     trace_id: str
+    # 출처에 없지만 확정자가 확인하고 남긴 수치("필드 ID: 값")다.
+    confirmed_numeric_findings: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +106,7 @@ class FinalizedNursingNote:
             "finalized_by": self.finalized_by,
             "finalized_at": self.finalized_at.isoformat(),
             "trace_id": self.trace_id,
+            "confirmed_numeric_findings": list(self.confirmed_numeric_findings),
         }
 
     @classmethod
@@ -110,4 +116,5 @@ class FinalizedNursingNote:
             raw["form_title"], raw.get("patient_id"), raw.get("encounter_id"), dict(raw["fields"]),
             dict(raw["candidate_decisions"]), dict(raw.get("applied_suggestions", {})), raw["finalized_by"],
             datetime.fromisoformat(raw["finalized_at"]), raw["trace_id"],
+            tuple(raw.get("confirmed_numeric_findings", ())),
         )

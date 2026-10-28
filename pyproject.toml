@@ -21,6 +21,7 @@ dependencies = [
 n-note-ai-service-layers = "n_note_ai_service_layers:main"
 n-note-synthetic-openai = "n_note_ai_service_layers.run_synthetic_openai:main"
 n-note-api = "n_note_ai_service_layers.api:main"
+n-note-model-eval = "n_note_ai_service_layers.run_model_eval:main"
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]

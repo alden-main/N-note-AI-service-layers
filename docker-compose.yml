@@ -1,19 +1,93 @@
+# 기본 실행은 ai-service만 띄우고 STT·LLM은 OpenAI API를 사용한다(SaaS).
+# 로컬 모델(온프레미스·폐쇄망)은 deploy/models/<profile>.env를 함께 지정하면 local-stt·local-llm을 띄운다.
+#   scripts/compose-model.sh medgemma-27b up -d
+x-vllm: &vllm
+  ipc: host
+  environment:
+    # gated 모델(MedGemma 등) 다운로드용이다. 폐쇄망에서는 미리 받은 캐시만 쓰도록 HF_HUB_OFFLINE=1로 둔다.
+    HF_TOKEN: ${HF_TOKEN:-}
+    HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+  volumes:
+    - ${N_NOTE_MODEL_CACHE:-./model-cache}:/root/.cache/huggingface
+  networks:
+    - ai-gateway-network
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 900s
+  restart: unless-stopped
+
 services:
   ai-service:
     build: .
     environment:
       MCP_GATEWAY_URL: http://gateway:8080/mcp
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
-      OPENAI_STT_MODEL: ${OPENAI_STT_MODEL:-gpt-4o-transcribe}
-      OPENAI_DRAFT_MODEL: ${OPENAI_DRAFT_MODEL:-gpt-4o-mini}
+      # OpenAI API를 쓰는 경우에만 필요하다(로컬 모델만 쓰면 비워 둔다).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      N_NOTE_MODEL_PROFILE: ${N_NOTE_MODEL_PROFILE:-openai}
+      # STT·LLM 서버. base URL이 비어 있으면 OpenAI API를 사용한다.
+      N_NOTE_STT_BASE_URL: ${N_NOTE_STT_BASE_URL:-}
+      N_NOTE_STT_MODEL: ${N_NOTE_STT_MODEL:-${OPENAI_STT_MODEL:-gpt-4o-transcribe}}
+      N_NOTE_STT_PROMPT: ${N_NOTE_STT_PROMPT:-${OPENAI_STT_PROMPT:-}}
+      N_NOTE_LLM_BASE_URL: ${N_NOTE_LLM_BASE_URL:-}
+      N_NOTE_LLM_MODEL: ${N_NOTE_LLM_MODEL:-${OPENAI_DRAFT_MODEL:-gpt-4o-mini}}
+      N_NOTE_LLM_API: ${N_NOTE_LLM_API:-}
+      N_NOTE_LLM_TOOL_CALLING: ${N_NOTE_LLM_TOOL_CALLING:-true}
+      N_NOTE_LLM_EXTRA_BODY: ${N_NOTE_LLM_EXTRA_BODY:-}
+      N_NOTE_LLM_MAX_TOKENS: ${N_NOTE_LLM_MAX_TOKENS:-}
+      N_NOTE_LLM_TEMPERATURE: ${N_NOTE_LLM_TEMPERATURE:-}
       # 운영 양식 7종 중 기본 양식과 활성화할 양식 목록(쉼표 구분, 비우면 전체)이다.
       N_NOTE_DEFAULT_FORM: ${N_NOTE_DEFAULT_FORM:-nursing-daily-note}
       N_NOTE_ENABLED_FORMS: ${N_NOTE_ENABLED_FORMS:-}
     volumes:
       - ./forms:/app/forms:ro
       - n-note-artifacts:/var/lib/n-note/artifacts
+      # 모델 비교 평가 사례·결과(scripts/compose-model.sh <profile> run --rm ai-service ...)
+      - ./eval:/app/eval
     networks:
       - ai-gateway-network
+
+  # 로컬 Whisper 전사 서버(OpenAI 호환 /v1/audio/transcriptions)
+  local-stt:
+    <<: *vllm
+    profiles: ["local-stt"]
+    build:
+      context: deploy/models
+      dockerfile: stt.Dockerfile
+      args:
+        N_NOTE_VLLM_IMAGE: ${N_NOTE_VLLM_IMAGE:-vllm/vllm-openai:v0.31.0-cu129}
+        N_NOTE_VLLM_VERSION: ${N_NOTE_VLLM_VERSION:-0.31.0}
+    image: n-note-local-stt:${N_NOTE_VLLM_VERSION:-0.31.0}
+    command: >-
+      ${N_NOTE_LOCAL_STT_MODEL:-openai/whisper-large-v3-turbo}
+      --served-model-name ${N_NOTE_STT_MODEL:-whisper-large-v3-turbo}
+      --gpu-memory-utilization ${N_NOTE_LOCAL_STT_GPU_UTIL:-0.10}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${N_NOTE_STT_GPU:-0}"]
+              capabilities: [gpu]
+
+  # 로컬 초안 생성 LLM 서버(OpenAI 호환 /v1/chat/completions). 모델·인자는 프로필 env 파일이 정한다.
+  local-llm:
+    <<: *vllm
+    profiles: ["local-llm"]
+    image: ${N_NOTE_VLLM_IMAGE:-vllm/vllm-openai:v0.31.0-cu129}
+    command: >-
+      ${N_NOTE_LOCAL_LLM_MODEL:-google/medgemma-1.5-4b-it}
+      --served-model-name ${N_NOTE_LLM_MODEL:-local-llm}
+      ${N_NOTE_LOCAL_LLM_ARGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${N_NOTE_LLM_GPU:-0}"]
+              capabilities: [gpu]
 
 volumes:
   n-note-artifacts:

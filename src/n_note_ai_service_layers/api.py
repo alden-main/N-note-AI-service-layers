@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.form_definition_loader import FormDefinitionLoader
 from n_note_ai_service_layers.adapters.note_artifact_store import FileNursingNoteStore
+from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
 from n_note_ai_service_layers.adapters.pdf_renderer import NursingNotePdfRenderer, PdfConfigurationError
 from n_note_ai_service_layers.adapters.transcript_only_repository import TranscriptOnlyRepository
@@ -21,7 +22,6 @@ from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft_review import DraftCandidate, FinalizedNursingNote
 from n_note_ai_service_layers.contracts.report_validation import ReportValidationResult
 from n_note_ai_service_layers.settings import load_dotenv
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
 from n_note_ai_service_layers.adapters.synthetic_repository import SyntheticScenarioRepository
 from n_note_ai_service_layers.contracts.clinical_context import ClinicalContextQuery
 from n_note_ai_service_layers.policies.pressure_injury_schema import pressure_injury_poc_schema
@@ -36,7 +36,7 @@ from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClien
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
 from n_note_ai_service_layers.services.report_validation import FormReportValidationFlow
 from n_note_ai_service_layers.services.schema_review import FormSchemaRegistry, SchemaReviewService
-from n_note_ai_service_layers.services.draft_review import DraftAlreadyFinalized, InMemoryDraftReviewStore
+from n_note_ai_service_layers.services.draft_review import DraftAlreadyFinalized, InMemoryDraftReviewStore, NumericReviewRequired
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
 
 
@@ -142,6 +142,8 @@ class DraftFinalizeRequest(BaseModel):
     """최신 초안 revision을 확정하고 PDF를 생성하는 API 입력 모델이다."""
 
     finalized_by: str = Field(min_length=1)
+    # 전사문에 없는 초안 수치(numeric_verification.findings)를 확인했다는 표시다. 남아 있으면 필수다.
+    numeric_review_confirmed: bool = False
 
 
 class InMemoryHandoffStore:
@@ -183,9 +185,9 @@ app = FastAPI(title="N-note Bridge API", version="0.1.0")
 
 
 def get_speech_to_text_provider() -> OpenAiSpeechToTextAdapter:
-    """환경의 OpenAI 자격 증명으로 STT provider를 만든다."""
+    """설정한 STT 서버(OpenAI 또는 로컬 Whisper)로 STT provider를 만든다."""
     try:
-        return OpenAiSpeechToTextAdapter(model=os.getenv("OPENAI_STT_MODEL", "gpt-4o-transcribe"), prompt=os.getenv("OPENAI_STT_PROMPT") or None)
+        return model_providers.speech_to_text_provider()
     except Exception as exc:
         raise HTTPException(status_code=503, detail="speech transcription is not configured") from exc
 
@@ -225,11 +227,7 @@ def get_nursing_note_workflow(
     """Gateway를 유일한 외부 MCP 경계로 사용해 초안과 검토 artifact를 조립한다."""
     gateway = McpGatewayClient()
     try:
-        generator = OpenAiDraftGenerationAdapter(
-            gateway_client=gateway,
-            model=os.getenv("OPENAI_DRAFT_MODEL", "gpt-4o-mini"),
-            allowed_tool_names=settings.llm_tool_names(),
-        )
+        generator = model_providers.draft_generator(gateway)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="draft generation is not configured") from exc
     draft_flow = DraftGenerationFlow(stt, generator)
@@ -430,6 +428,18 @@ def _draft_candidates(*results) -> tuple[DraftCandidate, ...]:
     )
 
 
+def _numeric_verification_response(findings) -> dict[str, Any]:
+    """출처에 없는 초안 수치 목록이다. 비어 있지 않으면 확정 시 수치 확인이 필요하다."""
+    return {
+        "status": "needs_review" if findings else "ok",
+        "findings": [
+            {"finding_id": item.finding_id, "field_id": item.field_id, "start_offset": item.start_offset,
+             "end_offset": item.end_offset, "text": item.text, "reason": item.reason}
+            for item in findings
+        ],
+    }
+
+
 def _report_validation_response(result: ReportValidationResult) -> dict[str, Any]:
     return {
         "status": result.status,
@@ -508,6 +518,7 @@ def _draft_review_response(record) -> dict[str, Any]:
         "edited_by": latest.edited_by,
         "created_at": latest.created_at,
         "finalized_note_id": record.finalized_note_id,
+        "numeric_verification": _numeric_verification_response(draft_review_store.numeric_findings(record, schema)),
     }
 
 
@@ -567,6 +578,8 @@ async def create_nursing_note_workflow(
         _draft_candidates(result.transcript_gateway_verification, result.draft_gateway_verification),
         patient_id,
         encounter_id,
+        result.numeric_sources,
+        result.reference_time,
     )
     return {
         "trace_id": trace_id, "auto_apply": False, "redacted": True, "redaction_count": result.redaction_count,
@@ -584,6 +597,7 @@ async def create_nursing_note_workflow(
         "transcript_verification": _gateway_verification_response(result.transcript_gateway_verification),
         "draft_verification": _gateway_verification_response(result.draft_gateway_verification),
         "report_validation": _report_validation_response(result.report_validation),
+        "numeric_verification": _numeric_verification_response(result.numeric_findings),
     }
 
 
@@ -641,11 +655,13 @@ def finalize_nursing_note_draft(
     try:
         current = draft_review_store.get(draft_id)
         schema = template_registry.get(current.schema_id, current.schema_version)
-        note = draft_review_store.finalize(draft_id, schema, request.finalized_by, x_trace_id or str(uuid4()))
+        note = draft_review_store.finalize(draft_id, schema, request.finalized_by, x_trace_id or str(uuid4()), request.numeric_review_confirmed)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="nursing note draft not found") from exc
     except DraftAlreadyFinalized as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NumericReviewRequired as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc), **_numeric_verification_response(exc.findings)}) from exc
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     note_store.save(note)

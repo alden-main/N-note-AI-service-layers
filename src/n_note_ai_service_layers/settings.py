@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 # LLM 초안 생성 중 호출을 허용하는 Gateway 읽기 전용 도구다. 제출·승인·이력 도구는
@@ -25,6 +27,92 @@ DEFAULT_PDF_FONT_CANDIDATES = (
     "/Library/Fonts/NanumGothic.ttf",
     "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
 )
+
+
+@dataclass(frozen=True)
+class ModelEndpoint:
+    """STT·LLM 모델 서버 접속 정보다. ``base_url``이 없으면 OpenAI API를 사용한다."""
+
+    model: str
+    base_url: str | None = None
+    api_key: str | None = None
+
+    @property
+    def provider(self) -> str:
+        return "openai-compatible" if self.base_url else "openai"
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    """빈 문자열을 미설정으로 취급한다(compose의 ``${VAR:-}`` 전달 대응)."""
+    value = os.getenv(name)
+    return value.strip() if value and value.strip() else default
+
+
+def stt_endpoint() -> ModelEndpoint:
+    """음성 전사 서버다. 로컬 Whisper(vLLM 등)는 ``N_NOTE_STT_BASE_URL``로 지정한다."""
+    return ModelEndpoint(
+        model=_env("N_NOTE_STT_MODEL") or _env("OPENAI_STT_MODEL", "gpt-4o-transcribe"),
+        base_url=_env("N_NOTE_STT_BASE_URL"),
+        api_key=_env("N_NOTE_STT_API_KEY"),
+    )
+
+
+def stt_prompt() -> str | None:
+    """병동 약어·의학용어 인식률을 높이는 STT 문맥 힌트다."""
+    return _env("N_NOTE_STT_PROMPT") or _env("OPENAI_STT_PROMPT")
+
+
+def llm_endpoint() -> ModelEndpoint:
+    """초안 생성 LLM 서버다. 로컬 모델(vLLM 등)은 ``N_NOTE_LLM_BASE_URL``로 지정한다."""
+    return ModelEndpoint(
+        model=_env("N_NOTE_LLM_MODEL") or _env("OPENAI_DRAFT_MODEL", "gpt-4o-mini"),
+        base_url=_env("N_NOTE_LLM_BASE_URL"),
+        api_key=_env("N_NOTE_LLM_API_KEY"),
+    )
+
+
+def llm_api() -> str:
+    """초안 생성에 쓸 API 형식이다: ``responses``(OpenAI) 또는 ``chat``(OpenAI 호환 서버).
+
+    로컬 서버의 Responses API 지원은 버전마다 달라, ``base_url``이 있으면 기본값을 ``chat``으로 둔다.
+    """
+    value = (_env("N_NOTE_LLM_API") or ("chat" if llm_endpoint().base_url else "responses")).lower()
+    if value not in {"responses", "chat"}:
+        raise ValueError("N_NOTE_LLM_API must be 'responses' or 'chat'")
+    return value
+
+
+def llm_tool_calling_enabled() -> bool:
+    """초안 생성 중 LLM의 사전 도구 호출 허용 여부다. tool call을 지원하지 않는 모델은 끈다."""
+    return (_env("N_NOTE_LLM_TOOL_CALLING", "true") or "true").lower() not in {"0", "false", "no", "off"}
+
+
+def llm_extra_body() -> dict:
+    """OpenAI 호환 서버에 그대로 전달할 추가 요청 필드(JSON)다. 예: thinking 끄기."""
+    raw = _env("N_NOTE_LLM_EXTRA_BODY")
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("N_NOTE_LLM_EXTRA_BODY must be a JSON object")
+    return value
+
+
+def llm_max_tokens() -> int | None:
+    """초안 생성 최대 출력 토큰 수다. 로컬 서버의 문맥 길이에 맞춰 제한한다."""
+    raw = _env("N_NOTE_LLM_MAX_TOKENS")
+    return int(raw) if raw else None
+
+
+def llm_temperature() -> float | None:
+    """초안 생성 temperature다. 미설정이면 서버 기본값을 쓴다."""
+    raw = _env("N_NOTE_LLM_TEMPERATURE")
+    return float(raw) if raw else None
+
+
+def model_profile() -> str | None:
+    """비교 평가 결과에 남길 모델 프로필 이름이다(``deploy/models/<profile>.env``)."""
+    return _env("N_NOTE_MODEL_PROFILE")
 
 
 def mcp_gateway_url() -> str:
