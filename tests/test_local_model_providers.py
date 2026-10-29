@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
-from n_note_ai_service_layers.adapters.openai_chat_draft_generation import FINAL_OUTPUT_INSTRUCTION, OpenAiChatDraftGenerationAdapter
+from n_note_ai_service_layers.adapters.openai_chat_draft_generation import FINAL_OUTPUT_INSTRUCTION, FINAL_TURN_INSTRUCTION, OpenAiChatDraftGenerationAdapter
 from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
 from n_note_ai_service_layers.policies.pressure_injury_schema import pressure_injury_poc_schema
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
@@ -108,11 +108,42 @@ class ChatDraftAdapterTests(unittest.TestCase):
         self.assertTrue(request["response_format"]["json_schema"]["strict"])
         self.assertEqual(request["extra_body"], {"top_k": 20})
         self.assertEqual(request["max_tokens"], 1024)
-        # Gemma chat template은 user 메시지 연속을 거부하므로 최종 지시를 같은 user 메시지에 합친다.
-        self.assertEqual([message["role"] for message in request["messages"]], ["system", "user"])
-        self.assertIn(FINAL_OUTPUT_INSTRUCTION, request["messages"][-1]["content"])
-        self.assertIn('"proposed_fields"', request["messages"][-1]["content"])
+        # 고정 지침·schema는 system에, 요청별 payload만 user에 둔다(prefix cache 적중, user 메시지 연속 없음).
+        system, user = request["messages"]
+        self.assertEqual((system["role"], user["role"]), ("system", "user"))
+        self.assertIn(FINAL_OUTPUT_INSTRUCTION, system["content"])
+        self.assertIn('"proposed_fields"', system["content"])
+        self.assertEqual(json.loads(user["content"]), {"transcript": "식사 절반 섭취"})
         self.assertNotIn("tools", request)
+
+    def test_system_prefix_is_identical_across_requests_for_the_same_form(self):
+        completions = _Completions(_completion(FINAL), _completion(FINAL))
+        adapter = OpenAiChatDraftGenerationAdapter(_client(completions), "m")
+        adapter.generate({"transcript": "a"}, pressure_injury_poc_schema())
+        adapter.generate({"transcript": "b"}, pressure_injury_poc_schema())
+        first, second = (request["messages"][0] for request in completions.requests)
+        self.assertEqual(first, second)
+
+    def test_schema_valid_answer_in_tool_phase_skips_the_structured_call(self):
+        answer = '```json\n{"proposed_fields":{"braden.nutrition":2},"evidence_refs":[{"field_id":"braden.nutrition","refs":["transcript"]}],"needs_confirmation":false}\n```'
+        completions = _Completions(_completion(answer))
+        adapter = OpenAiChatDraftGenerationAdapter(_client(completions), "qwen", gateway_client=McpGatewayClient(transport=_Gateway()))
+        result = adapter.generate({"transcript": "식사 절반"}, pressure_injury_poc_schema())
+        self.assertEqual(len(completions.requests), 1)
+        self.assertIn("tools", completions.requests[0])
+        self.assertEqual(result.proposed_fields, {"braden.nutrition": 2})
+        self.assertEqual(result.evidence_refs, {"braden.nutrition": ("transcript",)})
+
+    def test_schema_invalid_answer_in_tool_phase_falls_back_to_structured_call(self):
+        invalid = '{"proposed_fields":{"braden.nutrition":"2점"},"evidence_refs":[],"needs_confirmation":false}'
+        completions = _Completions(_completion(invalid), _completion(FINAL))
+        adapter = OpenAiChatDraftGenerationAdapter(_client(completions), "qwen", gateway_client=McpGatewayClient(transport=_Gateway()))
+        result = adapter.generate({"transcript": "식사 절반"}, pressure_injury_poc_schema())
+        self.assertEqual(len(completions.requests), 2)
+        self.assertIn("response_format", completions.requests[1])
+        # 버린 자유 형식 답은 최종 요청 대화에 넣지 않는다.
+        self.assertEqual([message["role"] for message in completions.requests[1]["messages"]], ["system", "user"])
+        self.assertEqual(result.proposed_fields, {"braden.nutrition": 2})
 
     def test_tool_phase_runs_before_structured_output(self):
         gateway = _Gateway()
@@ -128,6 +159,7 @@ class ChatDraftAdapterTests(unittest.TestCase):
         self.assertNotIn("tools", final)
         roles = [message["role"] for message in final["messages"]]
         self.assertEqual(roles, ["system", "user", "assistant", "tool", "user"])
+        self.assertEqual(final["messages"][-1]["content"], FINAL_TURN_INSTRUCTION)
         self.assertEqual(final["messages"][3]["tool_call_id"], "call-1")
 
     def test_server_without_tool_support_falls_back_to_hints_only(self):

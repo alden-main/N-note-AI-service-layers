@@ -55,6 +55,19 @@ class OpenAiAdapterTests(unittest.TestCase):
         self.assertEqual(responses.request["text"]["format"]["type"], "json_schema")
         self.assertNotIn("risk.level", result.proposed_fields)
 
+    def test_evidence_is_requested_only_for_filled_fields(self):
+        evidence = OpenAiDraftGenerationAdapter._output_format(pressure_injury_poc_schema(SchemaStatus.ACTIVE))["schema"]["properties"]["evidence_refs"]
+        self.assertEqual(evidence["type"], "array")
+        self.assertEqual(evidence["items"]["required"], ["field_id", "refs"])
+        self.assertNotIn("risk.level", evidence["items"]["properties"]["field_id"]["enum"])
+
+    def test_array_evidence_is_merged_by_field_and_filtered(self):
+        class Responses:
+            def create(self, **kwargs):
+                return SimpleNamespace(output_text='{"proposed_fields":{"braden.nutrition":2},"evidence_refs":[{"field_id":"braden.nutrition","refs":["transcript"]},{"field_id":"braden.nutrition","refs":["fact:f1"]},{"field_id":"risk.level","refs":["x"]}],"needs_confirmation":false}')
+        result = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=Responses())).generate({}, pressure_injury_poc_schema(SchemaStatus.ACTIVE))
+        self.assertEqual(result.evidence_refs, {"braden.nutrition": ("transcript", "fact:f1")})
+
     def test_provider_neutral_flow_connects_stt_to_draft_generation(self):
         class FakeStt:
             def transcribe(self, audio):

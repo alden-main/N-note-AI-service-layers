@@ -5,6 +5,11 @@ services:
     environment:
       # Station C의 STATIONC_MCP_GATEWAY_TIMEOUT(기본 15초)보다 작게 유지한다.
       GATEWAY_UPSTREAM_TIMEOUT_SECONDS: ${GATEWAY_UPSTREAM_TIMEOUT_SECONDS:-5}
+      # 성공한 health 확인을 재사용하는 시간(초)이다. 0이면 도구 호출마다 health를 확인한다.
+      GATEWAY_HEALTH_TTL_SECONDS: ${GATEWAY_HEALTH_TTL_SECONDS:-5}
+      # /v1/tools/batch-call 한 요청의 최대 호출 수와 Gateway 전체의 일괄 호출 동시 실행 수다.
+      GATEWAY_BATCH_MAX_CALLS: ${GATEWAY_BATCH_MAX_CALLS:-32}
+      GATEWAY_BATCH_MAX_CONCURRENCY: ${GATEWAY_BATCH_MAX_CONCURRENCY:-8}
     volumes:
       - ./config/upstreams.yaml:/app/config/upstreams.yaml:ro
     networks: [ai-gateway-network, mcp-gateway-network]

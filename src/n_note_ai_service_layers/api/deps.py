@@ -106,6 +106,7 @@ def get_nursing_note_workflow(
     return NursingNoteWorkflow(
         stt, generator, GatewayTermVerificationFlow(gateway),
         redactor=get_transcript_redactor(), report_validation=FormReportValidationFlow(gateway),
+        hint_budget_seconds=settings.term_hint_budget_seconds(),
     )
 
 

@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from n_note_ai_service_layers.services.json_schema import matches_schema
+
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 # Gateway의 일괄 도구 호출 경로다. MCP endpoint와 같은 host·접두 경로를 쓴다.
@@ -165,7 +167,7 @@ class McpGatewayClient:
         tool = next((item for item in self._catalog if item["name"] == name), None)
         if tool is None:
             raise McpGatewayProtocolError("tool is not in the current Gateway catalog")
-        if not isinstance(arguments, dict) or not _matches_schema(arguments, tool["inputSchema"]):
+        if not isinstance(arguments, dict) or not matches_schema(arguments, tool["inputSchema"]):
             raise McpGatewayProtocolError("tool arguments do not match the Gateway input schema")
 
     def _batch(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None) -> list[dict[str, Any] | McpGatewayError] | None:
@@ -308,33 +310,6 @@ def _tool_outcome(result: dict[str, Any]) -> dict[str, Any]:
         code, retryable = _tool_error_details(result)
         raise McpGatewayToolError(code, retryable)
     return result
-
-
-def _matches_schema(value: Any, schema: dict[str, Any]) -> bool:
-    """Small deterministic JSON Schema subset used by Gateway tool input schemas."""
-    if "anyOf" in schema:
-        return isinstance(schema["anyOf"], list) and any(_matches_schema(value, item) for item in schema["anyOf"] if isinstance(item, dict))
-    expected = schema.get("type")
-    type_matches = {
-        "object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str),
-        "integer": isinstance(value, int) and not isinstance(value, bool), "number": isinstance(value, (int, float)) and not isinstance(value, bool),
-        "boolean": isinstance(value, bool), "null": value is None,
-    }
-    if isinstance(expected, str) and not type_matches.get(expected, True):
-        return False
-    if "enum" in schema and value not in schema["enum"]:
-        return False
-    if isinstance(value, dict):
-        properties = schema.get("properties", {})
-        required = schema.get("required", [])
-        if not isinstance(properties, dict) or not isinstance(required, list) or any(key not in value for key in required):
-            return False
-        if schema.get("additionalProperties") is False and any(key not in properties for key in value):
-            return False
-        return all(not isinstance(properties.get(key), dict) or _matches_schema(item, properties[key]) for key, item in value.items())
-    if isinstance(value, list) and isinstance(schema.get("items"), dict):
-        return all(_matches_schema(item, schema["items"]) for item in value)
-    return True
 
 
 def _tool_error_details(result: dict[str, Any]) -> tuple[str, bool]:

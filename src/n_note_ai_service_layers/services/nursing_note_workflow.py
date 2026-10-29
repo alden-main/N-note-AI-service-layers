@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -59,6 +59,8 @@ class NursingNoteWorkflow:
 
     순서: STT → 비식별화 → 전사문 표준어·의학용어 검토 → 검토 힌트를 포함한 양식 초안 생성 →
     초안 수치 대조 → (초안 필드별 용어 검토 ∥ 보고서 검증 MCP의 양식 완결성 검증)이다.
+    전사문 검토가 ``hint_budget_seconds`` 안에 끝나지 않으면 힌트 없이 초안 생성을 시작하고, 검토 결과는
+    초안 생성 뒤에 받아 응답(검토 후보)에 담는다. Gateway 지연이 LLM 시작을 붙잡지 않게 하기 위해서다.
     어떤 후보도 자동 적용하지 않는다. STT·초안 생성 실패는 ``WorkflowStageError``이고,
     Gateway 실패는 ``unavailable`` 상태로 응답에 남긴다.
     """
@@ -71,6 +73,7 @@ class NursingNoteWorkflow:
         redactor: TranscriptRedactor | None = None,
         report_validation: FormReportValidationFlow | None = None,
         projector: LlmPayloadProjector | None = None,
+        hint_budget_seconds: float | None = None,
     ) -> None:
         self.stt = stt
         self.generator = generator
@@ -78,6 +81,8 @@ class NursingNoteWorkflow:
         self.redactor = redactor or TranscriptRedactor()
         self.report_validation = report_validation
         self.projector = projector or LlmPayloadProjector()
+        # None이면 전사문 검토가 끝날 때까지 기다린다.
+        self.hint_budget_seconds = hint_budget_seconds
 
     def generate(
         self, snapshot, audio: AudioInput, schema: FormSchema, known_identifiers: Iterable[str] = (),
@@ -103,22 +108,31 @@ class NursingNoteWorkflow:
         external_transcript = Transcript(redacted.text, transcript.provider, transcript.model, transcript.language)
         notify("transcript_term_review")
         catalog = self._discover(trace_id)
-        with stage(_logger, trace_id, "transcript_term_review") as metrics:
-            if catalog is None:
-                transcript_gateway = GatewayTermVerificationResult("transcript", "unavailable")
-            else:
-                transcript_gateway = self.gateway_verification.verify("transcript", external_transcript.text, trace_id, catalog)
-            metrics.update(status=transcript_gateway.status, candidates=len(transcript_gateway.occurrences))
-        reference_time = now_local()
-        hints = self.hints(transcript_gateway)
-        notify("draft_generation")
-        with stage(_logger, trace_id, "draft_generation", schema_id=schema.schema_id) as metrics:
-            try:
-                payload = self.projector.project(snapshot, external_transcript.text, schema, term_review_hints=hints, reference_time=reference_time)
-                draft = self.generator.generate(payload, schema)
-            except Exception as exc:
-                raise WorkflowStageError("draft_generation") from exc
-            metrics["fields"] = len(draft.proposed_fields)
+        review_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="transcript-review")
+        try:
+            review = self._start_transcript_review(review_pool, external_transcript.text, trace_id, catalog)
+            with stage(_logger, trace_id, "transcript_term_review") as metrics:
+                done, _ = wait([review], timeout=self.hint_budget_seconds)
+                hint_source = review.result() if done else None
+                metrics.update(
+                    status=hint_source.status if hint_source else "pending",
+                    candidates=len(hint_source.occurrences) if hint_source else 0,
+                    hints_deferred=not done,
+                )
+            reference_time = now_local()
+            hints = self.hints(hint_source) if hint_source else ()
+            notify("draft_generation")
+            with stage(_logger, trace_id, "draft_generation", schema_id=schema.schema_id) as metrics:
+                try:
+                    payload = self.projector.project(snapshot, external_transcript.text, schema, term_review_hints=hints, reference_time=reference_time)
+                    draft = self.generator.generate(payload, schema)
+                except Exception as exc:
+                    raise WorkflowStageError("draft_generation") from exc
+                metrics.update(fields=len(draft.proposed_fields), hints=len(hints))
+            # 힌트 대기 상한을 넘긴 검토도 화면의 검토 후보로는 필요하다. Gateway timeout 안에 끝난다.
+            transcript_gateway = review.result()
+        finally:
+            review_pool.shutdown(wait=False)
         sources = self.numeric_sources(external_transcript.text, payload)
         numeric_findings = NumericVerifier().check(schema, draft.proposed_fields, sources, reference_time)
         document = DraftDocument.build(schema, draft.proposed_fields)
@@ -131,6 +145,15 @@ class NursingNoteWorkflow:
             report_validation=validation, numeric_findings=numeric_findings, numeric_sources=sources, reference_time=reference_time,
             llm_applied_term_hints=self.applied_hints(hints, external_transcript.text, document.text),
         )
+
+    def _start_transcript_review(
+        self, pool: ThreadPoolExecutor, text: str, trace_id: str, catalog: tuple[dict[str, Any], ...] | None,
+    ) -> Future[GatewayTermVerificationResult]:
+        if catalog is None:
+            done: Future[GatewayTermVerificationResult] = Future()
+            done.set_result(GatewayTermVerificationResult("transcript", "unavailable"))
+            return done
+        return pool.submit(self.gateway_verification.verify, "transcript", text, trace_id, catalog)
 
     def _review_draft(
         self, schema: FormSchema, document: DraftDocument, trace_id: str, catalog: tuple[dict[str, Any], ...] | None,

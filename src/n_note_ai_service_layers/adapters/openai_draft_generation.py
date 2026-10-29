@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from n_note_ai_service_layers.contracts.draft import DraftResult
@@ -28,7 +29,8 @@ BASE_INSTRUCTIONS = (
     "Do not create risk scores, risk levels, diagnoses, or interventions that the transcript does not state. "
     "Never invent dates or times: resolve relative expressions such as '오후 2시' or '어제' against the payload's "
     "reference_time, and leave date/time fields null when the transcript states no time. "
-    "For each filled field, list evidence_refs such as 'transcript' or 'fact:<fact_id>'. "
+    "For each filled field only, add one evidence_refs item with its field_id and refs such as 'transcript' or "
+    "'fact:<fact_id>'; do not add items for null fields. "
     "Set needs_confirmation to true when any statement is uncertain."
 )
 
@@ -105,12 +107,10 @@ class OpenAiDraftGenerationAdapter:
         proposed = parsed["proposed_fields"]
         if not isinstance(proposed, dict):
             raise ValueError("proposed_fields must be an object")
-        evidence = parsed.get("evidence_refs", {})
-        if not isinstance(evidence, dict):
-            raise ValueError("evidence_refs must be an object")
+        evidence = _evidence_by_field(parsed.get("evidence_refs", []))
         return DraftResult(
             proposed_fields={key: value for key, value in proposed.items() if key in allowed and value is not None},
-            evidence_refs={key: tuple(str(item) for item in value) for key, value in evidence.items() if key in allowed and isinstance(value, list)},
+            evidence_refs={key: value for key, value in evidence.items() if key in allowed},
             needs_confirmation=bool(parsed.get("needs_confirmation", False)),
             model_version=self._model,
             prompt_version=self._prompt_version,
@@ -135,20 +135,39 @@ class OpenAiDraftGenerationAdapter:
             function_calls = [item for item in getattr(response, "output", []) if _value(item, "type") == "function_call"]
             if not function_calls:
                 return response
-            outputs: list[dict[str, str]] = []
-            for call in function_calls:
-                if calls >= self._max_tool_calls or time.monotonic() - started >= self._tool_timeout_seconds:
-                    result: dict[str, Any] = {"error": "tool_limit_reached"}
-                else:
-                    calls += 1
-                    result = self._call_gateway(_value(call, "name"), _value(call, "arguments"))
-                outputs.append({"type": "function_call_output", "call_id": str(_value(call, "call_id")), "output": json.dumps(result, ensure_ascii=False)})
+            results, calls = self._run_tool_calls([(_value(call, "name"), _value(call, "arguments")) for call in function_calls], started, calls)
+            outputs = [
+                {"type": "function_call_output", "call_id": str(_value(call, "call_id")), "output": json.dumps(result, ensure_ascii=False)}
+                for call, result in zip(function_calls, results)
+            ]
             next_request = dict(request)
             next_request["input"] = outputs
             response_id = getattr(response, "id", None)
             if response_id:
                 next_request["previous_response_id"] = response_id
             response = self._client.responses.create(**next_request)
+
+    def _run_tool_calls(self, calls: list[tuple[Any, Any]], started: float, used: int) -> tuple[list[dict[str, Any]], int]:
+        """한 응답의 도구 호출을 상한(횟수·시간) 안에서 동시에 Gateway로 보낸다.
+
+        입력 순서대로 결과를 반환하고, 상한을 넘은 호출에는 ``tool_limit_reached``로 답한다.
+        두 번째 값은 지금까지 사용한 호출 수다.
+        """
+        results: list[dict[str, Any]] = [{"error": "tool_limit_reached"} for _ in calls]
+        permitted: list[int] = []
+        for index in range(len(calls)):
+            if used >= self._max_tool_calls or time.monotonic() - started >= self._tool_timeout_seconds:
+                break
+            used += 1
+            permitted.append(index)
+        if len(permitted) > 1:
+            with ThreadPoolExecutor(max_workers=min(len(permitted), 4), thread_name_prefix="llm-tool") as pool:
+                outcomes = list(pool.map(lambda index: self._call_gateway(*calls[index]), permitted))
+        else:
+            outcomes = [self._call_gateway(*calls[index]) for index in permitted]
+        for index, outcome in zip(permitted, outcomes):
+            results[index] = outcome
+        return results, used
 
     def _call_gateway(self, name: Any, raw_arguments: Any) -> dict[str, Any]:
         if not isinstance(name, str) or (self._allowed_tool_names is not None and name not in self._allowed_tool_names):
@@ -188,9 +207,16 @@ class OpenAiDraftGenerationAdapter:
             field.field_id: OpenAiDraftGenerationAdapter._value_schema(field)
             for field in allowed_fields
         }
-        evidence_schemas = {
-            field_id: {"type": "array", "items": {"type": "string"}}
-            for field_id in allowed
+        # 채운 필드의 근거만 배열로 받는다. 필드별 객체(모든 필드 필수)는 null 필드마다 빈 배열을 출력하게 해
+        # 출력 토큰이 필드 수에 비례해 늘어난다.
+        evidence_item = {
+            "type": "object",
+            "properties": {
+                "field_id": {"type": "string", "enum": allowed} if allowed else {"type": "string"},
+                "refs": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["field_id", "refs"],
+            "additionalProperties": False,
         }
         return {
             "type": "json_schema",
@@ -201,7 +227,7 @@ class OpenAiDraftGenerationAdapter:
                 "additionalProperties": False,
                 "properties": {
                     "proposed_fields": {"type": "object", "properties": value_schemas, "required": allowed, "additionalProperties": False},
-                    "evidence_refs": {"type": "object", "properties": evidence_schemas, "required": allowed, "additionalProperties": False},
+                    "evidence_refs": {"type": "array", "items": evidence_item},
                     "needs_confirmation": {"type": "boolean"},
                 },
                 "required": ["proposed_fields", "evidence_refs", "needs_confirmation"],
@@ -240,6 +266,21 @@ class OpenAiDraftGenerationAdapter:
         if kind == "object":
             return {"type": "object", "properties": {}, "additionalProperties": False}
         return {"type": kind}
+
+
+def _evidence_by_field(evidence: Any) -> dict[str, tuple[str, ...]]:
+    """``[{"field_id", "refs"}]``(현재 schema) 또는 ``{field_id: [refs]}``(구조화 출력을 강제하지 못한 서버)를 필드별 근거로 바꾼다."""
+    if isinstance(evidence, dict):
+        pairs = [(key, value) for key, value in evidence.items()]
+    elif isinstance(evidence, list):
+        pairs = [(item.get("field_id"), item.get("refs")) for item in evidence if isinstance(item, dict)]
+    else:
+        raise ValueError("evidence_refs must be an array or object")
+    merged: dict[str, tuple[str, ...]] = {}
+    for field_id, refs in pairs:
+        if isinstance(field_id, str) and isinstance(refs, list):
+            merged[field_id] = merged.get(field_id, ()) + tuple(str(item) for item in refs)
+    return merged
 
 
 def _value(item: Any, key: str) -> Any:

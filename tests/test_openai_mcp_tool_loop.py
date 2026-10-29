@@ -64,6 +64,45 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
         self.assertEqual(result.proposed_fields, {"braden.nutrition": 2})
         self.assertNotIn("tools", responses.requests[0])
 
+    def test_tool_calls_in_one_response_run_concurrently_and_keep_order(self):
+        import threading
+        barrier = threading.Barrier(2, timeout=2)
+
+        class SlowGateway(_Gateway):
+            def __call__(self, url, body, headers, timeout):
+                if b"tools/call" in body:
+                    barrier.wait()
+                return super().__call__(url, body, headers, timeout)
+
+        class Responses(_Responses):
+            def create(self, **kwargs):
+                self.requests.append(kwargs); self.number += 1
+                if self.number == 1:
+                    calls = [SimpleNamespace(type="function_call", name="dictionary__lookup", arguments=f'{{"term":"{term}"}}', call_id=f"call-{term}") for term in ("a", "b")]
+                    return SimpleNamespace(id="response-1", output=calls, output_text=None)
+                return SimpleNamespace(id="response-2", output=[], output_text='{"proposed_fields":{},"evidence_refs":[],"needs_confirmation":false}')
+
+        responses = Responses()
+        adapter = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=SlowGateway()))
+        adapter.generate({"facts": []}, pressure_injury_poc_schema())
+        self.assertEqual([item["call_id"] for item in responses.requests[1]["input"]], ["call-a", "call-b"])
+
+    def test_calls_beyond_the_limit_get_tool_limit_reached(self):
+        class Responses(_Responses):
+            def create(self, **kwargs):
+                self.requests.append(kwargs); self.number += 1
+                if self.number == 1:
+                    calls = [SimpleNamespace(type="function_call", name="dictionary__lookup", arguments='{"term":"x"}', call_id=f"call-{index}") for index in range(3)]
+                    return SimpleNamespace(id="response-1", output=calls, output_text=None)
+                return SimpleNamespace(id="response-2", output=[], output_text='{"proposed_fields":{},"evidence_refs":[],"needs_confirmation":false}')
+
+        gateway = _Gateway()
+        responses = Responses()
+        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), max_tool_calls=2).generate({"facts": []}, pressure_injury_poc_schema())
+        outputs = [item["output"] for item in responses.requests[1]["input"]]
+        self.assertEqual(len(gateway.called), 2)
+        self.assertEqual(outputs[2], '{"error": "tool_limit_reached"}')
+
 
 if __name__ == "__main__":
     unittest.main()

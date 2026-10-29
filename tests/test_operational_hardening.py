@@ -298,6 +298,44 @@ class WorkflowHintTrackingTests(unittest.TestCase):
         )
         self.assertEqual(result.llm_applied_term_hints, ({"source_text": "금새", "applied_text": "금세", "category": "standard_korean"},))
 
+    def test_slow_transcript_review_does_not_hold_back_draft_generation(self) -> None:
+        import threading
+        schema = FormSchema("t", "v1", "T", (FormSection("s", (FormField("note", "string"),)),), status=SchemaStatus.ACTIVE)
+        occurrence = GatewayTermOccurrence("transcript", "korean", 0, 2, "금새", "금새", (GatewaySuggestion("금세"),), category="standard_korean")
+        release = threading.Event()
+        seen: dict = {}
+
+        class Stt:
+            def transcribe(self, audio): return Transcript("금새 호전", "fake", "fake")
+
+        class Generator:
+            def generate(self, payload, schema):
+                seen["hints"] = payload["term_review_hints"]
+                release.set()  # 초안 생성이 끝나야 검토가 끝나므로, 검토를 기다렸다면 여기까지 오지 못한다.
+                return DraftResult({"note": "금새 호전됨"})
+
+        class Gateway:
+            class Client:
+                def discover(self, request_id): return ()
+            gateway = Client()
+            def verify(self, phase, text, trace_id, catalog=None):
+                release.wait(2)
+                return GatewayTermVerificationResult(phase, "ok", (occurrence,))
+            def verify_document(self, phase, document, trace_id, catalog=None):
+                return GatewayTermVerificationResult(phase, "ok")
+
+        class Projector(LlmPayloadProjector):
+            def project(self, snapshot, transcript, schema, term_review_hints=(), reference_time=None):
+                return {"transcript": transcript, "term_review_hints": list(term_review_hints)}
+
+        result = NursingNoteWorkflow(Stt(), Generator(), Gateway(), projector=Projector(), hint_budget_seconds=0.05).generate(
+            object(), AudioInput(b"a", "a.wav", "audio/wav", "trace"), schema,
+        )
+        self.assertEqual(seen["hints"], [])
+        # 힌트로는 못 썼지만 검토 후보는 응답에 남는다.
+        self.assertEqual(result.transcript_gateway_verification.occurrences, (occurrence,))
+        self.assertEqual(result.llm_applied_term_hints, ())
+
     def test_stt_failure_is_a_stage_error(self) -> None:
         class Stt:
             def transcribe(self, audio): raise TimeoutError("slow")

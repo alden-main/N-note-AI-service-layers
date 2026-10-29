@@ -48,6 +48,8 @@ services:
       N_NOTE_STT_TIMEOUT_SECONDS: ${N_NOTE_STT_TIMEOUT_SECONDS:-60}
       N_NOTE_LLM_TIMEOUT_SECONDS: ${N_NOTE_LLM_TIMEOUT_SECONDS:-90}
       N_NOTE_MODEL_MAX_RETRIES: ${N_NOTE_MODEL_MAX_RETRIES:-1}
+      # 전사문 용어 검토를 LLM 힌트로 쓰려고 기다리는 최대 시간(초)이다. 넘으면 힌트 없이 초안 생성을 시작한다.
+      N_NOTE_TERM_HINT_BUDGET_SECONDS: ${N_NOTE_TERM_HINT_BUDGET_SECONDS:-3}
       # 실환자 운영에서는 true로 둔다: 비식별화 전 원본 음성이 외부 OpenAI로 나가지 않게 로컬 STT만 허용한다.
       N_NOTE_REQUIRE_LOCAL_STT: ${N_NOTE_REQUIRE_LOCAL_STT:-false}
       N_NOTE_TIMEZONE: ${N_NOTE_TIMEZONE:-Asia/Seoul}

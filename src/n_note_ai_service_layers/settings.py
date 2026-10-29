@@ -100,6 +100,14 @@ def llm_timeout_seconds() -> float:
     return _positive_float("N_NOTE_LLM_TIMEOUT_SECONDS", 90.0)
 
 
+def term_hint_budget_seconds() -> float:
+    """전사문 용어 검토 결과를 LLM 힌트로 쓰려고 기다리는 최대 시간이다.
+
+    넘으면 힌트 없이 초안 생성을 시작한다(검토 후보는 초안 생성 뒤에 받아 응답에 담는다).
+    """
+    return _positive_float("N_NOTE_TERM_HINT_BUDGET_SECONDS", 3.0)
+
+
 def model_max_retries() -> int:
     """STT·LLM 요청의 SDK 재시도 횟수다. 재시도마다 제한 시간이 다시 적용된다."""
     return _non_negative_int("N_NOTE_MODEL_MAX_RETRIES", 1)
