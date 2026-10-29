@@ -10,18 +10,26 @@ import uuid
 from typing import Any
 
 from .config import configured_upstreams
-from .mcp import DEFAULT_UPSTREAM_TIMEOUT_SECONDS, GatewayCatalog, HttpTransport, PROTOCOL_VERSION
+from .mcp import DEFAULT_BATCH_MAX_CONCURRENCY, DEFAULT_UPSTREAM_TIMEOUT_SECONDS, GatewayCatalog, HttpTransport, PROTOCOL_VERSION
 
 
 DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_HEALTH_TTL_SECONDS = 5.0
+DEFAULT_BATCH_MAX_CALLS = 32
+BATCH_CALL_PATH = "/v1/tools/batch-call"
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
-    """단일 `/mcp` endpoint에서 MCP initialize, tools/list, tools/call을 처리한다."""
+    """`/mcp`에서 MCP initialize, tools/list, tools/call을, `/v1/tools/batch-call`에서 일괄 도구 호출을 처리한다."""
 
+    # keep-alive로 호출자(AI Service)가 연결을 재사용하게 한다. 모든 응답은 Content-Length를 보낸다.
+    protocol_version = "HTTP/1.1"
+    # 유휴 keep-alive 연결을 붙잡은 handler 스레드를 이 시간(초) 뒤 정리한다.
+    timeout = 60
     catalog: GatewayCatalog
     max_request_body_bytes = DEFAULT_MAX_REQUEST_BODY_BYTES
+    max_batch_calls = DEFAULT_BATCH_MAX_CALLS
 
     def do_GET(self) -> None:
         """Gateway readiness를 민감 정보 없이 `/healthz`로 제공한다."""
@@ -31,23 +39,47 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 
     def do_POST(self) -> None:
-        """MCP JSON-RPC 요청을 크기 제한 안에서 처리하고 request ID를 연결한다."""
+        """MCP JSON-RPC 또는 일괄 호출 요청을 크기 제한 안에서 처리하고 request ID를 연결한다."""
         request_id = self.headers.get("X-Request-ID") or str(uuid.uuid4())
-        if self.path != "/mcp":
+        if self.path not in ("/mcp", BATCH_CALL_PATH):
+            # 읽지 않은 본문이 다음 요청으로 해석되지 않게 연결을 닫는다.
+            self.close_connection = True
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain", request_id)
             return
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             if content_length < 0 or content_length > self.max_request_body_bytes:
-                self._send_tool_error(None, "request_too_large", "요청 본문이 Gateway 제한을 초과했습니다", request_id)
+                self.close_connection = True
+                if self.path == BATCH_CALL_PATH:
+                    self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, b'{"error":"request_too_large"}', "application/json", request_id)
+                else:
+                    self._send_tool_error(None, "request_too_large", "요청 본문이 Gateway 제한을 초과했습니다", request_id)
                 return
             body = json.loads(self.rfile.read(content_length).decode("utf-8"))
             if not isinstance(body, dict):
-                raise ValueError("JSON-RPC request는 객체여야 합니다")
+                raise ValueError("요청 본문은 객체여야 합니다")
+            if self.path == BATCH_CALL_PATH:
+                self._handle_batch(body, request_id)
+                return
             result = self._handle(body, request_id)
             self._send(HTTPStatus.OK, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json", request_id)
         except (ValueError, json.JSONDecodeError):
             self._send(HTTPStatus.BAD_REQUEST, b'{"error":"invalid JSON-RPC request"}', "application/json", request_id)
+
+    def _handle_batch(self, body: dict[str, Any], request_id: str) -> None:
+        """``{"calls": [{"name", "arguments"}, ...]}``를 동시에 중계하고 ``{"results": [...]}``를 입력 순서대로 반환한다.
+
+        각 result는 tools/call과 같은 MCP tool result 계약(감사 로그 포함)을 따른다.
+        """
+        calls = body.get("calls")
+        if not isinstance(calls, list) or not calls:
+            self._send(HTTPStatus.BAD_REQUEST, b'{"error":"calls must be a non-empty array"}', "application/json", request_id)
+            return
+        if len(calls) > self.max_batch_calls:
+            self._send(HTTPStatus.BAD_REQUEST, b'{"error":"too_many_calls"}', "application/json", request_id)
+            return
+        results = self.catalog.call_many(calls, request_id)
+        self._send(HTTPStatus.OK, json.dumps({"results": results}, ensure_ascii=False).encode("utf-8"), "application/json", request_id)
 
     def _handle(self, body: dict[str, Any], request_id: str) -> dict[str, Any]:
         """지원 MCP method를 JSON-RPC response로 변환한다.
@@ -87,6 +119,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         if request_id:
             self.send_header("X-Request-ID", request_id)
         self.end_headers()
@@ -151,10 +185,16 @@ def _demo_tools(service_id: str) -> list[dict[str, Any]]:
 
 def serve_gateway(port: int) -> None:
     """discovery를 수행한 Gateway HTTP 서버를 지정 port에서 실행한다."""
-    catalog = GatewayCatalog(configured_upstreams(), HttpTransport(_upstream_timeout_seconds()))
+    catalog = GatewayCatalog(
+        configured_upstreams(),
+        HttpTransport(_upstream_timeout_seconds()),
+        health_ttl_seconds=_non_negative_float("GATEWAY_HEALTH_TTL_SECONDS", DEFAULT_HEALTH_TTL_SECONDS),
+        batch_max_concurrency=_positive_int("GATEWAY_BATCH_MAX_CONCURRENCY", DEFAULT_BATCH_MAX_CONCURRENCY),
+    )
     catalog.discover_all()
     GatewayHandler.catalog = catalog
     GatewayHandler.max_request_body_bytes = _max_request_body_bytes()
+    GatewayHandler.max_batch_calls = _positive_int("GATEWAY_BATCH_MAX_CALLS", DEFAULT_BATCH_MAX_CALLS)
     ThreadingHTTPServer(("0.0.0.0", port), GatewayHandler).serve_forever()
 
 
@@ -168,6 +208,28 @@ def _max_request_body_bytes() -> int:
     if limit <= 0:
         raise ValueError("GATEWAY_MAX_REQUEST_BODY_BYTES는 양의 정수여야 합니다")
     return limit
+
+
+def _non_negative_float(name: str, default: float) -> float:
+    """환경 변수의 0 이상 실수 설정을 검증해 반환한다. 0이면 해당 캐시를 끈다."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError as error:
+        raise ValueError(f"{name}는 0 이상의 숫자여야 합니다") from error
+    if not value >= 0:
+        raise ValueError(f"{name}는 0 이상의 숫자여야 합니다")
+    return value
+
+
+def _positive_int(name: str, default: int) -> int:
+    """환경 변수의 양의 정수 설정을 검증해 반환한다."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as error:
+        raise ValueError(f"{name}는 양의 정수여야 합니다") from error
+    if value <= 0:
+        raise ValueError(f"{name}는 양의 정수여야 합니다")
+    return value
 
 
 def _upstream_timeout_seconds() -> float:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any
 
@@ -93,17 +92,9 @@ class GatewayTermVerificationFlow:
         return replace(result, occurrences=tuple(mapped))
 
     def _call_all(self, tasks: list[tuple[str, int, str]], request_id: str | None) -> list[dict[str, Any] | None]:
-        """도구·청크 호출을 동시에 보내고 입력 순서대로 결과(실패는 ``None``)를 반환한다."""
-        def call(task: tuple[str, int, str]) -> dict[str, Any] | None:
-            tool_name, _, chunk = task
-            try:
-                return self.gateway.call_tool(tool_name, {"text": chunk}, request_id)
-            except McpGatewayError:
-                return None
-        if len(tasks) <= 1 or self.max_concurrency <= 1:
-            return [call(task) for task in tasks]
-        with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(tasks)), thread_name_prefix="term-review") as pool:
-            return list(pool.map(call, tasks))
+        """도구·청크 호출을 Gateway 일괄 호출 한 번으로 보내고 입력 순서대로 결과(실패는 ``None``)를 반환한다."""
+        outcomes = self.gateway.call_tools([(tool_name, {"text": chunk}) for tool_name, _, chunk in tasks], request_id, self.max_concurrency)
+        return [None if isinstance(outcome, McpGatewayError) else outcome for outcome in outcomes]
 
     @staticmethod
     def _accepts_text(tool: dict[str, Any]) -> bool:

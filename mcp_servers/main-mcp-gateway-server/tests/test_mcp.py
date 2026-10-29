@@ -1,13 +1,15 @@
 """Gateway catalog의 discovery, 이름 변환, 장애 격리를 검증한다."""
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from main_mcp_gateway_server.config import UpstreamConfig, configured_upstreams
-from main_mcp_gateway_server.mcp import GatewayCatalog, McpResponse, PROTOCOL_VERSION
+from main_mcp_gateway_server.mcp import GatewayCatalog, HttpTransport, McpResponse, PROTOCOL_VERSION
 
 
 class FakeTransport:
@@ -20,11 +22,18 @@ class FakeTransport:
         self.tools = [{"name": "lookup", "description": "lookup tool", "inputSchema": {"type": "object"}}]
         self.tool_result: dict = {"structuredContent": {"source": "fake"}, "isError": False}
 
+        self.health_checks = 0
+        # tools/call마다 호출되는 선택 hook이다(동시성 검증용).
+        self.on_tool_call = None
+
     def healthy(self, url: str) -> bool:
+        self.health_checks += 1
         return self.health[url]
 
     def request_json(self, url: str, payload: dict, request_id: str | None = None, session_id: str | None = None) -> McpResponse:
         self.calls.append((url, payload, request_id, session_id))
+        if payload["method"] == "tools/call" and self.on_tool_call:
+            self.on_tool_call(payload)
         if payload["method"] == "initialize":
             return McpResponse({"result": {"protocolVersion": self.protocol_version}}, "session-from-initialize")
         if payload["method"] == "tools/list":
@@ -106,6 +115,154 @@ class GatewayCatalogTest(unittest.TestCase):
         failed = self.catalog.call("a__lookup", {})
         self.assertTrue(failed["isError"])
         self.assertEqual(json.loads(failed["content"][0]["text"])["error"]["code"], "internal_error")
+
+
+class GatewayConcurrencyTest(unittest.TestCase):
+    """도구 호출이 catalog 잠금에 줄 서지 않고, health 확인과 일괄 호출이 계약대로 동작하는지 확인한다."""
+
+    def _catalog(self, transport: FakeTransport, **options) -> GatewayCatalog:
+        catalog = GatewayCatalog((UpstreamConfig("a", "http://a/mcp", "http://a/healthz"), UpstreamConfig("b", "http://b/mcp", "http://b/healthz")), transport, **options)
+        catalog.discover_all()
+        return catalog
+
+    def test_tool_calls_run_concurrently(self) -> None:
+        """두 호출이 동시에 upstream에 머물 수 있어야 한다(직렬화되면 barrier가 깨진다)."""
+        transport = FakeTransport()
+        catalog = self._catalog(transport)
+        barrier = threading.Barrier(2, timeout=2)
+        transport.on_tool_call = lambda _: barrier.wait()
+        results: list[dict] = []
+        threads = [threading.Thread(target=lambda: results.append(catalog.call("a__lookup", {}))) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.get("isError") is False for result in results))
+
+    def test_discovery_does_not_block_calls(self) -> None:
+        """discovery가 upstream을 기다리는 동안에도 기존 catalog로 도구를 호출할 수 있다."""
+        transport = FakeTransport()
+        catalog = self._catalog(transport)
+        entered, release = threading.Event(), threading.Event()
+        original = transport.healthy
+
+        def slow_health(url: str) -> bool:
+            entered.set()
+            release.wait(2)
+            return original(url)
+
+        transport.healthy = slow_health
+        discovery = threading.Thread(target=catalog.discover_all)
+        discovery.start()
+        self.assertTrue(entered.wait(2))
+        transport.healthy = original
+        result = catalog.call("a__lookup", {})
+        release.set()
+        discovery.join()
+        self.assertFalse(result["isError"])
+
+    def test_health_result_is_cached_until_failure(self) -> None:
+        """health TTL 안에서는 호출마다 health를 확인하지 않고, upstream 호출이 실패하면 캐시를 버린다."""
+        transport = FakeTransport()
+        catalog = self._catalog(transport, health_ttl_seconds=60)
+        checks = transport.health_checks
+        catalog.call("a__lookup", {})
+        catalog.call("a__lookup", {})
+        self.assertEqual(transport.health_checks, checks)
+
+        def fail(_: dict) -> None:
+            raise OSError("down")
+
+        transport.on_tool_call = fail
+        self.assertTrue(catalog.call("a__lookup", {})["isError"])
+        transport.on_tool_call = None
+        catalog.call("a__lookup", {})
+        self.assertEqual(transport.health_checks, checks + 1)
+
+    def test_call_many_keeps_order_and_isolates_invalid_items(self) -> None:
+        """일괄 호출은 입력 순서를 유지하고 형식이 틀린 항목만 invalid_params로 만든다."""
+        transport = FakeTransport()
+        catalog = self._catalog(transport)
+        results = catalog.call_many(
+            [{"name": "a__lookup", "arguments": {}}, {"name": 3}, {"name": "missing__tool", "arguments": {}}, {"name": "b__lookup"}],
+            "batch-request",
+        )
+        codes = [result["structuredContent"].get("error", {}).get("code", "ok") for result in results]
+        self.assertEqual(codes, ["ok", "invalid_params", "not_found", "ok"])
+        forwarded = [item[2] for item in transport.calls if item[1]["method"] == "tools/call"]
+        self.assertEqual(forwarded, ["batch-request", "batch-request"])
+
+
+class _KeepAliveUpstream(BaseHTTPRequestHandler):
+    """연결 수를 세는 HTTP/1.1 upstream이다."""
+
+    protocol_version = "HTTP/1.1"
+    connections = 0
+    status = 200
+    body = b""
+    content_type = "application/json"
+
+    def setup(self) -> None:
+        type(self).connections += 1
+        super().setup()
+
+    def do_GET(self) -> None:
+        self._reply(200, b"ok", "text/plain")
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self._reply(self.status, self.body, self.content_type)
+
+    def _reply(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Mcp-Session-Id", "s-1")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class HttpTransportTest(unittest.TestCase):
+    """upstream keep-alive 재사용과 응답 해석을 실제 HTTP로 검증한다."""
+
+    def setUp(self) -> None:
+        handler = type("Upstream", (_KeepAliveUpstream,), {"connections": 0, "status": 200, "body": json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}).encode()})
+        self.handler = handler
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.transport = HttpTransport(timeout=2)
+
+    def tearDown(self) -> None:
+        self.transport.close()
+        self.server.shutdown()
+        self.thread.join()
+        self.server.server_close()
+
+    def test_reuses_connection_and_reads_session(self) -> None:
+        for _ in range(3):
+            response = self.transport.request_json(f"{self.url}/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call"})
+            self.assertEqual(response.body["result"], {"ok": True})
+            self.assertEqual(response.session_id, "s-1")
+        self.assertTrue(self.transport.healthy(f"{self.url}/healthz"))
+        self.assertEqual(self.handler.connections, 1)
+
+    def test_decodes_sse_response(self) -> None:
+        self.handler.content_type = "text/event-stream"
+        self.handler.body = b'event: message\ndata: {"jsonrpc": "2.0", "id": 1, "result": {"sse": true}}\n\n'
+        response = self.transport.request_json(f"{self.url}/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call"})
+        self.assertEqual(response.body["result"], {"sse": True})
+
+    def test_http_error_and_unreachable_upstream_raise_os_error(self) -> None:
+        self.handler.status = 404
+        with self.assertRaises(OSError):
+            self.transport.request_json(f"{self.url}/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call"})
+        self.assertFalse(HttpTransport(timeout=0.5).healthy("http://127.0.0.1:9/healthz"))
 
 
 class UpstreamConfigTest(unittest.TestCase):

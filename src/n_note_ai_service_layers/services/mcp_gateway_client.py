@@ -7,12 +7,15 @@ import json
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
+# Gateway의 일괄 도구 호출 경로다. MCP endpoint와 같은 host·접두 경로를 쓴다.
+BATCH_CALL_PATH = "/v1/tools/batch-call"
 HttpTransport = Callable[[str, bytes, Mapping[str, str], float], tuple[int, Mapping[str, str], bytes]]
 
 
@@ -50,6 +53,7 @@ class McpGatewayClient:
         timeout_seconds: float | None = None,
         transport: HttpTransport | None = None,
         catalog_ttl_seconds: float = 0.0,
+        batch_url: str | None = None,
     ) -> None:
         # Imported here to keep this transport module usable without app startup.
         from n_note_ai_service_layers.settings import mcp_gateway_timeout_seconds, mcp_gateway_url
@@ -62,6 +66,9 @@ class McpGatewayClient:
         self._catalog_lock = threading.Lock()
         # Keep-alive connection per worker thread (http.client connections are not thread-safe).
         self._connections = threading.local()
+        self._batch_url = batch_url or _batch_url(self._url)
+        # An older Gateway answers 404 for the batch path; fall back to one tools/call per item.
+        self._batch_supported = True
 
     @property
     def catalog(self) -> tuple[dict[str, Any], ...]:
@@ -124,16 +131,90 @@ class McpGatewayClient:
         ]
 
     def call_tool(self, name: str, arguments: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
+        self._check_call(name, arguments)
+        return _tool_outcome(self._request("tools/call", {"name": name, "arguments": arguments}, request_id))
+
+    def call_tools(
+        self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None = None, max_concurrency: int = 1,
+    ) -> list[dict[str, Any] | McpGatewayError]:
+        """Call several tools in one Gateway round trip and return results (or errors) in input order.
+
+        Calls that fail local catalog/schema checks never leave the process. The Gateway relays the
+        rest concurrently. Without batch support it falls back to ``call_tool`` with up to
+        ``max_concurrency`` parallel requests.
+        """
+        results: list[dict[str, Any] | McpGatewayError | None] = [None] * len(calls)
+        pending: list[int] = []
+        for index, (name, arguments) in enumerate(calls):
+            try:
+                self._check_call(name, arguments)
+            except McpGatewayError as exc:
+                results[index] = exc
+            else:
+                pending.append(index)
+        if pending:
+            selected = [calls[index] for index in pending]
+            outcomes = self._batch(selected, request_id) if self._batch_supported else None
+            if outcomes is None:
+                outcomes = self._each(selected, request_id, max_concurrency)
+            for index, outcome in zip(pending, outcomes):
+                results[index] = outcome
+        return results  # type: ignore[return-value]
+
+    def _check_call(self, name: str, arguments: Any) -> None:
         tool = next((item for item in self._catalog if item["name"] == name), None)
         if tool is None:
             raise McpGatewayProtocolError("tool is not in the current Gateway catalog")
         if not isinstance(arguments, dict) or not _matches_schema(arguments, tool["inputSchema"]):
             raise McpGatewayProtocolError("tool arguments do not match the Gateway input schema")
-        result = self._request("tools/call", {"name": name, "arguments": arguments}, request_id)
-        if result.get("isError") is True:
-            code, retryable = _tool_error_details(result)
-            raise McpGatewayToolError(code, retryable)
-        return result
+
+    def _batch(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None) -> list[dict[str, Any] | McpGatewayError] | None:
+        """POST the batch; ``None`` means this Gateway has no batch endpoint."""
+        trace_id = request_id or str(uuid.uuid4())
+        body = json.dumps({"calls": [{"name": name, "arguments": arguments} for name, arguments in calls]}).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Accept": "application/json", "X-Request-ID": trace_id}
+        try:
+            status, response_headers, raw = self._transport(self._batch_url, body, headers, self._timeout_seconds)
+        except (OSError, TimeoutError, http.client.HTTPException):
+            self.invalidate_catalog()
+            error = McpGatewayConnectionError("Gateway connection failed")
+            return [error for _ in calls]
+        if status == 404:
+            self._batch_supported = False
+            return None
+        try:
+            if status < 200 or status >= 300:
+                raise McpGatewayProtocolError(f"Gateway returned HTTP {status}")
+            if response_headers.get("X-Request-ID") not in (None, trace_id):
+                raise McpGatewayProtocolError("Gateway returned a mismatched request ID")
+            try:
+                items = json.loads(raw.decode("utf-8")).get("results")
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
+                raise McpGatewayProtocolError("Gateway returned invalid JSON") from exc
+            if not isinstance(items, list) or len(items) != len(calls):
+                raise McpGatewayProtocolError("Gateway batch result does not match the request")
+        except McpGatewayProtocolError as error:
+            return [error for _ in calls]
+        outcomes: list[dict[str, Any] | McpGatewayError] = []
+        for item in items:
+            try:
+                if not isinstance(item, dict):
+                    raise McpGatewayProtocolError("Gateway result must be an object")
+                outcomes.append(_tool_outcome(item))
+            except McpGatewayError as error:
+                outcomes.append(error)
+        return outcomes
+
+    def _each(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None, max_concurrency: int) -> list[dict[str, Any] | McpGatewayError]:
+        def call(item: tuple[str, dict[str, Any]]) -> dict[str, Any] | McpGatewayError:
+            try:
+                return self.call_tool(item[0], item[1], request_id)
+            except McpGatewayError as error:
+                return error
+        if len(calls) <= 1 or max_concurrency <= 1:
+            return [call(item) for item in calls]
+        with ThreadPoolExecutor(max_workers=min(max_concurrency, len(calls)), thread_name_prefix="gateway-call") as pool:
+            return list(pool.map(call, calls))
 
     def _request(self, method: str, params: dict[str, Any], request_id: str | None) -> dict[str, Any]:
         trace_id = request_id or str(uuid.uuid4())
@@ -212,6 +293,21 @@ class McpGatewayClient:
         if connection is not None:
             connection.close()
             self._connections.connection = None
+
+
+def _batch_url(mcp_url: str) -> str:
+    """``http://gateway:8080/mcp`` → ``http://gateway:8080/v1/tools/batch-call`` (keeping any path prefix)."""
+    parts = urlsplit(mcp_url)
+    prefix = parts.path.removesuffix("/").removesuffix("/mcp")
+    return urlunsplit((parts.scheme, parts.netloc, prefix + BATCH_CALL_PATH, "", ""))
+
+
+def _tool_outcome(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a successful tool result or raise its ``isError`` envelope as ``McpGatewayToolError``."""
+    if result.get("isError") is True:
+        code, retryable = _tool_error_details(result)
+        raise McpGatewayToolError(code, retryable)
+    return result
 
 
 def _matches_schema(value: Any, schema: dict[str, Any]) -> bool:

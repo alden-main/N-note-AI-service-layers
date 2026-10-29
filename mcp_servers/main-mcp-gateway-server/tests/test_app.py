@@ -1,5 +1,6 @@
 """Gateway HTTP endpoint의 MCP protocol 및 요청 크기 제한을 검증한다."""
 
+import http.client
 from http.server import ThreadingHTTPServer
 import json
 import os
@@ -29,6 +30,9 @@ class RecordingCatalog:
         """호출 기록을 남기고 계약에 맞는 성공 tool result를 반환한다."""
         self.calls.append((name, arguments, request_id))
         return {"structuredContent": {}, "isError": False}
+
+    def call_many(self, calls: list, request_id: str | None = None) -> list[dict]:
+        return [self.call(item["name"], item.get("arguments", {}), request_id) for item in calls]
 
 
 class GatewayHandlerTest(unittest.TestCase):
@@ -91,6 +95,46 @@ class GatewayHandlerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(response["result"]["isError"])
         self.assertEqual(self.catalog.calls, [("a__lookup", {}, "request-from-client")])
+
+    def _post_path(self, path: str, payload: dict) -> tuple[int, dict]:
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        try:
+            connection.request("POST", path, body=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "X-Request-ID": "batch-1"})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+
+    def test_batch_call_returns_results_in_order(self) -> None:
+        """일괄 호출은 각 도구 결과를 입력 순서대로 돌려주고 request ID를 유지한다."""
+        status, response = self._post_path("/v1/tools/batch-call", {"calls": [{"name": "a__one", "arguments": {}}, {"name": "b__two", "arguments": {"text": "x"}}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(response["results"]), 2)
+        self.assertEqual(self.catalog.calls, [("a__one", {}, "batch-1"), ("b__two", {"text": "x"}, "batch-1")])
+
+    def test_batch_call_rejects_empty_or_oversized_batches(self) -> None:
+        """빈 batch와 상한을 넘는 batch는 upstream 호출 없이 400이다."""
+        previous = GatewayHandler.max_batch_calls
+        GatewayHandler.max_batch_calls = 2
+        try:
+            self.assertEqual(self._post_path("/v1/tools/batch-call", {"calls": []})[0], 400)
+            calls = [{"name": "a__one", "arguments": {}}] * 3
+            self.assertEqual(self._post_path("/v1/tools/batch-call", {"calls": calls})[0], 400)
+        finally:
+            GatewayHandler.max_batch_calls = previous
+        self.assertEqual(self.catalog.calls, [])
+
+    def test_keep_alive_serves_multiple_requests_on_one_connection(self) -> None:
+        """호출자는 한 연결로 여러 MCP 요청을 보낼 수 있다."""
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        try:
+            for message_id in (1, 2):
+                connection.request("POST", "/mcp", body=json.dumps({"jsonrpc": "2.0", "id": message_id, "method": "tools/list", "params": {}}).encode(), headers={"Content-Type": "application/json"})
+                response = connection.getresponse()
+                self.assertEqual(json.loads(response.read())["id"], message_id)
+                self.assertFalse(response.will_close)
+        finally:
+            connection.close()
 
     def test_tools_list_refreshes_upstreams(self) -> None:
         """Gateway보다 늦게 준비된 upstream도 다음 tools/list에서 발견한다."""

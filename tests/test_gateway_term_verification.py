@@ -25,12 +25,25 @@ MEDICAL_SCHEMA = {
 class _Gateway:
     """Gateway가 upstream 결과를 그대로 중계하는 응답을 흉내 낸다."""
 
-    def __init__(self, results):
+    def __init__(self, results, batch=True):
         self.results = results
         self.calls = []
+        self.batch = batch
+        self.batch_requests = 0
+
+    def _tool(self, name, arguments):
+        self.calls.append((name, arguments["text"]))
+        return self.results[name](arguments["text"])
 
     def __call__(self, url, body, headers, timeout):
         message = json.loads(body)
+        if url.endswith("/v1/tools/batch-call"):
+            # 일괄 호출을 모르는 구버전 Gateway는 404를 반환한다.
+            if not self.batch:
+                return 404, {}, b"not found"
+            self.batch_requests += 1
+            results = [self._tool(item["name"], item["arguments"]) for item in message["calls"]]
+            return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps({"results": results}, ensure_ascii=False).encode()
         if message["method"] == "initialize":
             result = {"protocolVersion": "2025-06-18"}
         elif message["method"] == "tools/list":
@@ -40,9 +53,7 @@ class _Gateway:
                 {"name": "medical-term-review__submit_review_suggestions", "description": "submit", "inputSchema": {"type": "object", "properties": {"analysis_id": {"type": "string"}, "text": {"type": "string"}}, "required": ["analysis_id", "text"]}},
             ]}
         else:
-            name, text = message["params"]["name"], message["params"]["arguments"]["text"]
-            self.calls.append((name, text))
-            result = self.results[name](text)
+            result = self._tool(message["params"]["name"], message["params"]["arguments"])
         return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}, ensure_ascii=False).encode()
 
 
@@ -144,6 +155,33 @@ class GatewayTermVerificationTests(unittest.TestCase):
         result = self._flow(gateway, (KOREAN_TOOL,)).verify_document("draft", document)
         # 라벨("중재")의 후보는 필드 값이 아니므로 적용 대상에서 제외한다.
         self.assertEqual([(item.field_id, item.start_offset, item.end_offset) for item in result.occurrences], [("b", 0, 2)])
+
+    def test_review_calls_go_out_in_one_gateway_batch(self):
+        findings = lambda text: {"findings": [_finding(text, "금새", "금세")] if "금새" in text else []}
+        gateway = _Gateway({KOREAN_TOOL: _korean(findings), MEDICAL_TOOL: _medical(_no_candidates)})
+        result = self._flow(gateway, chunk_chars=4).verify("transcript", "금새\n확인 필요")
+        chunks = len(self._flow(gateway, chunk_chars=4)._chunks("금새\n확인 필요"))
+        self.assertGreater(chunks, 1)
+        self.assertEqual(gateway.batch_requests, 1)
+        self.assertEqual(len(gateway.calls), 2 * chunks)
+        self.assertEqual([item.input_text for item in result.occurrences], ["금새"])
+
+    def test_falls_back_to_single_calls_when_gateway_has_no_batch_endpoint(self):
+        gateway = _Gateway({KOREAN_TOOL: _korean(lambda text: {"findings": [_finding(text, "금새", "금세")]}), MEDICAL_TOOL: _medical(_no_candidates)}, batch=False)
+        flow = self._flow(gateway)
+        first = flow.verify("transcript", "금새 확인")
+        second = flow.verify("transcript", "금새 확인")
+        self.assertEqual(gateway.batch_requests, 0)
+        self.assertEqual(len(gateway.calls), 4)
+        self.assertEqual(first.occurrences, second.occurrences)
+        self.assertEqual(first.occurrences[0].suggestions[0].text, "금세")
+
+    def test_one_failed_tool_in_a_batch_keeps_the_other_candidates(self):
+        failed = lambda text: {"isError": True, "structuredContent": {"error": {"code": "upstream_unavailable", "message": "down", "retryable": True}}}
+        gateway = _Gateway({KOREAN_TOOL: _korean(lambda text: {"findings": [_finding(text, "금새", "금세")]}), MEDICAL_TOOL: failed})
+        result = self._flow(gateway).verify("transcript", "금새 확인")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([item.tool_name for item in result.occurrences], [KOREAN_TOOL])
 
 
 if __name__ == "__main__":
