@@ -17,6 +17,13 @@ dependencies = [
     "uvicorn>=0.30.0",
 ]
 
+[project.optional-dependencies]
+# 전사문 이름 비식별화용 로컬 한국어 NER(N_NOTE_NER_MODEL). 기본 이미지에는 넣지 않는다.
+ner = [
+    "transformers>=4.44",
+    "torch>=2.4",
+]
+
 [project.scripts]
 n-note-ai-service-layers = "n_note_ai_service_layers:main"
 n-note-synthetic-openai = "n_note_ai_service_layers.run_synthetic_openai:main"
@@ -26,3 +33,12 @@ n-note-model-eval = "n_note_ai_service_layers.run_model_eval:main"
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
+
+# NER용 torch는 CPU 빌드만 받는다(Linux 기본 wheel의 CUDA 의존성 수 GB를 피한다).
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

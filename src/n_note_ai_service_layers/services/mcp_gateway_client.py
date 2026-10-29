@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -36,13 +38,18 @@ class McpGatewayToolError(McpGatewayError):
 
 
 class McpGatewayClient:
-    """Call only the configured Gateway endpoint and cache its tool catalog in memory."""
+    """Call only the configured Gateway endpoint and cache its tool catalog in memory.
+
+    One instance is shared across requests and threads: the HTTP connection pool is
+    reused, and ``discover`` reuses the catalog for ``catalog_ttl_seconds`` (0 = always refresh).
+    """
 
     def __init__(
         self,
         url: str | None = None,
         timeout_seconds: float | None = None,
         transport: HttpTransport | None = None,
+        catalog_ttl_seconds: float = 0.0,
     ) -> None:
         # Imported here to keep this transport module usable without app startup.
         from n_note_ai_service_layers.settings import mcp_gateway_timeout_seconds, mcp_gateway_url
@@ -50,6 +57,11 @@ class McpGatewayClient:
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else mcp_gateway_timeout_seconds()
         self._transport = transport or self._http_post
         self._catalog: tuple[dict[str, Any], ...] = ()
+        self._catalog_ttl_seconds = catalog_ttl_seconds
+        self._catalog_loaded_at: float | None = None
+        self._catalog_lock = threading.Lock()
+        # Keep-alive connection per worker thread (http.client connections are not thread-safe).
+        self._connections = threading.local()
 
     @property
     def catalog(self) -> tuple[dict[str, Any], ...]:
@@ -70,10 +82,26 @@ class McpGatewayClient:
         return tuple(tools)
 
     def discover(self, request_id: str | None = None) -> tuple[dict[str, Any], ...]:
-        """Refresh the in-memory catalog after a successful initialize handshake."""
-        self.initialize(request_id)
-        self._catalog = self.list_tools(request_id)
-        return self._catalog
+        """Refresh the in-memory catalog after a successful initialize handshake.
+
+        A catalog younger than ``catalog_ttl_seconds`` is returned without a round trip.
+        """
+        with self._catalog_lock:
+            if self._catalog_fresh():
+                return self._catalog
+            self.initialize(request_id)
+            self._catalog = self.list_tools(request_id)
+            self._catalog_loaded_at = time.monotonic()
+            return self._catalog
+
+    def invalidate_catalog(self) -> None:
+        self._catalog_loaded_at = None
+
+    def _catalog_fresh(self) -> bool:
+        return (
+            self._catalog_ttl_seconds > 0 and self._catalog_loaded_at is not None
+            and time.monotonic() - self._catalog_loaded_at < self._catalog_ttl_seconds
+        )
 
     def model_tools(self, allowed_names: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         """Convert the current catalog to OpenAI function tools.
@@ -114,7 +142,10 @@ class McpGatewayClient:
         headers = {"Content-Type": "application/json", "Accept": "application/json", "X-Request-ID": trace_id}
         try:
             status, response_headers, raw = self._transport(self._url, body, headers, self._timeout_seconds)
-        except (OSError, URLError, TimeoutError) as exc:
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+            if method == "tools/call":
+                # The Gateway may have restarted with a different catalog.
+                self.invalidate_catalog()
             raise McpGatewayConnectionError("Gateway connection failed") from exc
         if status < 200 or status >= 300:
             raise McpGatewayProtocolError(f"Gateway returned HTTP {status}")
@@ -136,14 +167,51 @@ class McpGatewayClient:
     def _valid_tool(tool: Any) -> bool:
         return isinstance(tool, dict) and all(isinstance(tool.get(key), str) for key in ("name", "description")) and isinstance(tool.get("inputSchema"), dict)
 
-    @staticmethod
-    def _http_post(url: str, body: bytes, headers: Mapping[str, str], timeout: float) -> tuple[int, Mapping[str, str], bytes]:
-        request = Request(url, data=body, headers=dict(headers), method="POST")
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                return response.status, dict(response.headers.items()), response.read()
-        except HTTPError as exc:
-            return exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read()
+    def _http_post(self, url: str, body: bytes, headers: Mapping[str, str], timeout: float) -> tuple[int, Mapping[str, str], bytes]:
+        """POST over this thread's keep-alive connection, reconnecting once if the Gateway closed it.
+
+        Gateway tools are read-only, so resending after a dropped idle connection is safe.
+        """
+        parts = urlsplit(url)
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        for attempt in range(2):
+            try:
+                connection = self._connection(parts.scheme, parts.hostname or "", parts.port, timeout)
+                connection.request("POST", path, body=body, headers=dict(headers))
+                response = connection.getresponse()
+                payload = response.read()
+            except TimeoutError:
+                # A slow Gateway is not retried: that would double the caller's wait.
+                self._drop_connection()
+                raise
+            except (OSError, http.client.RemoteDisconnected, http.client.CannotSendRequest):
+                self._drop_connection()
+                if attempt:
+                    raise
+                continue
+            except Exception:
+                self._drop_connection()
+                raise
+            if response.will_close:
+                self._drop_connection()
+            return response.status, dict(response.getheaders()), payload
+        raise McpGatewayConnectionError("Gateway connection failed")
+
+    def _connection(self, scheme: str, host: str, port: int | None, timeout: float) -> http.client.HTTPConnection:
+        connection = getattr(self._connections, "connection", None)
+        if connection is None:
+            factory = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            connection = factory(host, port, timeout=timeout)
+            self._connections.connection = connection
+        elif connection.sock is not None:
+            connection.sock.settimeout(timeout)
+        return connection
+
+    def _drop_connection(self) -> None:
+        connection = getattr(self._connections, "connection", None)
+        if connection is not None:
+            connection.close()
+            self._connections.connection = None
 
 
 def _matches_schema(value: Any, schema: dict[str, Any]) -> bool:

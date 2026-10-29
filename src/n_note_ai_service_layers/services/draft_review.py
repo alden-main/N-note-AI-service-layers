@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
+
+from n_note_ai_service_layers.adapters.document_store import DocumentStore, InMemoryDocumentStore, VersionConflict
 
 from n_note_ai_service_layers.contracts.draft_review import (
     CandidateDecision,
@@ -33,15 +36,44 @@ class NumericReviewRequired(ValueError):
         self.findings = findings
 
 
-class InMemoryDraftReviewStore:
-    """개발 환경에서 확정 전 초안 revision을 메모리에 보관한다.
+class DraftRevisionConflict(ValueError):
+    """다른 사용자가 먼저 초안을 수정해, 요청이 기준으로 삼은 revision이 최신이 아니다."""
+
+
+DRAFT_COLLECTION = "drafts"
+
+
+class DraftReviewStore:
+    """확정 전 초안 revision을 문서 저장소(SQLite 또는 메모리)에 보관한다.
 
     입력: 초안 생성·수정·확정 요청과 활성 template이다.
-    출력: 사용자 편집과 후보 결정을 순서대로 담은 불변 revision과 확정본이며, 초안 자체는 영속 보관하지 않는다.
+    출력: 사용자 편집과 후보 결정을 순서대로 담은 불변 revision과 확정본이다.
+    동시 수정은 저장소 버전으로 거부하고(``DraftRevisionConflict``), 보관 기간이 지난 초안은 삭제한다.
     """
-    def __init__(self, audit: AuditTrail | None = None) -> None:
-        self.items: dict[str, DraftReviewRecord] = {}
+    def __init__(self, store: DocumentStore | None = None, audit: AuditTrail | None = None, retention_hours: float | None = None) -> None:
+        self.store = store or InMemoryDocumentStore()
         self.audit = audit or AuditTrail()
+        self.retention_hours = retention_hours
+
+    def clear(self) -> None:
+        self.store.clear(DRAFT_COLLECTION)
+
+    def _load(self, draft_id: str) -> tuple[DraftReviewRecord, int]:
+        stored = self.store.get(DRAFT_COLLECTION, draft_id)
+        if stored is None:
+            raise LookupError("draft not found")
+        return DraftReviewRecord.from_dict(stored.payload), stored.version
+
+    def _save(self, record: DraftReviewRecord, expected_version: int) -> None:
+        try:
+            self.store.put(DRAFT_COLLECTION, record.draft_id, record.as_dict(), expected_version=expected_version)
+        except VersionConflict as exc:
+            raise DraftRevisionConflict("draft was modified by another request; reload and retry") from exc
+
+    @staticmethod
+    def _check_expected(record: DraftReviewRecord, expected_revision: int | None) -> None:
+        if expected_revision is not None and record.latest_revision != expected_revision:
+            raise DraftRevisionConflict(f"draft is at revision {record.latest_revision}, not {expected_revision}; reload and retry")
 
     def create(
         self,
@@ -55,6 +87,7 @@ class InMemoryDraftReviewStore:
         encounter_id: str | None = None,
         numeric_sources: tuple[str, ...] = (),
         reference_time: datetime | None = None,
+        llm_applied_term_hints: tuple[dict[str, str], ...] = (),
     ) -> DraftReviewRecord:
         """초안 생성 결과를 첫 revision으로 저장한다.
 
@@ -68,17 +101,18 @@ class InMemoryDraftReviewStore:
         record = DraftReviewRecord(
             draft_id, schema.schema_id, schema.version, transcript, candidate_ids, (initial,), candidates, patient_id, encounter_id,
             numeric_sources=numeric_sources or (transcript,), reference_time=reference_time,
+            llm_applied_term_hints=llm_applied_term_hints, created_at=now,
         )
-        self.items[draft_id] = record
-        self.audit.record(trace_id, "draft_created", schema.schema_id, schema.version)
+        if self.retention_hours:
+            # 전사문·환자 ID가 담긴 초안을 무기한 보관하지 않는다.
+            self.store.purge_older_than(DRAFT_COLLECTION, time.time() - self.retention_hours * 3600)
+        self._save(record, expected_version=0)
+        self.audit.record(trace_id, "draft_created", schema.schema_id, schema.version, subject_id=draft_id)
         return record
 
     def get(self, draft_id: str) -> DraftReviewRecord:
         """초안 ID에 해당하는 검토 레코드를 반환한다."""
-        try:
-            return self.items[draft_id]
-        except KeyError as exc:
-            raise LookupError("draft not found") from exc
+        return self._load(draft_id)[0]
 
     def revise(
         self,
@@ -89,16 +123,19 @@ class InMemoryDraftReviewStore:
         edited_by: str,
         trace_id: str,
         selected_suggestions: dict[str, str] | None = None,
+        expected_revision: int | None = None,
     ) -> DraftReviewRecord:
         """후보 결정과 직접 편집을 다음 revision으로 추가한다.
 
         승인한 초안 후보는 선택한 제안어(없으면 첫 제안어)로 해당 필드 값의 원문 범위를 치환한다.
         직접 편집한 필드와 같은 필드의 후보를 함께 승인하거나, 원문 범위가 바뀐 후보를 승인하면 거부한다.
 
-        입력: 초안 ID, 활성 template, 변경할 필드·후보 결정·선택 제안어, 편집자와 추적 ID이다.
+        입력: 초안 ID, 활성 template, 변경할 필드·후보 결정·선택 제안어, 편집자와 추적 ID,
+        선택적인 기준 revision(다르면 ``DraftRevisionConflict``)이다.
         출력: 변경 후 전체 필드와 누적 결정을 가진 새 revision 레코드이다.
         """
-        record = self.get(draft_id)
+        record, version = self._load(draft_id)
+        self._check_expected(record, expected_revision)
         if record.finalized_note_id:
             raise DraftAlreadyFinalized("draft is already finalized")
         if (record.schema_id, record.schema_version) != (schema.schema_id, schema.version):
@@ -147,8 +184,8 @@ class InMemoryDraftReviewStore:
 
         revision = DraftRevision(draft_id, previous.revision + 1, fields, {**previous.candidate_decisions, **decisions}, edited_by, datetime.now(timezone.utc), applied)
         updated = replace(record, revisions=record.revisions + (revision,), candidates=tuple(candidates[item.candidate_id] for item in record.candidates))
-        self.items[draft_id] = updated
-        self.audit.record(trace_id, "draft_revised", schema.schema_id, schema.version)
+        self._save(updated, version)
+        self.audit.record(trace_id, "draft_revised", schema.schema_id, schema.version, actor=edited_by, subject_id=draft_id)
         return updated
 
     def numeric_findings(self, record: DraftReviewRecord, schema: FormSchema) -> tuple[NumericFinding, ...]:
@@ -157,6 +194,7 @@ class InMemoryDraftReviewStore:
 
     def finalize(
         self, draft_id: str, schema: FormSchema, finalized_by: str, trace_id: str, numeric_review_confirmed: bool = False,
+        expected_revision: int | None = None,
     ) -> FinalizedNursingNote:
         """최신 revision을 확정본으로 만든다.
 
@@ -166,9 +204,10 @@ class InMemoryDraftReviewStore:
         입력: 초안 ID, 초안과 같은 template, 확정자와 추적 ID, 수치 확인 여부이다.
         출력: 이후 수정할 수 없는 ``FinalizedNursingNote``이다.
         """
-        record = self.get(draft_id)
+        record, version = self._load(draft_id)
         if record.finalized_note_id:
             raise DraftAlreadyFinalized("draft is already finalized")
+        self._check_expected(record, expected_revision)
         if (record.schema_id, record.schema_version) != (schema.schema_id, schema.version):
             raise ValueError("draft template does not match active template")
         if not finalized_by:
@@ -186,9 +225,11 @@ class InMemoryDraftReviewStore:
             record.patient_id, record.encounter_id, dict(latest.fields), dict(latest.candidate_decisions), applied,
             finalized_by, datetime.now(timezone.utc), trace_id,
             tuple(f"{item.field_id}: {item.text}" for item in numeric),
+            record.llm_applied_term_hints,
         )
-        self.items[draft_id] = replace(record, finalized_note_id=note.note_id)
-        self.audit.record(trace_id, "draft_finalized", schema.schema_id, schema.version)
+        # 같은 초안을 두 요청이 동시에 확정하면 저장소 버전 검사로 하나만 성공한다.
+        self._save(replace(record, finalized_note_id=note.note_id), version)
+        self.audit.record(trace_id, "draft_finalized", schema.schema_id, schema.version, actor=finalized_by, subject_id=note.note_id)
         return note
 
     @staticmethod

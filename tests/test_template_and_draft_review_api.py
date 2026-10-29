@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -28,10 +29,21 @@ from n_note_ai_service_layers.contracts.term_verification import (
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflowResult
 
 
+
+def _job_result(client, accepted):
+    """비동기 초안 생성 작업(202)이 끝날 때까지 상태를 조회해 최종 작업을 반환한다."""
+    assert accepted.status_code == 202, accepted.text
+    for _ in range(500):
+        job = client.get(accepted.headers["Location"]).json()
+        if job["status"] in ("succeeded", "failed"):
+            return job
+        time.sleep(0.01)
+    raise AssertionError("workflow job did not finish")
+
 class TemplateAndDraftReviewApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
-        draft_review_store.items.clear()
+        draft_review_store.clear()
 
     def test_operator_can_register_approve_and_activate_a_versioned_template(self) -> None:
         payload = {
@@ -76,7 +88,7 @@ class TemplateAndDraftReviewApiTests(unittest.TestCase):
         occurrence = GatewayTermOccurrence("transcript", "korean__review", 0, 2, "금새", "금새", (GatewaySuggestion("금세"),))
 
         class Workflow:
-            def generate(self, snapshot, audio, selected_schema):
+            def generate(self, snapshot, audio, selected_schema, known_identifiers=(), progress=None):
                 return NursingNoteWorkflowResult(
                     Transcript("금새 확인", "fake", "fake-stt", "ko"),
                     DraftResult({"s.note": "초안"}),
@@ -94,8 +106,7 @@ class TemplateAndDraftReviewApiTests(unittest.TestCase):
             )
         finally:
             app.dependency_overrides.clear()
-        self.assertEqual(created.status_code, 200)
-        body = created.json()
+        body = _job_result(self.client, created)["result"]
         self.assertFalse(body["auto_apply"])
         self.assertEqual(body["draft"]["sections"][0]["fields"][0]["value"], "초안")
         candidate_id = body["transcript_verification"]["occurrences"][0]["candidate_id"]
@@ -123,7 +134,7 @@ class TemplateAndDraftReviewApiTests(unittest.TestCase):
         validation = ReportValidationResult("ok", (ReportValidationCriterion("section:nursing_process", "필수 항목", "satisfied"),), {"satisfied": 1}, "report-validation__evaluate_report_against_standard")
 
         class Workflow:
-            def generate(self, snapshot, audio, selected_schema):
+            def generate(self, snapshot, audio, selected_schema, known_identifiers=(), progress=None):
                 return NursingNoteWorkflowResult(
                     Transcript("통증은 없고 금새 잠듦", "fake", "fake-stt", "ko"),
                     DraftResult({"assessment": "통증 없음. 금새 입면함.", "plan_and_intervention": "수면 환경 조성함."}),
@@ -142,8 +153,7 @@ class TemplateAndDraftReviewApiTests(unittest.TestCase):
                     files={"audio": ("note.wav", b"audio", "audio/wav")},
                     data={"patient_id": "p-1", "encounter_id": "e-1", "schema_id": schema.schema_id},
                 )
-                self.assertEqual(created.status_code, 200, created.text)
-                body = created.json()
+                body = _job_result(self.client, created)["result"]
                 self.assertEqual(body["form"]["title"], "간호일지")
                 self.assertEqual(body["report_validation"]["criteria"][0]["status"], "satisfied")
                 assessment = next(field for section in body["draft"]["sections"] for field in section["fields"] if field["field_id"] == "assessment")

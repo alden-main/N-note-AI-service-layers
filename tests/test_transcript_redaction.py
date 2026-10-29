@@ -6,7 +6,6 @@ from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
-from n_note_ai_service_layers.services.draft_generation_flow import DraftGenerationFlow
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
 
@@ -48,7 +47,7 @@ class TranscriptRedactionTests(unittest.TestCase):
                 return GatewayTermVerificationResult(phase, "ok")
 
         projector, generator, gateway = Projector(), Generator(), Gateway()
-        workflow = NursingNoteWorkflow(DraftGenerationFlow(Stt(), generator, projector), gateway)
+        workflow = NursingNoteWorkflow(Stt(), generator, gateway, projector=projector)
         result = workflow.generate(object(), AudioInput(b"audio", "note.wav", "audio/wav", "trace"), schema)
         expected = "환자명: [[LABELED_PERSON_1]] 금새 확인"
         self.assertEqual(result.transcript.text, expected)

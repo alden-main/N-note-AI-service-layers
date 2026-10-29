@@ -12,7 +12,7 @@ from n_note_ai_service_layers.adapters.note_artifact_store import FileNursingNot
 from n_note_ai_service_layers.adapters.pdf_renderer import NursingNotePdfRenderer, PdfConfigurationError
 from n_note_ai_service_layers.contracts.draft_review import DraftCandidate, FinalizedNursingNote
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, PdfPlacement, SchemaStatus
-from n_note_ai_service_layers.services.draft_review import DraftAlreadyFinalized, InMemoryDraftReviewStore
+from n_note_ai_service_layers.services.draft_review import DraftAlreadyFinalized, DraftReviewStore
 from n_note_ai_service_layers.settings import pdf_font_path
 
 SCHEMA = FormSchema(
@@ -28,7 +28,7 @@ def _candidate(candidate_id, field_id, start, end, text, *suggestions):
 
 class DraftReviewTests(unittest.TestCase):
     def _store_with(self, fields, candidates):
-        store = InMemoryDraftReviewStore()
+        store = DraftReviewStore()
         record = store.create(SCHEMA, "전사문", fields, tuple(item.candidate_id for item in candidates), "trace", tuple(candidates), "patient-1", "encounter-1")
         return store, record
 

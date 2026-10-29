@@ -12,3 +12,4 @@ tests
 *.pdf
 *.xlsx
 !forms/**/*.pdf
+mcp_servers

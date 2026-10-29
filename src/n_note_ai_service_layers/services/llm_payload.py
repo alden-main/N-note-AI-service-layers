@@ -6,6 +6,7 @@ from datetime import datetime
 
 from n_note_ai_service_layers.contracts.clinical_context import Availability, ClinicalContextSnapshot
 from n_note_ai_service_layers.contracts.form_schema import FormSchema, SchemaStatus
+from n_note_ai_service_layers.services.clock import now_local
 
 
 class LlmPayloadProjector:
@@ -49,7 +50,7 @@ class LlmPayloadProjector:
             "schema_version": schema.version,
             "form_title": schema.display_title,
             # 구술 시점이다. '오후 2시' 같은 상대 표현의 날짜를 해석하는 기준으로만 쓴다.
-            "reference_time": (reference_time or datetime.now().astimezone()).isoformat(timespec="minutes"),
+            "reference_time": (reference_time or now_local()).isoformat(timespec="minutes"),
             "transcript": transcript,
             # Gateway가 전사문에서 찾은 표준어·의학용어 후보다. 전사문을 대체하지 않는다.
             "term_review_hints": list(term_review_hints),

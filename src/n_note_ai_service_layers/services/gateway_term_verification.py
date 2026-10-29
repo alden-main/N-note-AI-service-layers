@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any
 
@@ -29,11 +30,14 @@ class GatewayTermVerificationFlow:
     MAX_SUGGESTIONS = 10
     _PROTECTED_TOKEN = re.compile(r"\[\[[A-Z_]+_\d+\]\]")
 
-    def __init__(self, gateway: McpGatewayClient, tool_names: tuple[str, ...] | None = None, chunk_chars: int | None = None) -> None:
-        from n_note_ai_service_layers.settings import term_review_chunk_chars, term_review_tool_names
+    def __init__(
+        self, gateway: McpGatewayClient, tool_names: tuple[str, ...] | None = None, chunk_chars: int | None = None, max_concurrency: int | None = None,
+    ) -> None:
+        from n_note_ai_service_layers.settings import gateway_max_concurrency, term_review_chunk_chars, term_review_tool_names
         self.gateway = gateway
         self.tool_names = tool_names if tool_names is not None else term_review_tool_names()
         self.chunk_chars = chunk_chars or term_review_chunk_chars()
+        self.max_concurrency = max_concurrency or gateway_max_concurrency()
 
     def verify(self, phase: str, text: str, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> GatewayTermVerificationResult:
         """전사문 같은 단일 텍스트를 검토하고 원문 기준 offset 후보를 반환한다."""
@@ -50,21 +54,17 @@ class GatewayTermVerificationFlow:
         occurrences: list[GatewayTermOccurrence] = []
         known_words: list[tuple[int, int]] = []
         unsupported = unavailable = False
-        for tool in tools:
-            for offset, chunk in self._chunks(text):
-                if not chunk.strip():
-                    continue
-                try:
-                    result = self.gateway.call_tool(tool["name"], {"text": chunk}, request_id)
-                except McpGatewayError:
-                    unavailable = True
-                    continue
-                parsed = self._parse_result(result, phase, chunk, tool["name"])
-                if parsed is None:
-                    unsupported = True
-                    continue
-                occurrences.extend(replace(item, start_offset=item.start_offset + offset, end_offset=item.end_offset + offset) for item in parsed)
-                known_words.extend((start + offset, end + offset) for start, end in self._known_word_spans(result, chunk))
+        tasks = [(tool["name"], offset, chunk) for tool in tools for offset, chunk in self._chunks(text) if chunk.strip()]
+        for (tool_name, offset, chunk), result in zip(tasks, self._call_all(tasks, request_id)):
+            if result is None:
+                unavailable = True
+                continue
+            parsed = self._parse_result(result, phase, chunk, tool_name)
+            if parsed is None:
+                unsupported = True
+                continue
+            occurrences.extend(replace(item, start_offset=item.start_offset + offset, end_offset=item.end_offset + offset) for item in parsed)
+            known_words.extend((start + offset, end + offset) for start, end in self._known_word_spans(result, chunk))
         occurrences = [
             item for item in occurrences
             if not self._PROTECTED_TOKEN.search(item.input_text) and not self._ordinary_word_guess(item, known_words)
@@ -91,6 +91,19 @@ class GatewayTermVerificationFlow:
             span, start, end = located
             mapped.append(replace(item, start_offset=start, end_offset=end, field_id=span.field_id))
         return replace(result, occurrences=tuple(mapped))
+
+    def _call_all(self, tasks: list[tuple[str, int, str]], request_id: str | None) -> list[dict[str, Any] | None]:
+        """도구·청크 호출을 동시에 보내고 입력 순서대로 결과(실패는 ``None``)를 반환한다."""
+        def call(task: tuple[str, int, str]) -> dict[str, Any] | None:
+            tool_name, _, chunk = task
+            try:
+                return self.gateway.call_tool(tool_name, {"text": chunk}, request_id)
+            except McpGatewayError:
+                return None
+        if len(tasks) <= 1 or self.max_concurrency <= 1:
+            return [call(task) for task in tasks]
+        with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(tasks)), thread_name_prefix="term-review") as pool:
+            return list(pool.map(call, tasks))
 
     @staticmethod
     def _accepts_text(tool: dict[str, Any]) -> bool:

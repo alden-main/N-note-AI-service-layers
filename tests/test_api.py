@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from fastapi.testclient import TestClient
@@ -11,9 +12,20 @@ from n_note_ai_service_layers.policies.pressure_injury_schema import pressure_in
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflowResult
 
 
+
+def _job_result(client, accepted):
+    """비동기 초안 생성 작업(202)이 끝날 때까지 상태를 조회해 최종 작업을 반환한다."""
+    assert accepted.status_code == 202, accepted.text
+    for _ in range(500):
+        job = client.get(accepted.headers["Location"]).json()
+        if job["status"] in ("succeeded", "failed"):
+            return job
+        time.sleep(0.01)
+    raise AssertionError("workflow job did not finish")
+
 class BridgeApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        store.items.clear()
+        store.clear()
         self.client = TestClient(app)
 
     def test_healthz(self) -> None:
@@ -47,7 +59,7 @@ class BridgeApiTests(unittest.TestCase):
             def build(self, query): return object()
 
         class Workflow:
-            def generate(self, snapshot, audio, selected_schema):
+            def generate(self, snapshot, audio, selected_schema, known_identifiers=(), progress=None):
                 return NursingNoteWorkflowResult(
                     Transcript("금새 확인", "fake", "fake-stt", "ko"),
                     DraftResult({"braden.nutrition": 2}),
@@ -65,6 +77,7 @@ class BridgeApiTests(unittest.TestCase):
             )
         finally:
             app.dependency_overrides.clear()
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(response.json()["auto_apply"])
-        self.assertEqual(response.json()["transcript"]["text"], "금새 확인")
+        job = _job_result(self.client, response)
+        self.assertEqual(job["status"], "succeeded", job["error"])
+        self.assertFalse(job["result"]["auto_apply"])
+        self.assertEqual(job["result"]["transcript"]["text"], "금새 확인")

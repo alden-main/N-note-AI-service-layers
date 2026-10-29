@@ -1,0 +1,10 @@
+{
+  "version": "2026.10.1",
+  "rules": [
+    {"rule_id": "KR-ORTH-001", "source": "됬", "replacement": "됐", "source_reference": "국립국어원 표준국어대사전 표제어 대조 규칙", "tags": ["VV", "VA"], "confidence": 0.98},
+    {"rule_id": "KR-ORTH-002", "source": "되요", "replacement": "돼요", "source_reference": "국립국어원 표준국어대사전 표제어 대조 규칙", "tags": ["VV", "VA"], "confidence": 0.98},
+    {"rule_id": "KR-ORTH-003", "source": "몇일", "replacement": "며칠", "source_reference": "국립국어원 표준국어대사전 표제어 대조 규칙", "tags": ["N"], "confidence": 0.98},
+    {"rule_id": "KR-ORTH-004", "source": "왠만", "replacement": "웬만", "source_reference": "국립국어원 표준국어대사전 표제어 대조 규칙", "tags": ["M"], "confidence": 0.98},
+    {"rule_id": "KR-ORTH-005", "source": "금새", "replacement": "금세", "source_reference": "국립국어원 표준국어대사전 표제어 대조 규칙", "tags": ["MAG"], "confidence": 0.98}
+  ]
+}

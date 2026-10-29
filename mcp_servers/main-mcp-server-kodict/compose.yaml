@@ -1,0 +1,27 @@
+services:
+  korean-standard-dictionary:
+    build:
+      context: .
+    image: korean-standard-dictionary:${KODICT_IMAGE_TAG:-0.1.0}
+    environment:
+      KODICT_DATABASE_PATH: /app/data/korean_standard_dictionary.sqlite3
+      KODICT_MAX_CONCURRENT_REQUESTS: ${KODICT_MAX_CONCURRENT_REQUESTS:-4}
+      KODICT_MAX_FINDINGS: ${KODICT_MAX_FINDINGS:-1000}
+    volumes:
+      - ${KODICT_DATABASE_HOST_PATH:?KODICT_DATABASE_HOST_PATH is required}:/app/data/korean_standard_dictionary.sqlite3:ro
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - mcp-gateway-network
+    restart: unless-stopped
+
+networks:
+  mcp-gateway-network:
+    external: true
+    name: mcp-gateway-network

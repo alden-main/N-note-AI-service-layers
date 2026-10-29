@@ -1,0 +1,23 @@
+[project]
+name = "main-mcp-gateway-server"
+version = "0.1.0"
+description = "Docker internal-network MCP gateway"
+readme = "README.md"
+authors = [
+    { name = "alden-main", email = "alden@gkmain.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "files-to-prompt>=0.6",
+    "pyyaml>=6.0.3,<7.0",
+]
+
+[tool.uv]
+package = true
+
+[project.scripts]
+main-mcp-gateway-server = "main_mcp_gateway_server:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"

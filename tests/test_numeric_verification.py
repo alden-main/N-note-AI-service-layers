@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import time
 import unittest
 
 from fastapi.testclient import TestClient
@@ -10,7 +11,7 @@ from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
-from n_note_ai_service_layers.services.draft_review import InMemoryDraftReviewStore, NumericReviewRequired
+from n_note_ai_service_layers.services.draft_review import DraftReviewStore, NumericReviewRequired
 from n_note_ai_service_layers.services.numeric_verification import NumericVerifier, source_numbers
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflowResult
 
@@ -25,6 +26,17 @@ SCHEMA = FormSchema(
 def values(text: str) -> set[float]:
     return {float(item) for item in source_numbers([text])}
 
+
+
+def _job_result(client, accepted):
+    """비동기 초안 생성 작업(202)이 끝날 때까지 상태를 조회해 최종 작업을 반환한다."""
+    assert accepted.status_code == 202, accepted.text
+    for _ in range(500):
+        job = client.get(accepted.headers["Location"]).json()
+        if job["status"] in ("succeeded", "failed"):
+            return job
+        time.sleep(0.01)
+    raise AssertionError("workflow job did not finish")
 
 class SpokenNumberTests(unittest.TestCase):
     def test_sino_korean_numbers_and_decimals(self):
@@ -79,7 +91,7 @@ class NumericVerifierTests(unittest.TestCase):
 
 class NumericFinalizeTests(unittest.TestCase):
     def test_finalize_requires_confirmation_and_records_confirmed_values(self):
-        store = InMemoryDraftReviewStore()
+        store = DraftReviewStore()
         record = store.create(SCHEMA, "혈압은 백에 육십", {"assessment": "혈압 160/100"}, (), "t", numeric_sources=("혈압은 백에 육십",), reference_time=REFERENCE)
         with self.assertRaises(NumericReviewRequired) as raised:
             store.finalize(record.draft_id, SCHEMA, "nurse-1", "t")
@@ -89,7 +101,7 @@ class NumericFinalizeTests(unittest.TestCase):
         self.assertEqual(note.as_dict()["confirmed_numeric_findings"], ["assessment: 160"])
 
     def test_corrected_value_clears_the_finding(self):
-        store = InMemoryDraftReviewStore()
+        store = DraftReviewStore()
         record = store.create(SCHEMA, "혈압은 백에 육십", {"assessment": "혈압 160/100"}, (), "t", reference_time=REFERENCE)
         store.revise(record.draft_id, SCHEMA, {"assessment": "혈압 100/60"}, {}, "nurse-1", "t")
         self.assertEqual(store.numeric_findings(store.get(record.draft_id), SCHEMA), ())
@@ -101,7 +113,7 @@ class NumericApiTests(unittest.TestCase):
         if not any(item.schema_id == SCHEMA.schema_id for item in template_registry.list_versions()):
             template_registry.add(SCHEMA)
         client = TestClient(app)
-        draft_review_store.items.clear()
+        draft_review_store.clear()
 
         class Context:
             class Registry:
@@ -111,7 +123,7 @@ class NumericApiTests(unittest.TestCase):
             def build(self, query): return object()
 
         class Workflow:
-            def generate(self, snapshot, audio, selected_schema):
+            def generate(self, snapshot, audio, selected_schema, known_identifiers=(), progress=None):
                 findings = NumericVerifier().check(SCHEMA, {"assessment": "혈압 160/100"}, ["혈압은 백에 육십"], REFERENCE)
                 return NursingNoteWorkflowResult(
                     Transcript("혈압은 백에 육십", "fake", "fake-stt", "ko"),
@@ -131,8 +143,7 @@ class NumericApiTests(unittest.TestCase):
             )
         finally:
             app.dependency_overrides.clear()
-        self.assertEqual(created.status_code, 200, created.text)
-        body = created.json()
+        body = _job_result(client, created)["result"]
         self.assertEqual(body["numeric_verification"]["status"], "needs_review")
         self.assertEqual(body["numeric_verification"]["findings"][0]["text"], "160")
         draft = client.get(f"/v1/nursing-note-drafts/{body['draft_id']}").json()

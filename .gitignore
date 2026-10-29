@@ -219,3 +219,13 @@ __marimo__/
 
 # 확정 간호기록 JSON·PDF(로컬 실행 기본 경로)
 data/artifacts/
+eval/results/
+model-cache/
+
+# macOS
+.DS_Store
+
+# MCP 서버: 대용량 원본/런타임 데이터는 저장소에서 제외(로컬 디스크에는 유지)
+mcp_servers/main-mcp-server-kodict/koreandict_xlsx/
+mcp_servers/main-mcp-server-medicaldict/data/*.sqlite
+mcp_servers/main-mcp-server-medicaldict/data/dictionary-snapshots/snapshots/

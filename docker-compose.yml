@@ -21,7 +21,10 @@ x-vllm: &vllm
 
 services:
   ai-service:
-    build: .
+    build:
+      context: .
+      args:
+        N_NOTE_INSTALL_NER: ${N_NOTE_INSTALL_NER:-false}
     environment:
       MCP_GATEWAY_URL: http://gateway:8080/mcp
       # OpenAI API를 쓰는 경우에만 필요하다(로컬 모델만 쓰면 비워 둔다).
@@ -41,9 +44,37 @@ services:
       # 운영 양식 7종 중 기본 양식과 활성화할 양식 목록(쉼표 구분, 비우면 전체)이다.
       N_NOTE_DEFAULT_FORM: ${N_NOTE_DEFAULT_FORM:-nursing-daily-note}
       N_NOTE_ENABLED_FORMS: ${N_NOTE_ENABLED_FORMS:-}
+      # STT·LLM 요청 제한 시간(초)과 재시도 횟수다. SDK 기본값(600초·2회)은 요청을 수십 분 붙잡는다.
+      N_NOTE_STT_TIMEOUT_SECONDS: ${N_NOTE_STT_TIMEOUT_SECONDS:-60}
+      N_NOTE_LLM_TIMEOUT_SECONDS: ${N_NOTE_LLM_TIMEOUT_SECONDS:-90}
+      N_NOTE_MODEL_MAX_RETRIES: ${N_NOTE_MODEL_MAX_RETRIES:-1}
+      # 실환자 운영에서는 true로 둔다: 비식별화 전 원본 음성이 외부 OpenAI로 나가지 않게 로컬 STT만 허용한다.
+      N_NOTE_REQUIRE_LOCAL_STT: ${N_NOTE_REQUIRE_LOCAL_STT:-false}
+      N_NOTE_TIMEZONE: ${N_NOTE_TIMEZONE:-Asia/Seoul}
+      N_NOTE_WORKERS: ${N_NOTE_WORKERS:-2}
+      N_NOTE_DRAFT_RETENTION_HOURS: ${N_NOTE_DRAFT_RETENTION_HOURS:-72}
+      # 브리지·인증 프록시가 인증한 사용자 ID 헤더다. 운영에서는 필수(true)로 둔다.
+      N_NOTE_USER_HEADER: ${N_NOTE_USER_HEADER:-X-Authenticated-User}
+      N_NOTE_REQUIRE_AUTHENTICATED_USER: ${N_NOTE_REQUIRE_AUTHENTICATED_USER:-false}
+      MCP_GATEWAY_CATALOG_TTL_SECONDS: ${MCP_GATEWAY_CATALOG_TTL_SECONDS:-300}
+      N_NOTE_GATEWAY_MAX_CONCURRENCY: ${N_NOTE_GATEWAY_MAX_CONCURRENCY:-4}
+      # 초안 생성 비동기 작업: worker당 동시 실행 수·대기열 상한·멈춘 작업 판정 시간(초)이다.
+      N_NOTE_JOB_CONCURRENCY: ${N_NOTE_JOB_CONCURRENCY:-4}
+      N_NOTE_JOB_MAX_PENDING: ${N_NOTE_JOB_MAX_PENDING:-32}
+      N_NOTE_JOB_TIMEOUT_SECONDS: ${N_NOTE_JOB_TIMEOUT_SECONDS:-600}
+      # 로컬 NER 비식별화(N_NOTE_INSTALL_NER=true로 빌드). 비우면 규칙 기반만 쓴다.
+      N_NOTE_NER_MODEL: ${N_NOTE_NER_MODEL:-}
+      N_NOTE_NER_MIN_SCORE: ${N_NOTE_NER_MIN_SCORE:-0.8}
+      N_NOTE_NER_THREADS: ${N_NOTE_NER_THREADS:-2}
+      # NER 모델은 미리 받은 캐시만 쓴다(scripts/download_models.sh). 원문이 외부로 나가지 않는다.
+      HF_HUB_OFFLINE: ${N_NOTE_NER_HF_OFFLINE:-1}
     volumes:
       - ./forms:/app/forms:ro
       - n-note-artifacts:/var/lib/n-note/artifacts
+      # 초안·핸드오프·감사 이력·양식 상태·작업 상태(SQLite)다.
+      - n-note-state:/var/lib/n-note/state
+      # 로컬 NER 모델 캐시(로컬 STT·LLM과 같은 캐시)다.
+      - ${N_NOTE_MODEL_CACHE:-./model-cache}:/root/.cache/huggingface:ro
       # 모델 비교 평가 사례·결과(scripts/compose-model.sh <profile> run --rm ai-service ...)
       - ./eval:/app/eval
     networks:
@@ -91,6 +122,7 @@ services:
 
 volumes:
   n-note-artifacts:
+  n-note-state:
 
 networks:
   ai-gateway-network:

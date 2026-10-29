@@ -1,0 +1,23 @@
+services:
+  gateway:
+    build: .
+    command: ["gateway", "--port", "8080"]
+    environment:
+      # Station C의 STATIONC_MCP_GATEWAY_TIMEOUT(기본 15초)보다 작게 유지한다.
+      GATEWAY_UPSTREAM_TIMEOUT_SECONDS: ${GATEWAY_UPSTREAM_TIMEOUT_SECONDS:-5}
+    volumes:
+      - ./config/upstreams.yaml:/app/config/upstreams.yaml:ro
+    networks: [ai-gateway-network, mcp-gateway-network]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; assert urlopen('http://localhost:8080/healthz').status == 200"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+networks:
+  ai-gateway-network:
+    external: true
+    name: ai-gateway-network
+  mcp-gateway-network:
+    external: true
+    name: mcp-gateway-network

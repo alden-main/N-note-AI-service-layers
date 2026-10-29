@@ -146,8 +146,8 @@ def run_case(case: EvalCase, stt_provider: Any | None = None) -> dict[str, Any]:
     else:
         stt = _Timed(FixedTranscriptProvider(case.transcript or ""))
     workflow = api.get_nursing_note_workflow(stt)
-    generator = _Timed(workflow.draft_flow.generator)
-    workflow.draft_flow.generator = generator
+    generator = _Timed(workflow.generator)
+    workflow.generator = generator
     schema_id, purpose = api._resolve_workflow_form(case.schema_id, None)
     trace_id = str(uuid4())
     context_flow = api.get_workflow_context_flow()

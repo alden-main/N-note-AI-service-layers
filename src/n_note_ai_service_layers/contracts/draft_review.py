@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
@@ -65,9 +65,60 @@ class DraftReviewRecord:
     # 수치 대조 출처(전사문·사실)와 구술 기준 시각이다. revision마다 최신 필드 값으로 다시 대조한다.
     numeric_sources: tuple[str, ...] = ()
     reference_time: datetime | None = None
+    # LLM이 전사문 용어 힌트를 받아 초안에 반영한 교정({"source_text", "applied_text"})이다.
+    # 후보 승인 절차를 거치지 않은 교정이므로 검토 화면과 확정본에 남긴다.
+    llm_applied_term_hints: tuple[dict[str, str], ...] = ()
+    created_at: datetime | None = None
 
     def candidate(self, candidate_id: str) -> DraftCandidate | None:
         return next((item for item in self.candidates if item.candidate_id == candidate_id), None)
+
+    @property
+    def latest_revision(self) -> int:
+        return self.revisions[-1].revision
+
+    def as_dict(self) -> dict[str, Any]:
+        """저장소 보관용 JSON 호환 사전이다."""
+        return {
+            "draft_id": self.draft_id,
+            "schema_id": self.schema_id,
+            "schema_version": self.schema_version,
+            "transcript": self.transcript,
+            "candidate_ids": list(self.candidate_ids),
+            "revisions": [
+                {**asdict(revision), "created_at": revision.created_at.isoformat()}
+                for revision in self.revisions
+            ],
+            "candidates": [{**asdict(item), "suggestions": list(item.suggestions)} for item in self.candidates],
+            "patient_id": self.patient_id,
+            "encounter_id": self.encounter_id,
+            "finalized_note_id": self.finalized_note_id,
+            "numeric_sources": list(self.numeric_sources),
+            "reference_time": self.reference_time.isoformat() if self.reference_time else None,
+            "llm_applied_term_hints": [dict(item) for item in self.llm_applied_term_hints],
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "DraftReviewRecord":
+        return cls(
+            raw["draft_id"], raw["schema_id"], raw["schema_version"], raw["transcript"], tuple(raw["candidate_ids"]),
+            tuple(
+                DraftRevision(
+                    item["draft_id"], int(item["revision"]), dict(item["fields"]), dict(item["candidate_decisions"]),
+                    item["edited_by"], datetime.fromisoformat(item["created_at"]), dict(item.get("applied_suggestions", {})),
+                )
+                for item in raw["revisions"]
+            ),
+            tuple(DraftCandidate(**{**item, "suggestions": tuple(item["suggestions"])}) for item in raw.get("candidates", [])),
+            raw.get("patient_id"),
+            raw.get("encounter_id"),
+            raw.get("finalized_note_id"),
+            tuple(raw.get("numeric_sources", ())),
+            datetime.fromisoformat(raw["reference_time"]) if raw.get("reference_time") else None,
+            tuple(dict(item) for item in raw.get("llm_applied_term_hints", ())),
+            datetime.fromisoformat(raw["created_at"]) if raw.get("created_at") else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -89,6 +140,7 @@ class FinalizedNursingNote:
     trace_id: str
     # 출처에 없지만 확정자가 확인하고 남긴 수치("필드 ID: 값")다.
     confirmed_numeric_findings: tuple[str, ...] = ()
+    llm_applied_term_hints: tuple[dict[str, str], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +159,7 @@ class FinalizedNursingNote:
             "finalized_at": self.finalized_at.isoformat(),
             "trace_id": self.trace_id,
             "confirmed_numeric_findings": list(self.confirmed_numeric_findings),
+            "llm_applied_term_hints": [dict(item) for item in self.llm_applied_term_hints],
         }
 
     @classmethod
@@ -117,4 +170,5 @@ class FinalizedNursingNote:
             dict(raw["candidate_decisions"]), dict(raw.get("applied_suggestions", {})), raw["finalized_by"],
             datetime.fromisoformat(raw["finalized_at"]), raw["trace_id"],
             tuple(raw.get("confirmed_numeric_findings", ())),
+            tuple(dict(item) for item in raw.get("llm_applied_term_hints", ())),
         )

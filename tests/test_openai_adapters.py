@@ -10,7 +10,8 @@ from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
 from n_note_ai_service_layers.policies.pressure_injury_schema import pressure_injury_poc_schema
 from n_note_ai_service_layers.services.context_assembler import ClinicalContextAssembler
-from n_note_ai_service_layers.services.draft_generation_flow import DraftGenerationFlow
+from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayConnectionError
+from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
 from n_note_ai_service_layers.contracts.clinical_context import Availability, ClinicalContextQuery, ClinicalFact
 from datetime import datetime
 from pathlib import Path
@@ -67,11 +68,16 @@ class OpenAiAdapterTests(unittest.TestCase):
         query = ClinicalContextQuery("p", "e", schema.purpose, datetime.now().astimezone(), schema.schema_id, "trace", schema.version)
         facts = [ClinicalFact("braden.nutrition", 2, "2", query.as_of, "test", Availability.AVAILABLE)]
         snapshot = ClinicalContextAssembler().build(query, facts, schema)
+        class OfflineGateway:
+            class Client:
+                def discover(self, request_id): raise McpGatewayConnectionError("offline")
+            gateway = Client()
         generator = FakeGenerator()
-        transcript, result = DraftGenerationFlow(FakeStt(), generator).generate_from_audio(snapshot, AudioInput(b"x", "x.wav", "audio/wav", "trace"), schema)
-        self.assertEqual(transcript.text, "음성 전사")
+        result = NursingNoteWorkflow(FakeStt(), generator, OfflineGateway()).generate(snapshot, AudioInput(b"x", "x.wav", "audio/wav", "trace"), schema)
+        self.assertEqual(result.transcript.text, "음성 전사")
         self.assertEqual(generator.payload["transcript"], "음성 전사")
-        self.assertEqual(result.proposed_fields["braden.nutrition"], 2)
+        self.assertEqual(result.draft.proposed_fields["braden.nutrition"], 2)
+        self.assertEqual(result.draft_gateway_verification.status, "unavailable")
 
     def test_dotenv_loader_does_not_override_existing_environment(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
