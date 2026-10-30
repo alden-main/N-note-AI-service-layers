@@ -1,0 +1,22 @@
+services:
+  report-validation-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: report-validation-mcp:0.1.0
+    restart: unless-stopped
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    expose:
+      - "8000"
+    networks:
+      - mcp-gateway-network
+    read_only: true
+    tmpfs:
+      - /tmp
+
+networks:
+  mcp-gateway-network:
+    external: true
+    name: mcp-gateway-network

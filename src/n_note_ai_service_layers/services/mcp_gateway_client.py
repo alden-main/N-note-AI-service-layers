@@ -16,6 +16,8 @@ from n_note_ai_service_layers.services.json_schema import matches_schema
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
+# A catalog missing expected tools (an upstream MCP still starting or down) is refreshed this often.
+INCOMPLETE_CATALOG_TTL_SECONDS = 15.0
 # Gateway의 일괄 도구 호출 경로다. MCP endpoint와 같은 host·접두 경로를 쓴다.
 BATCH_CALL_PATH = "/v1/tools/batch-call"
 HttpTransport = Callable[[str, bytes, Mapping[str, str], float], tuple[int, Mapping[str, str], bytes]]
@@ -47,6 +49,8 @@ class McpGatewayClient:
 
     One instance is shared across requests and threads: the HTTP connection pool is
     reused, and ``discover`` reuses the catalog for ``catalog_ttl_seconds`` (0 = always refresh).
+    While any of ``expected_tools`` is missing, the catalog is reused only for
+    ``incomplete_catalog_ttl_seconds`` so a late or recovered upstream shows up quickly.
     """
 
     def __init__(
@@ -56,6 +60,8 @@ class McpGatewayClient:
         transport: HttpTransport | None = None,
         catalog_ttl_seconds: float = 0.0,
         batch_url: str | None = None,
+        expected_tools: tuple[str, ...] = (),
+        incomplete_catalog_ttl_seconds: float = INCOMPLETE_CATALOG_TTL_SECONDS,
     ) -> None:
         # Imported here to keep this transport module usable without app startup.
         from n_note_ai_service_layers.settings import mcp_gateway_timeout_seconds, mcp_gateway_url
@@ -64,6 +70,8 @@ class McpGatewayClient:
         self._transport = transport or self._http_post
         self._catalog: tuple[dict[str, Any], ...] = ()
         self._catalog_ttl_seconds = catalog_ttl_seconds
+        self._expected_tools = frozenset(expected_tools)
+        self._incomplete_catalog_ttl_seconds = incomplete_catalog_ttl_seconds
         self._catalog_loaded_at: float | None = None
         self._catalog_lock = threading.Lock()
         # Keep-alive connection per worker thread (http.client connections are not thread-safe).
@@ -107,10 +115,12 @@ class McpGatewayClient:
         self._catalog_loaded_at = None
 
     def _catalog_fresh(self) -> bool:
-        return (
-            self._catalog_ttl_seconds > 0 and self._catalog_loaded_at is not None
-            and time.monotonic() - self._catalog_loaded_at < self._catalog_ttl_seconds
-        )
+        if self._catalog_ttl_seconds <= 0 or self._catalog_loaded_at is None:
+            return False
+        ttl = self._catalog_ttl_seconds
+        if self._expected_tools - {tool["name"] for tool in self._catalog}:
+            ttl = min(ttl, self._incomplete_catalog_ttl_seconds)
+        return time.monotonic() - self._catalog_loaded_at < ttl
 
     def model_tools(self, allowed_names: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         """Convert the current catalog to OpenAI function tools.

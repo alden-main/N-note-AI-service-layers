@@ -1,0 +1,12 @@
+# 이미지에는 src만 들어간다. 사전 DB(data/)는 실행 시 읽기 전용으로 마운트한다.
+.git
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.DS_Store
+data
+koreandict_xlsx
+dist
+tests
+docs

@@ -110,5 +110,28 @@ class McpGatewayBatchTests(unittest.TestCase):
         self.assertTrue(all(isinstance(item, McpGatewayConnectionError) for item in results))
 
 
+class CatalogRefreshTests(unittest.TestCase):
+    def test_incomplete_catalog_is_refreshed_sooner_than_the_full_ttl(self):
+        from unittest.mock import patch
+        gateway = _Gateway()
+        client = McpGatewayClient(transport=gateway, catalog_ttl_seconds=300, expected_tools=("dictionary__lookup", "report__validate"), incomplete_catalog_ttl_seconds=15)
+        with patch("n_note_ai_service_layers.services.mcp_gateway_client.time.monotonic", side_effect=[0.0, 10.0, 20.0, 20.0]):
+            client.discover()  # 0초: 조회(report__validate 없음)
+            client.discover()  # 10초: 불완전 TTL(15초) 안이라 재사용
+            gateway.tools.append({"name": "report__validate", "description": "v", "inputSchema": {"type": "object"}})
+            catalog = client.discover()  # 20초: 불완전 TTL이 지나 다시 조회
+        self.assertEqual(sum(1 for request, _ in gateway.requests if request["method"] == "tools/list"), 2)
+        self.assertIn("report__validate", [tool["name"] for tool in catalog])
+
+    def test_complete_catalog_uses_the_full_ttl(self):
+        from unittest.mock import patch
+        gateway = _Gateway()
+        client = McpGatewayClient(transport=gateway, catalog_ttl_seconds=300, expected_tools=("dictionary__lookup",), incomplete_catalog_ttl_seconds=15)
+        with patch("n_note_ai_service_layers.services.mcp_gateway_client.time.monotonic", side_effect=[0.0, 0.0, 200.0]):
+            client.discover()
+            client.discover()
+        self.assertEqual(sum(1 for request, _ in gateway.requests if request["method"] == "tools/list"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,13 +54,25 @@ def get_speech_to_text_provider() -> SpeechToTextProvider:
 
 
 @lru_cache(maxsize=4)
-def _gateway_client(url: str, timeout_seconds: float, catalog_ttl_seconds: float) -> McpGatewayClient:
-    return McpGatewayClient(url, timeout_seconds, catalog_ttl_seconds=catalog_ttl_seconds)
+def _gateway_client(url: str, timeout_seconds: float, catalog_ttl_seconds: float, expected_tools: tuple[str, ...]) -> McpGatewayClient:
+    return McpGatewayClient(url, timeout_seconds, catalog_ttl_seconds=catalog_ttl_seconds, expected_tools=expected_tools)
+
+
+def _expected_gateway_tools() -> tuple[str, ...]:
+    """workflow가 쓰는 Gateway 도구다. 하나라도 catalog에 없으면(MCP 기동 중·장애) catalog를 자주 다시 조회한다."""
+    names = [*settings.term_review_tool_names()]
+    if settings.report_validation_tool_name():
+        names.append(settings.report_validation_tool_name())
+    if settings.llm_tool_calling_enabled():
+        names.extend(settings.llm_tool_names())
+    return tuple(sorted(set(names)))
 
 
 def get_gateway_client() -> McpGatewayClient:
     """요청 간에 공유하는 Gateway 클라이언트다(커넥션 풀·catalog TTL 캐시)."""
-    return _gateway_client(settings.mcp_gateway_url(), settings.mcp_gateway_timeout_seconds(), settings.mcp_gateway_catalog_ttl_seconds())
+    return _gateway_client(
+        settings.mcp_gateway_url(), settings.mcp_gateway_timeout_seconds(), settings.mcp_gateway_catalog_ttl_seconds(), _expected_gateway_tools(),
+    )
 
 
 def get_note_store() -> FileNursingNoteStore:
