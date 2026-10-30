@@ -1,7 +1,5 @@
 """표준 해석과 결정적 후보 검증의 핵심 계약을 확인한다."""
 
-import json
-from pathlib import Path
 import unittest
 
 from main_mcp_server_document_analysis.contracts import InputError
@@ -19,6 +17,18 @@ def standard() -> dict:
     }
 
 
+def hmd_standard() -> dict:
+    """테스트에 쓰는 hmd-analysis-requirement-set/v1 기준(7개 requirement)을 반환한다."""
+    evidence = [["endpoint_definition", "effect_size", "p_value"], ["study_period"], ["population"], ["sample_size"], ["comparator"], ["adverse_events"], ["limitations"]]
+    return {
+        "schema_version": "hmd-analysis-requirement-set/v1", "requirement_set_id": "hmd-example", "requirement_set_version": "v1",
+        "analysis_requirements": [
+            {"requirement_id": f"req_{index}", "description": f"requirement {index}", "category": "analysis", "required_evidence": items}
+            for index, items in enumerate(evidence, start=1)
+        ],
+    }
+
+
 def service() -> ReportValidationService:
     """범용 및 HMD interpreter가 등록된 검증 서비스를 만든다."""
     return ReportValidationService(StandardInterpreterRegistry((ReportValidationStandardV1Interpreter(), HmdAnalysisRequirementSetV1Interpreter())))
@@ -29,7 +39,7 @@ class ValidationTest(unittest.TestCase):
 
     def test_hmd_fixture_uses_only_report_validation_criteria(self) -> None:
         """HMD의 공유 메타데이터와 evidence_rules는 해석하지 않는다."""
-        raw = json.loads((Path(__file__).parents[1] / "docs/hmd_analysis_requirement_set_v1.json").read_text())
+        raw = hmd_standard()
         raw["status"] = {"shared": "metadata"}
         raw["usage"] = "ignored"
         raw["analysis_requirements"][0]["evidence_rules"] = {"unrelated": "ignored"}
