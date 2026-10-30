@@ -12,6 +12,8 @@ if [[ ! -f "$env_file" ]]; then
   exit 2
 fi
 args=(--project-directory "$root" -f "$root/docker-compose.yml")
+# 서버별 설정(포트 공개 등)은 docker-compose.override.yml에 둔다. 일반 docker compose처럼 함께 읽는다.
+[[ -f "$root/docker-compose.override.yml" ]] && args+=(-f "$root/docker-compose.override.yml")
 # .env(API 키 등) 다음에 프로필을 읽어 프로필 값이 우선한다.
 [[ -f "$root/.env" ]] && args+=(--env-file "$root/.env")
 args+=(--env-file "$env_file")

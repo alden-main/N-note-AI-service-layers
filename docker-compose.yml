@@ -1,6 +1,18 @@
-# 기본 실행은 ai-service만 띄우고 STT·LLM은 OpenAI API를 사용한다(SaaS).
-# 로컬 모델(온프레미스·폐쇄망)은 deploy/models/<profile>.env를 함께 지정하면 local-stt·local-llm을 띄운다.
+# 한 번에 ai-service, MCP Gateway, MCP 서버 3종(표준국어·의학용어·보고서 검증)을 띄운다.
+#   docker compose up -d --build
+# 기본 STT·LLM은 OpenAI API다(SaaS). 로컬 모델(온프레미스·폐쇄망)은 deploy/models/<profile>.env를 함께 지정하면
+# local-stt·local-llm도 띄운다.
 #   scripts/compose-model.sh medgemma-27b up -d
+#
+# 네트워크 경계: ai-service는 ai-gateway-network에만, MCP 서버는 mcp-gateway-network(internal)에만 연결한다.
+# Gateway만 두 네트워크에 연결되므로 ai-service는 MCP 서버에 직접 접근할 수 없다.
+x-mcp-healthcheck: &mcp-healthcheck
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
 x-vllm: &vllm
   ipc: host
   environment:
@@ -25,6 +37,8 @@ services:
       context: .
       args:
         N_NOTE_INSTALL_NER: ${N_NOTE_INSTALL_NER:-false}
+    # 배포 번들(scripts/bundle.sh)은 모든 이미지를 같은 N_NOTE_IMAGE_TAG로 만들고, 서버는 이 이름으로 적재한다.
+    image: n-note-ai-service:${N_NOTE_IMAGE_TAG:-local}
     environment:
       MCP_GATEWAY_URL: http://gateway:8080/mcp
       # OpenAI API를 쓰는 경우에만 필요하다(로컬 모델만 쓰면 비워 둔다).
@@ -79,8 +93,95 @@ services:
       - ${N_NOTE_MODEL_CACHE:-./model-cache}:/root/.cache/huggingface:ro
       # 모델 비교 평가 사례·결과(scripts/compose-model.sh <profile> run --rm ai-service ...)
       - ./eval:/app/eval
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - ai-gateway-network
+
+  # MCP Gateway: ai-service가 호출하는 유일한 MCP endpoint(http://gateway:8080/mcp)다.
+  gateway:
+    build: ./mcp_servers/main-mcp-gateway-server
+    image: n-note-mcp-gateway:${N_NOTE_IMAGE_TAG:-local}
+    command: ["gateway", "--port", "8080"]
+    environment:
+      # ai-service의 MCP_GATEWAY_TIMEOUT_SECONDS(기본 15초)보다 작게 유지한다.
+      GATEWAY_UPSTREAM_TIMEOUT_SECONDS: ${GATEWAY_UPSTREAM_TIMEOUT_SECONDS:-5}
+      GATEWAY_HEALTH_TTL_SECONDS: ${GATEWAY_HEALTH_TTL_SECONDS:-5}
+      GATEWAY_BATCH_MAX_CALLS: ${GATEWAY_BATCH_MAX_CALLS:-32}
+      GATEWAY_BATCH_MAX_CONCURRENCY: ${GATEWAY_BATCH_MAX_CONCURRENCY:-8}
+    volumes:
+      - ./mcp_servers/main-mcp-gateway-server/config/upstreams.yaml:/app/config/upstreams.yaml:ro
+    # MCP 서버 하나가 실패해도 Gateway·ai-service는 뜬다(해당 검토만 unavailable). 늦게 준비된 MCP는
+    # 다음 tools/list에서 Gateway가 다시 찾고, ai-service는 도구가 빠진 catalog를 15초마다 다시 조회한다.
+    depends_on:
+      korean-standard-dictionary:
+        condition: service_started
+      medical-term-review:
+        condition: service_started
+      report-validation:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - ai-gateway-network
+      - mcp-gateway-network
+    restart: unless-stopped
+
+  # 아래 MCP 서버의 서비스 이름은 upstreams.yaml의 호스트명과 같아야 한다. host port는 공개하지 않는다.
+  # 표준국어대사전 MCP. 검증된 SQLite 릴리스를 읽기 전용으로 마운트한다.
+  korean-standard-dictionary:
+    build: ./mcp_servers/main-mcp-server-kodict
+    image: n-note-mcp-kodict:${N_NOTE_IMAGE_TAG:-local}
+    environment:
+      KODICT_DATABASE_PATH: /app/data/korean_standard_dictionary.sqlite3
+      KODICT_MAX_CONCURRENT_REQUESTS: ${KODICT_MAX_CONCURRENT_REQUESTS:-4}
+      KODICT_MAX_FINDINGS: ${KODICT_MAX_FINDINGS:-1000}
+    volumes:
+      - ${KODICT_DATABASE_HOST_PATH:-./mcp_servers/main-mcp-server-kodict/data/releases/2026.10/korean_standard_dictionary.sqlite3}:/app/data/korean_standard_dictionary.sqlite3:ro
+    healthcheck: *mcp-healthcheck
+    networks:
+      - mcp-gateway-network
+    restart: unless-stopped
+
+  # 의학용어 MCP. 사전 snapshot은 이미지에 포함하고 검토 이력만 volume에 남긴다.
+  medical-term-review:
+    build: ./mcp_servers/main-mcp-server-medicaldict
+    image: n-note-mcp-medicaldict:${N_NOTE_IMAGE_TAG:-local}
+    environment:
+      MEDICALDICT_MCP_TRANSPORT: streamable-http
+      MEDICALDICT_MCP_HOST: 0.0.0.0
+      MEDICALDICT_MCP_PORT: "8000"
+    volumes:
+      - medicaldict-history:/var/lib/medicaldict
+    healthcheck: *mcp-healthcheck
+    networks:
+      - mcp-gateway-network
+    restart: unless-stopped
+
+  # 보고서(양식) 완결성 검증 MCP. 상태가 없으므로 읽기 전용 파일 시스템으로 실행한다.
+  report-validation:
+    build: ./mcp_servers/main-mcp-server-document-analysis
+    image: n-note-mcp-report-validation:${N_NOTE_IMAGE_TAG:-local}
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck: *mcp-healthcheck
+    networks:
+      - mcp-gateway-network
+    restart: unless-stopped
 
   # 로컬 Whisper 전사 서버(OpenAI 호환 /v1/audio/transcriptions)
   local-stt:
@@ -125,8 +226,13 @@ services:
 volumes:
   n-note-artifacts:
   n-note-state:
+  medicaldict-history:
 
+# Compose가 만들고 관리한다(사전 docker network create 불필요). 이름은 기존 문서·외부 스택과 맞춘다.
 networks:
   ai-gateway-network:
-    external: true
     name: ai-gateway-network
+  mcp-gateway-network:
+    name: mcp-gateway-network
+    # MCP 서버는 외부 인터넷이 필요 없다(사전 데이터가 이미지·volume에 있다).
+    internal: true

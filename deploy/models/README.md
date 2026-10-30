@@ -59,26 +59,22 @@ AI 서비스가 요구하는 조건은 두 가지입니다.
 
 ## 폐쇄망 반입
 
-인터넷이 되는 곳에서 준비해 반입합니다.
+이미지는 배포 번들 하나로, 모델 가중치는 따로 반입합니다. 자세한 절차는 [Linux 서버 Docker 배포 가이드](../../docs/linux_docker_model_deployment.md) 6절에 있습니다.
 
 ```bash
-# 1) 모델 가중치 (gated 모델은 Hugging Face에서 약관 동의 후 HF_TOKEN 필요)
-HF_TOKEN=... scripts/download_models.sh qwen3.5-27b      # → ./model-cache/hub
-
-# 2) 이미지 빌드 후 저장 (local-stt는 vLLM 이미지에 음성 의존성만 추가한 이미지)
-scripts/compose-model.sh qwen3.5-27b build
-scripts/compose-model.sh qwen3.5-27b pull local-llm
-docker save -o n-note-images.tar \
-  vllm/vllm-openai:v0.31.0-cu129 n-note-local-stt:0.31.0 n-note-ai-service-layers-ai-service
+# 인터넷이 되는 곳
+HF_TOKEN=... scripts/download_models.sh qwen3.5-27b                 # 모델 가중치 → ./model-cache/hub
+scripts/bundle.sh --version 1.0.0 --profile qwen3.5-27b             # ai-service·Gateway·MCP 3종·local-stt·vLLM 이미지
+#   → dist/bundles/n-note-1.0.0-linux-amd64.tar.gz
 ```
 
-폐쇄망 서버에서 실행합니다.
-
 ```bash
-docker load -i n-note-images.tar
-# model-cache/를 복사한 뒤 .env에 HF_HUB_OFFLINE=1
-scripts/compose-model.sh qwen3.5-27b up -d --no-build
+# 폐쇄망 서버 (model-cache를 /opt/n-note/model-cache로 옮긴 뒤)
+tar -xzf n-note-1.0.0-linux-amd64.tar.gz && cd n-note-1.0.0-linux-amd64
+cp .env.example .env
+printf 'N_NOTE_MODEL_CACHE=/opt/n-note/model-cache\nHF_HUB_OFFLINE=1\n' >> .env
+./scripts/install.sh                                                # 이미지 로드 + 프로필로 기동 + 모델 적재 대기
 ```
 
 - vLLM 이미지는 `v0.31.0-cu129`(CUDA 12.9)로 고정했습니다. A100 서버의 NVIDIA 드라이버가 CUDA 12.9를 지원하는지 확인하세요. 버전은 `N_NOTE_VLLM_IMAGE`와 `N_NOTE_VLLM_VERSION`으로 바꿉니다.
-- MCP Gateway와 MCP 서버 이미지는 각 저장소의 `dist/*.tar.gz`로 함께 반입합니다.
+- MCP Gateway와 MCP 서버 이미지도 같은 번들에 들어 있습니다.
