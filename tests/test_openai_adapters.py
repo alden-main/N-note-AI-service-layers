@@ -8,7 +8,7 @@ from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapt
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
-from n_note_ai_service_layers.policies.pressure_injury_schema import pressure_injury_poc_schema
+from support import sample_form_schema
 from n_note_ai_service_layers.services.context_assembler import ClinicalContextAssembler
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayConnectionError
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
@@ -31,7 +31,7 @@ class _FakeResponses:
     def __init__(self): self.request = None
     def create(self, **kwargs):
         self.request = kwargs
-        return SimpleNamespace(output_text='{"proposed_fields":{"braden.nutrition":2,"risk.level":"HIGH_RISK"},"evidence_refs":{"braden.nutrition":["transcript:1"]},"needs_confirmation":false}')
+        return SimpleNamespace(output_text='{"proposed_fields":{"assessment.pain_score":2,"summary.derived_level":"HIGH_RISK"},"evidence_refs":{"assessment.pain_score":["transcript:1"]},"needs_confirmation":false}')
 
 
 class OpenAiAdapterTests(unittest.TestCase):
@@ -48,25 +48,25 @@ class OpenAiAdapterTests(unittest.TestCase):
     def test_draft_adapter_uses_structured_output_and_drops_deterministic_fields(self):
         responses = _FakeResponses()
         client = SimpleNamespace(responses=responses)
-        schema = pressure_injury_poc_schema(SchemaStatus.ACTIVE)
+        schema = sample_form_schema(SchemaStatus.ACTIVE)
         result = OpenAiDraftGenerationAdapter(client).generate({"facts": []}, schema)
-        self.assertEqual(result.proposed_fields, {"braden.nutrition": 2})
-        self.assertEqual(result.evidence_refs["braden.nutrition"], ("transcript:1",))
+        self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
+        self.assertEqual(result.evidence_refs["assessment.pain_score"], ("transcript:1",))
         self.assertEqual(responses.request["text"]["format"]["type"], "json_schema")
-        self.assertNotIn("risk.level", result.proposed_fields)
+        self.assertNotIn("summary.derived_level", result.proposed_fields)
 
     def test_evidence_is_requested_only_for_filled_fields(self):
-        evidence = OpenAiDraftGenerationAdapter._output_format(pressure_injury_poc_schema(SchemaStatus.ACTIVE))["schema"]["properties"]["evidence_refs"]
+        evidence = OpenAiDraftGenerationAdapter._output_format(sample_form_schema(SchemaStatus.ACTIVE))["schema"]["properties"]["evidence_refs"]
         self.assertEqual(evidence["type"], "array")
         self.assertEqual(evidence["items"]["required"], ["field_id", "refs"])
-        self.assertNotIn("risk.level", evidence["items"]["properties"]["field_id"]["enum"])
+        self.assertNotIn("summary.derived_level", evidence["items"]["properties"]["field_id"]["enum"])
 
     def test_array_evidence_is_merged_by_field_and_filtered(self):
         class Responses:
             def create(self, **kwargs):
-                return SimpleNamespace(output_text='{"proposed_fields":{"braden.nutrition":2},"evidence_refs":[{"field_id":"braden.nutrition","refs":["transcript"]},{"field_id":"braden.nutrition","refs":["fact:f1"]},{"field_id":"risk.level","refs":["x"]}],"needs_confirmation":false}')
-        result = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=Responses())).generate({}, pressure_injury_poc_schema(SchemaStatus.ACTIVE))
-        self.assertEqual(result.evidence_refs, {"braden.nutrition": ("transcript", "fact:f1")})
+                return SimpleNamespace(output_text='{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":[{"field_id":"assessment.pain_score","refs":["transcript"]},{"field_id":"assessment.pain_score","refs":["fact:f1"]},{"field_id":"summary.derived_level","refs":["x"]}],"needs_confirmation":false}')
+        result = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=Responses())).generate({}, sample_form_schema(SchemaStatus.ACTIVE))
+        self.assertEqual(result.evidence_refs, {"assessment.pain_score": ("transcript", "fact:f1")})
 
     def test_provider_neutral_flow_connects_stt_to_draft_generation(self):
         class FakeStt:
@@ -76,10 +76,10 @@ class OpenAiAdapterTests(unittest.TestCase):
             def __init__(self): self.payload = None
             def generate(self, payload, schema):
                 self.payload = payload
-                return DraftResult({"braden.nutrition": 2})
-        schema = pressure_injury_poc_schema(SchemaStatus.ACTIVE)
+                return DraftResult({"assessment.pain_score": 2})
+        schema = sample_form_schema(SchemaStatus.ACTIVE)
         query = ClinicalContextQuery("p", "e", schema.purpose, datetime.now().astimezone(), schema.schema_id, "trace", schema.version)
-        facts = [ClinicalFact("braden.nutrition", 2, "2", query.as_of, "test", Availability.AVAILABLE)]
+        facts = [ClinicalFact("assessment.pain_score", 2, "2", query.as_of, "test", Availability.AVAILABLE)]
         snapshot = ClinicalContextAssembler().build(query, facts, schema)
         class OfflineGateway:
             class Client:
@@ -89,7 +89,7 @@ class OpenAiAdapterTests(unittest.TestCase):
         result = NursingNoteWorkflow(FakeStt(), generator, OfflineGateway()).generate(snapshot, AudioInput(b"x", "x.wav", "audio/wav", "trace"), schema)
         self.assertEqual(result.transcript.text, "음성 전사")
         self.assertEqual(generator.payload["transcript"], "음성 전사")
-        self.assertEqual(result.draft.proposed_fields["braden.nutrition"], 2)
+        self.assertEqual(result.draft.proposed_fields["assessment.pain_score"], 2)
         self.assertEqual(result.draft_gateway_verification.status, "unavailable")
 
     def test_dotenv_loader_does_not_override_existing_environment(self):

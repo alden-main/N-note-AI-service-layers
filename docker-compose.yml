@@ -138,16 +138,17 @@ services:
     restart: unless-stopped
 
   # 아래 MCP 서버의 서비스 이름은 upstreams.yaml의 호스트명과 같아야 한다. host port는 공개하지 않는다.
-  # 표준국어대사전 MCP. 검증된 SQLite 릴리스를 읽기 전용으로 마운트한다.
+  # 표준국어대사전 MCP. 검증된 SQLite 릴리스를 이미지에 포함한다(사전 교체 = 이미지 재빌드).
   korean-standard-dictionary:
-    build: ./mcp_servers/main-mcp-server-kodict
+    build:
+      context: ./mcp_servers/main-mcp-server-kodict
+      args:
+        # 포함할 사전 릴리스(mcp_servers/main-mcp-server-kodict/data/releases/<버전>/)다. 감사 로그의 사전 버전이 된다.
+        KODICT_RELEASE: ${KODICT_RELEASE:-2026.10}
     image: n-note-mcp-kodict:${N_NOTE_IMAGE_TAG:-local}
     environment:
-      KODICT_DATABASE_PATH: /app/data/korean_standard_dictionary.sqlite3
       KODICT_MAX_CONCURRENT_REQUESTS: ${KODICT_MAX_CONCURRENT_REQUESTS:-4}
       KODICT_MAX_FINDINGS: ${KODICT_MAX_FINDINGS:-1000}
-    volumes:
-      - ${KODICT_DATABASE_HOST_PATH:-./mcp_servers/main-mcp-server-kodict/data/releases/2026.10/korean_standard_dictionary.sqlite3}:/app/data/korean_standard_dictionary.sqlite3:ro
     healthcheck: *mcp-healthcheck
     networks:
       - mcp-gateway-network

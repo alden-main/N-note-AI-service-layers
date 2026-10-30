@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
-from pathlib import Path
 
 from fastapi import Depends, HTTPException, Request, UploadFile
 
@@ -12,7 +10,6 @@ from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.note_artifact_store import FileNursingNoteStore
 from n_note_ai_service_layers.adapters.pdf_renderer import NursingNotePdfRenderer
-from n_note_ai_service_layers.adapters.synthetic_repository import SyntheticScenarioRepository
 from n_note_ai_service_layers.adapters.transcript_only_repository import TranscriptOnlyRepository
 from n_note_ai_service_layers.api.state import get_services
 from n_note_ai_service_layers.contracts.ai_provider import SpeechToTextProvider
@@ -91,16 +88,9 @@ def get_transcript_redactor() -> TranscriptRedactor:
 
 
 def get_workflow_context_flow() -> ClinicalContextFlow:
-    """임상 문맥 흐름을 만든다.
-
-    합성 POC fixture(N_NOTE_SYNTHETIC_FIXTURE)가 설정되면 그 사실을 사용하고, 없으면 전사문만으로
-    초안을 만든다. 운영 EMR repository는 별도 adapter로 주입한다.
-    """
+    """임상 문맥 흐름을 만든다. 전사문만으로 초안을 만들며, 운영 EMR repository는 별도 adapter로 주입한다."""
     registry = get_services().template_registry
-    fixture = os.getenv("N_NOTE_SYNTHETIC_FIXTURE")
-    if fixture and not Path(fixture).is_file():
-        raise HTTPException(status_code=503, detail="nursing note workflow context is not configured")
-    repository = SyntheticScenarioRepository(Path(fixture)) if fixture else TranscriptOnlyRepository()
+    repository = TranscriptOnlyRepository()
     purposes = {schema.purpose for schema in registry.list_versions() if schema.status is SchemaStatus.ACTIVE}
     return ClinicalContextFlow(PurposeAccessPolicy(purposes), registry, repository, ClinicalContextAssembler())
 

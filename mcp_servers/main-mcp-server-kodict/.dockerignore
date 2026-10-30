@@ -1,4 +1,4 @@
-# 이미지에는 src만 들어간다. 사전 DB(data/)는 실행 시 읽기 전용으로 마운트한다.
+# 이미지에는 src와 사전 릴리스(SQLite·manifest)만 들어간다. 원본 xlsx는 제외한다.
 .git
 .venv
 __pycache__
@@ -6,6 +6,8 @@ __pycache__
 .pytest_cache
 .DS_Store
 data
+!data/releases/*/korean_standard_dictionary.sqlite3
+!data/releases/*/manifest.json
 koreandict_xlsx
 dist
 tests

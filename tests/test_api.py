@@ -8,7 +8,7 @@ from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
-from n_note_ai_service_layers.policies.pressure_injury_schema import pressure_injury_poc_schema
+from support import sample_form_schema
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflowResult
 
 
@@ -33,9 +33,9 @@ class BridgeApiTests(unittest.TestCase):
 
     def test_bridge_handoff_exchange(self) -> None:
         payload = {
-            "schema_id": "pressure-injury",
-            "schema_version": "pressure-injury-poc/v1",
-            "fields": {"braden.nutrition": 2},
+            "schema_id": "sample-note",
+            "schema_version": "sample-note/v1",
+            "fields": {"assessment.pain_score": 2},
             "validation": {"status": "valid"},
             "nurse_review_status": "reviewed",
         }
@@ -50,7 +50,7 @@ class BridgeApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/bridge/handoffs?delivery_status=pending").json(), [])
 
     def test_nursing_note_workflow_returns_candidates_without_auto_apply(self) -> None:
-        schema = pressure_injury_poc_schema(status=SchemaStatus.ACTIVE)
+        schema = sample_form_schema(SchemaStatus.ACTIVE)
 
         class Context:
             class Registry:
@@ -62,7 +62,7 @@ class BridgeApiTests(unittest.TestCase):
             def generate(self, snapshot, audio, selected_schema, known_identifiers=(), progress=None):
                 return NursingNoteWorkflowResult(
                     Transcript("금새 확인", "fake", "fake-stt", "ko"),
-                    DraftResult({"braden.nutrition": 2}),
+                    DraftResult({"assessment.pain_score": 2}),
                     GatewayTermVerificationResult("transcript", "ok"),
                     GatewayTermVerificationResult("draft", "ok"),
                 )

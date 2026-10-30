@@ -47,7 +47,7 @@ docker compose ps                 # 5개 서비스가 healthy인지 확인
 
 MCP 서버 하나가 기동에 실패해도 Gateway와 ai-service는 뜨고, 해당 검토만 `unavailable`로 표시됩니다(`docker compose ps`에서 `unhealthy` 확인). 서버가 복구되면 Gateway가 다음 도구 목록 조회에서 다시 찾고, ai-service는 필요한 도구가 빠진 동안 15초마다 목록을 다시 조회하므로 재시작할 필요가 없습니다.
 
-`mcp-gateway-network`는 `internal` 네트워크라 MCP 서버는 외부 인터넷과 ai-service 어느 쪽에서도 직접 접근할 수 없습니다. 표준국어 사전 DB는 기본으로 `mcp_servers/main-mcp-server-kodict/data/releases/2026.10/`의 파일을 쓰며, 다른 릴리스는 `KODICT_DATABASE_HOST_PATH`로 지정합니다. 예전 방식으로 `docker network create`로 만든 같은 이름의 네트워크가 남아 있으면, 이를 쓰던 컨테이너를 내리고 `docker network rm ai-gateway-network mcp-gateway-network`를 한 번 실행한 뒤 기동합니다.
+`mcp-gateway-network`는 `internal` 네트워크라 MCP 서버는 외부 인터넷과 ai-service 어느 쪽에서도 직접 접근할 수 없습니다. 표준국어 사전 DB는 kodict 이미지 빌드 시 `mcp_servers/main-mcp-server-kodict/data/releases/<KODICT_RELEASE>/`(기본 `2026.10`)에서 이미지 안으로 들어갑니다. 사전을 바꾸면 이미지를 다시 빌드합니다. 예전 방식으로 `docker network create`로 만든 같은 이름의 네트워크가 남아 있으면, 이를 쓰던 컨테이너를 내리고 `docker network rm ai-gateway-network mcp-gateway-network`를 한 번 실행한 뒤 기동합니다.
 
 ### Linux 서버 배포 (macOS에서 빌드)
 
@@ -104,7 +104,6 @@ uv run n-note-model-eval compare                  # 프로필별 최근 결과 �
 | `N_NOTE_TERM_REVIEW_TOOLS` | 표준어·의학용어 검토 도구 2종 | 후보 생성 도구 |
 | `N_NOTE_TERM_HINT_BUDGET_SECONDS` | `3` | 전사문 용어 검토를 LLM 힌트로 쓰려고 기다리는 최대 시간. 넘으면 힌트 없이 초안 생성을 시작하고 검토 후보는 나중에 응답에 담음 |
 | `N_NOTE_REPORT_VALIDATION_TOOL` | `report-validation__evaluate_report_against_standard` | 비우면 양식 검증 생략 |
-| `N_NOTE_SYNTHETIC_FIXTURE` | 없음 | 합성 임상 문맥 fixture(욕창 PoC). 없으면 전사문만으로 초안 생성 |
 | `N_NOTE_STATE_DB` | 없음(메모리) · Docker는 `/var/lib/n-note/state/state.sqlite3` | 초안·핸드오프·감사 이력·양식 상태 SQLite. 미설정이면 재시작 시 사라지고 worker 간에 공유되지 않는다 |
 | `N_NOTE_WORKERS` | `1` · Docker는 `2` | uvicorn worker 수(`N_NOTE_STATE_DB`가 있어야 2 이상 가능) |
 | `N_NOTE_DRAFT_RETENTION_HOURS` | `72` | 확정 전 초안(전사문·환자 ID 포함) 보관 시간 |

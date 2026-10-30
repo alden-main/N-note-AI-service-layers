@@ -96,11 +96,6 @@ copy deploy/models
 copy scripts/compose-model.sh
 copy scripts/install.sh
 copy mcp_servers/main-mcp-gateway-server/config/upstreams.yaml
-# 표준국어 사전 DB는 이미지가 아니라 읽기 전용 마운트로 쓴다. compose 기본 경로에 둔다.
-kodict_default="mcp_servers/main-mcp-server-kodict/data/releases/2026.10/korean_standard_dictionary.sqlite3"
-kodict_source="${KODICT_DATABASE_HOST_PATH:-$root/$kodict_default}"
-mkdir -p "$(dirname "$stage/$kodict_default")"
-cp "$kodict_source" "$stage/$kodict_default"
 find "$stage" -name .DS_Store -delete
 
 commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -113,6 +108,7 @@ N_NOTE_BUNDLE_GIT_COMMIT=$commit
 N_NOTE_BUNDLE_GIT_DIRTY=$dirty
 N_NOTE_BUNDLE_BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 N_NOTE_BUNDLE_IMAGES="$(echo $images)"
+N_NOTE_BUNDLE_KODICT_RELEASE=${KODICT_RELEASE:-2026.10}
 INFO
 (cd "$stage" && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | sed 's|^\./||' | while read -r file; do shasum -a 256 "$file"; done > SHA256SUMS)
 

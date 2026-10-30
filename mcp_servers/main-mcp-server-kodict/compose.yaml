@@ -2,13 +2,13 @@ services:
   korean-standard-dictionary:
     build:
       context: .
+      args:
+        # 이미지에 포함할 사전 릴리스(data/releases/<버전>/)다.
+        KODICT_RELEASE: ${KODICT_RELEASE:-2026.10}
     image: korean-standard-dictionary:${KODICT_IMAGE_TAG:-0.1.0}
     environment:
-      KODICT_DATABASE_PATH: /app/data/korean_standard_dictionary.sqlite3
       KODICT_MAX_CONCURRENT_REQUESTS: ${KODICT_MAX_CONCURRENT_REQUESTS:-4}
       KODICT_MAX_FINDINGS: ${KODICT_MAX_FINDINGS:-1000}
-    volumes:
-      - ${KODICT_DATABASE_HOST_PATH:?KODICT_DATABASE_HOST_PATH is required}:/app/data/korean_standard_dictionary.sqlite3:ro
     expose:
       - "8000"
     healthcheck:

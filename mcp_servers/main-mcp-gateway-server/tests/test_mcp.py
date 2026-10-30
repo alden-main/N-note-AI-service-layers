@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+from time import monotonic
 import unittest
+from unittest.mock import patch
 
 from main_mcp_gateway_server.config import UpstreamConfig, configured_upstreams
 from main_mcp_gateway_server.mcp import GatewayCatalog, HttpTransport, McpResponse, PROTOCOL_VERSION
@@ -179,6 +181,28 @@ class GatewayConcurrencyTest(unittest.TestCase):
         transport.on_tool_call = None
         catalog.call("a__lookup", {})
         self.assertEqual(transport.health_checks, checks + 1)
+
+    def test_call_rediscovers_a_service_that_was_not_ready_at_startup(self) -> None:
+        """Gateway보다 늦게 뜬 upstream은 tools/list 없이 다음 호출에서 연결된다."""
+        transport = FakeTransport()
+        transport.health["http://a/healthz"] = False
+        catalog = self._catalog(transport)
+        self.assertEqual({tool["name"] for tool in catalog.list_tools()}, {"b__lookup"})
+        transport.health["http://a/healthz"] = True
+        with patch("main_mcp_gateway_server.mcp.monotonic", return_value=monotonic() + 10):
+            result = catalog.call("a__lookup", {})
+        self.assertFalse(result["isError"])
+        self.assertEqual({tool["name"] for tool in catalog.list_tools()}, {"a__lookup", "b__lookup"})
+
+    def test_rediscovery_is_rate_limited(self) -> None:
+        """연결되지 않은 서비스로 호출이 몰려도 간격 안에서는 다시 discovery하지 않는다."""
+        transport = FakeTransport()
+        transport.health["http://a/healthz"] = False
+        catalog = self._catalog(transport)
+        checks = transport.health_checks
+        for _ in range(3):
+            self.assertTrue(catalog.call("a__lookup", {})["isError"])
+        self.assertEqual(transport.health_checks, checks)
 
     def test_call_many_keeps_order_and_isolates_invalid_items(self) -> None:
         """일괄 호출은 입력 순서를 유지하고 형식이 틀린 항목만 invalid_params로 만든다."""

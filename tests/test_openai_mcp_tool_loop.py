@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import unittest
 
 from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
-from n_note_ai_service_layers.policies.pressure_injury_schema import pressure_injury_poc_schema
+from support import sample_form_schema
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
 
@@ -27,8 +27,8 @@ class _Responses:
     def create(self, **kwargs):
         self.requests.append(kwargs); self.number += 1
         if self.number == 1:
-            return SimpleNamespace(id="response-1", output=[SimpleNamespace(type="function_call", name="dictionary__lookup", arguments='{"term":"욕창"}', call_id="call-1")], output_text=None)
-        return SimpleNamespace(id="response-2", output=[], output_text='{"proposed_fields":{"braden.nutrition":2},"evidence_refs":{"braden.nutrition":["tool:1"]},"needs_confirmation":true}')
+            return SimpleNamespace(id="response-1", output=[SimpleNamespace(type="function_call", name="dictionary__lookup", arguments='{"term":"통증"}', call_id="call-1")], output_text=None)
+        return SimpleNamespace(id="response-2", output=[], output_text='{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":{"assessment.pain_score":["tool:1"]},"needs_confirmation":true}')
 
 
 class OpenAiMcpToolLoopTests(unittest.TestCase):
@@ -37,9 +37,9 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
         responses = _Responses()
         client = SimpleNamespace(responses=responses)
         adapter = OpenAiDraftGenerationAdapter(client, gateway_client=McpGatewayClient(transport=gateway))
-        result = adapter.generate({"facts": []}, pressure_injury_poc_schema())
-        self.assertEqual(gateway.called, [{"name": "dictionary__lookup", "arguments": {"term": "욕창"}}])
-        self.assertEqual(result.proposed_fields, {"braden.nutrition": 2})
+        result = adapter.generate({"facts": []}, sample_form_schema())
+        self.assertEqual(gateway.called, [{"name": "dictionary__lookup", "arguments": {"term": "통증"}}])
+        self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
         self.assertTrue(result.needs_confirmation)
         self.assertEqual(responses.requests[0]["tools"][0]["name"], "dictionary__lookup")
         self.assertFalse(responses.requests[0]["tools"][0]["strict"])
@@ -50,7 +50,7 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
         responses = _Responses()
         responses.number = 1  # 도구가 없으므로 첫 응답부터 최종 초안을 반환한다.
         adapter = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), allowed_tool_names=("other__search",))
-        adapter.generate({"facts": []}, pressure_injury_poc_schema())
+        adapter.generate({"facts": []}, sample_form_schema())
         self.assertNotIn("tools", responses.requests[0])
         self.assertEqual(gateway.called, [])
 
@@ -60,8 +60,8 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
         responses = _Responses()
         responses.number = 1  # 첫 응답부터 최종 초안을 반환한다.
         adapter = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=unreachable))
-        result = adapter.generate({"facts": []}, pressure_injury_poc_schema())
-        self.assertEqual(result.proposed_fields, {"braden.nutrition": 2})
+        result = adapter.generate({"facts": []}, sample_form_schema())
+        self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
         self.assertNotIn("tools", responses.requests[0])
 
     def test_tool_calls_in_one_response_run_concurrently_and_keep_order(self):
@@ -84,7 +84,7 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
 
         responses = Responses()
         adapter = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=SlowGateway()))
-        adapter.generate({"facts": []}, pressure_injury_poc_schema())
+        adapter.generate({"facts": []}, sample_form_schema())
         self.assertEqual([item["call_id"] for item in responses.requests[1]["input"]], ["call-a", "call-b"])
 
     def test_calls_beyond_the_limit_get_tool_limit_reached(self):
@@ -98,7 +98,7 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
 
         gateway = _Gateway()
         responses = Responses()
-        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), max_tool_calls=2).generate({"facts": []}, pressure_injury_poc_schema())
+        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), max_tool_calls=2).generate({"facts": []}, sample_form_schema())
         outputs = [item["output"] for item in responses.requests[1]["input"]]
         self.assertEqual(len(gateway.called), 2)
         self.assertEqual(outputs[2], '{"error": "tool_limit_reached"}')

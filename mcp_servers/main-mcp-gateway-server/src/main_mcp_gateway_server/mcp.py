@@ -20,6 +20,8 @@ GATEWAY_CLIENT_INFO = {"name": "mcp-gateway", "version": "0.1.0"}
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_IDLE_CONNECTIONS = 16
 DEFAULT_BATCH_MAX_CONCURRENCY = 8
+# 연결되지 않은 서비스로 온 호출이 그 서비스를 다시 discovery하는 최소 간격(초)이다.
+REDISCOVERY_INTERVAL_SECONDS = 5.0
 
 
 class Transport(Protocol):
@@ -180,6 +182,8 @@ class ServiceState:
     session_id: str | None = None
     # 이 시각(monotonic)까지는 최근 health 확인 결과를 재사용한다.
     healthy_until: float = 0.0
+    # 마지막 discovery 시각(monotonic)이다. 0이면 아직 시도하지 않았다.
+    discovered_at: float = 0.0
 
 
 class GatewayCatalog:
@@ -219,7 +223,7 @@ class GatewayCatalog:
                     self._services[state.config.service_id] = discovered
 
     def _discover(self, config: UpstreamConfig) -> ServiceState:
-        state = ServiceState(config)
+        state = ServiceState(config, discovered_at=monotonic())
         if not self._transport.healthy(config.health_url):
             state.status = "unhealthy"
             LOGGER.warning("gateway_discovery_failed service_id=%s stage=health", config.service_id)
@@ -276,6 +280,9 @@ class GatewayCatalog:
         if target is None:
             return self._finish_call(None, external_name, request_id, started_at, _tool_error("not_found", "등록되지 않은 Gateway 도구입니다", False))
         state, upstream_name = target
+        if upstream_name not in state.tools and state.status != "active":
+            # Gateway보다 늦게 준비됐거나 복구된 upstream은 tools/list를 기다리지 않고 여기서 다시 찾는다.
+            state = self._rediscover_if_stale(state)
         if upstream_name not in state.tools:
             return self._finish_call(state, upstream_name, request_id, started_at, _tool_error("not_found", "등록되지 않은 Gateway 도구입니다", False))
         if not self._healthy(state):
@@ -310,6 +317,20 @@ class GatewayCatalog:
         if len(calls) <= 1:
             return [run(item) for item in calls]
         return list(self._batch_executor.map(run, calls))
+
+    def _rediscover_if_stale(self, state: ServiceState) -> ServiceState:
+        """연결되지 않은 서비스 하나를 ``REDISCOVERY_INTERVAL_SECONDS``에 한 번까지만 다시 discovery한다."""
+        if monotonic() - state.discovered_at < REDISCOVERY_INTERVAL_SECONDS:
+            return state
+        with self._discovery_lock:
+            # 기다리는 동안 다른 스레드가 이미 다시 찾았을 수 있다.
+            current = self._snapshot()[state.config.service_id]
+            if monotonic() - current.discovered_at < REDISCOVERY_INTERVAL_SECONDS:
+                return current
+            discovered = self._discover(current.config)
+            with self._lock:
+                self._services[current.config.service_id] = discovered
+            return discovered
 
     def _healthy(self, state: ServiceState) -> bool:
         """health 확인 결과를 ``health_ttl_seconds`` 동안 재사용해 호출마다 왕복하지 않는다."""

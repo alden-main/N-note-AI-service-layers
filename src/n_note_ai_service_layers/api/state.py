@@ -12,10 +12,8 @@ from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, open_document_store
 from n_note_ai_service_layers.adapters.form_definition_loader import FormDefinitionLoader
 from n_note_ai_service_layers.api.handoff_store import HandoffStore
-from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
 from n_note_ai_service_layers.contracts.privacy import NamedEntityRecognizer
 from n_note_ai_service_layers.observability import configure_logging, get_logger, log_event
-from n_note_ai_service_layers.policies.pressure_injury_schema import pressure_injury_poc_schema
 from n_note_ai_service_layers.services.audit import AuditTrail
 from n_note_ai_service_layers.services.draft_review import DraftReviewStore
 from n_note_ai_service_layers.services.jobs import JobRunner, JobStore
@@ -56,7 +54,6 @@ def build_services() -> AppServices:
     documents = open_document_store(db_path)
     audit = AuditTrail(documents)
     registry = FormSchemaRegistry(documents)
-    registry.add_base(pressure_injury_poc_schema(status=SchemaStatus.ACTIVE))
     # 운영자가 배포한 양식 정의(N_NOTE_FORMS_DIR)를 활성 양식으로 등록한다.
     for form in FormDefinitionLoader(settings.forms_dir()).load_all(settings.enabled_form_ids()):
         registry.add_base(form)

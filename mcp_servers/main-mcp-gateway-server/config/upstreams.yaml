@@ -1,0 +1,14 @@
+# 이 파일은 Gateway 이미지 밖에서 read-only volume으로 주입할 수 있습니다.
+# 항목을 추가하거나 변경한 뒤 Gateway 컨테이너만 재시작하세요.
+upstreams:
+  - service_id: korean-standard-dictionary
+    mcp_url: http://korean-standard-dictionary:8000/mcp
+    health_url: http://korean-standard-dictionary:8000/healthz
+
+  - service_id: medical-term-review
+    mcp_url: http://medical-term-review:8000/mcp
+    health_url: http://medical-term-review:8000/healthz
+
+  - service_id: report-validation
+    mcp_url: http://report-validation:8000/mcp
+    health_url: http://report-validation:8000/healthz
