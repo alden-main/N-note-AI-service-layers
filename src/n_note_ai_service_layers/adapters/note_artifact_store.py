@@ -6,6 +6,7 @@ import json
 import uuid
 from pathlib import Path
 
+from n_note_ai_service_layers.contracts.codec import from_json_dict, to_json_dict
 from n_note_ai_service_layers.contracts.draft_review import FinalizedNursingNote
 
 NOTE_FILE = "note.json"
@@ -26,12 +27,12 @@ class FileNursingNoteStore:
         directory = self._directory(note.note_id)
         directory.mkdir(parents=True, exist_ok=True)
         with (directory / NOTE_FILE).open("x", encoding="utf-8") as handle:
-            json.dump(note.as_dict(), handle, ensure_ascii=False, indent=2)
+            json.dump(to_json_dict(note), handle, ensure_ascii=False, indent=2)
 
     def get(self, note_id: str) -> FinalizedNursingNote:
         path = self._directory(note_id) / NOTE_FILE
         try:
-            return FinalizedNursingNote.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            return from_json_dict(FinalizedNursingNote, json.loads(path.read_text(encoding="utf-8")))
         except FileNotFoundError as exc:
             raise LookupError("nursing note not found") from exc
 

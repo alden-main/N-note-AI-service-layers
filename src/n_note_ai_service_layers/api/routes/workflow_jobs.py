@@ -44,7 +44,7 @@ _STAGE_FAILURES = {
 
 def resolve_workflow_form(schema_id: str | None, purpose: str | None) -> tuple[str, str]:
     """요청 양식이 없으면 기본 양식(N_NOTE_DEFAULT_FORM)을, 목적이 없으면 활성 양식의 목적을 사용한다."""
-    schema_id = schema_id or settings.default_form_id()
+    schema_id = schema_id or settings.get().default_form_id
     if not schema_id:
         raise HTTPException(status_code=422, detail="schema_id is required when N_NOTE_DEFAULT_FORM is not set")
     if purpose:

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from n_note_ai_service_layers.contracts.codec import IsoDatetime
 
 
 CandidateDecision = Literal["pending", "accepted", "rejected"]
@@ -41,7 +42,7 @@ class DraftRevision:
     fields: dict[str, Any]
     candidate_decisions: dict[str, CandidateDecision]
     edited_by: str
-    created_at: datetime
+    created_at: IsoDatetime
     applied_suggestions: dict[str, str] = field(default_factory=dict)
 
 
@@ -64,11 +65,11 @@ class DraftReviewRecord:
     finalized_note_id: str | None = None
     # 수치 대조 출처(전사문·사실)와 구술 기준 시각이다. revision마다 최신 필드 값으로 다시 대조한다.
     numeric_sources: tuple[str, ...] = ()
-    reference_time: datetime | None = None
+    reference_time: IsoDatetime | None = None
     # LLM이 전사문 용어 힌트를 받아 초안에 반영한 교정({"source_text", "applied_text"})이다.
     # 후보 승인 절차를 거치지 않은 교정이므로 검토 화면과 확정본에 남긴다.
     llm_applied_term_hints: tuple[dict[str, str], ...] = ()
-    created_at: datetime | None = None
+    created_at: IsoDatetime | None = None
 
     def candidate(self, candidate_id: str) -> DraftCandidate | None:
         return next((item for item in self.candidates if item.candidate_id == candidate_id), None)
@@ -76,49 +77,6 @@ class DraftReviewRecord:
     @property
     def latest_revision(self) -> int:
         return self.revisions[-1].revision
-
-    def as_dict(self) -> dict[str, Any]:
-        """저장소 보관용 JSON 호환 사전이다."""
-        return {
-            "draft_id": self.draft_id,
-            "schema_id": self.schema_id,
-            "schema_version": self.schema_version,
-            "transcript": self.transcript,
-            "candidate_ids": list(self.candidate_ids),
-            "revisions": [
-                {**asdict(revision), "created_at": revision.created_at.isoformat()}
-                for revision in self.revisions
-            ],
-            "candidates": [{**asdict(item), "suggestions": list(item.suggestions)} for item in self.candidates],
-            "patient_id": self.patient_id,
-            "encounter_id": self.encounter_id,
-            "finalized_note_id": self.finalized_note_id,
-            "numeric_sources": list(self.numeric_sources),
-            "reference_time": self.reference_time.isoformat() if self.reference_time else None,
-            "llm_applied_term_hints": [dict(item) for item in self.llm_applied_term_hints],
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "DraftReviewRecord":
-        return cls(
-            raw["draft_id"], raw["schema_id"], raw["schema_version"], raw["transcript"], tuple(raw["candidate_ids"]),
-            tuple(
-                DraftRevision(
-                    item["draft_id"], int(item["revision"]), dict(item["fields"]), dict(item["candidate_decisions"]),
-                    item["edited_by"], datetime.fromisoformat(item["created_at"]), dict(item.get("applied_suggestions", {})),
-                )
-                for item in raw["revisions"]
-            ),
-            tuple(DraftCandidate(**{**item, "suggestions": tuple(item["suggestions"])}) for item in raw.get("candidates", [])),
-            raw.get("patient_id"),
-            raw.get("encounter_id"),
-            raw.get("finalized_note_id"),
-            tuple(raw.get("numeric_sources", ())),
-            datetime.fromisoformat(raw["reference_time"]) if raw.get("reference_time") else None,
-            tuple(dict(item) for item in raw.get("llm_applied_term_hints", ())),
-            datetime.fromisoformat(raw["created_at"]) if raw.get("created_at") else None,
-        )
 
 
 @dataclass(frozen=True)
@@ -136,39 +94,8 @@ class FinalizedNursingNote:
     candidate_decisions: dict[str, CandidateDecision]
     applied_suggestions: dict[str, str]
     finalized_by: str
-    finalized_at: datetime
+    finalized_at: IsoDatetime
     trace_id: str
     # 출처에 없지만 확정자가 확인하고 남긴 수치("필드 ID: 값")다.
     confirmed_numeric_findings: tuple[str, ...] = ()
     llm_applied_term_hints: tuple[dict[str, str], ...] = ()
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "note_id": self.note_id,
-            "draft_id": self.draft_id,
-            "revision": self.revision,
-            "schema_id": self.schema_id,
-            "schema_version": self.schema_version,
-            "form_title": self.form_title,
-            "patient_id": self.patient_id,
-            "encounter_id": self.encounter_id,
-            "fields": self.fields,
-            "candidate_decisions": self.candidate_decisions,
-            "applied_suggestions": self.applied_suggestions,
-            "finalized_by": self.finalized_by,
-            "finalized_at": self.finalized_at.isoformat(),
-            "trace_id": self.trace_id,
-            "confirmed_numeric_findings": list(self.confirmed_numeric_findings),
-            "llm_applied_term_hints": [dict(item) for item in self.llm_applied_term_hints],
-        }
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "FinalizedNursingNote":
-        return cls(
-            raw["note_id"], raw["draft_id"], int(raw["revision"]), raw["schema_id"], raw["schema_version"],
-            raw["form_title"], raw.get("patient_id"), raw.get("encounter_id"), dict(raw["fields"]),
-            dict(raw["candidate_decisions"]), dict(raw.get("applied_suggestions", {})), raw["finalized_by"],
-            datetime.fromisoformat(raw["finalized_at"]), raw["trace_id"],
-            tuple(raw.get("confirmed_numeric_findings", ())),
-            tuple(dict(item) for item in raw.get("llm_applied_term_hints", ())),
-        )

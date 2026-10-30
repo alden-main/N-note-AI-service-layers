@@ -7,6 +7,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from n_note_ai_service_layers.contracts.codec import IsoDatetime
+
 
 class SchemaStatus(StrEnum):
     """양식 스키마가 검토와 운영 과정에서 가지는 상태값이다.
@@ -100,7 +102,7 @@ class FormSchema:
     bridge_mapping: tuple[BridgeMapping, ...] = ()
     status: SchemaStatus = SchemaStatus.DRAFT
     approved_by: str | None = None
-    approved_at: datetime | None = None
+    approved_at: IsoDatetime | None = None
     freshness_windows_minutes: dict[str, int] = field(default_factory=dict)
     title: str | None = None
     instructions: str | None = None

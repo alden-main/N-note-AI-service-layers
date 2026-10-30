@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from n_note_ai_service_layers.api import app, draft_review_store, get_nursing_note_workflow, get_workflow_context_flow, template_registry
 from n_note_ai_service_layers.contracts.audio import Transcript
+from n_note_ai_service_layers.contracts.codec import to_json_dict
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
@@ -98,7 +99,7 @@ class NumericFinalizeTests(unittest.TestCase):
         self.assertEqual([item.text for item in raised.exception.findings], ["160"])
         note = store.finalize(record.draft_id, SCHEMA, "nurse-1", "t", numeric_review_confirmed=True)
         self.assertEqual(note.confirmed_numeric_findings, ("assessment: 160",))
-        self.assertEqual(note.as_dict()["confirmed_numeric_findings"], ["assessment: 160"])
+        self.assertEqual(to_json_dict(note)["confirmed_numeric_findings"], ["assessment: 160"])
 
     def test_corrected_value_clears_the_finding(self):
         store = DraftReviewStore()

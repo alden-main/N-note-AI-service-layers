@@ -6,80 +6,37 @@ from pathlib import Path
 from typing import Any
 
 from n_note_ai_service_layers import settings
+from n_note_ai_service_layers.contracts.codec import from_json_dict, to_json_dict
 from n_note_ai_service_layers.contracts.draft_review import DraftCandidate, DraftReviewRecord, FinalizedNursingNote
-from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
+from n_note_ai_service_layers.contracts.form_schema import FormSchema, SchemaStatus
 from n_note_ai_service_layers.contracts.report_validation import ReportValidationResult
 from n_note_ai_service_layers.api.schemas import TemplateRegistrationRequest
 from n_note_ai_service_layers.services.draft_document import ordered_fields, ordered_sections
 
 
 def template_response(schema: FormSchema) -> dict[str, Any]:
-    """내부 불변 template 계약을 API 응답 형식으로 변환한다."""
+    """내부 불변 template 계약을 API 응답 형식으로 변환한다(필드별 PDF 배치는 내보내지 않는다)."""
+    raw = to_json_dict(schema)
     return {
         "schema_id": schema.schema_id,
         "version": schema.version,
         "purpose": schema.purpose,
         "title": schema.display_title,
-        "status": schema.status.value,
+        "status": raw["status"],
         "approved_by": schema.approved_by,
-        "approved_at": schema.approved_at,
+        "approved_at": raw["approved_at"],
         "pdf_template": Path(schema.pdf_template).name if schema.pdf_template else None,
-        "is_default": schema.schema_id == settings.default_form_id(),
+        "is_default": schema.schema_id == settings.get().default_form_id,
         "sections": [
-            {
-                "section_id": section.section_id,
-                "label": section.label,
-                "display_order": section.display_order,
-                "fields": [
-                    {
-                        "field_id": field.field_id,
-                        "type": field.type,
-                        "label": field.label,
-                        "required": field.required,
-                        "llm_allowed": field.llm_allowed,
-                        "fact_id": field.fact_id,
-                        "conditional_required_when": field.conditional_required_when,
-                        "display_order": field.display_order,
-                        "description": field.description,
-                        "options": list(field.options),
-                    }
-                    for field in section.fields
-                ],
-            }
-            for section in schema.sections
+            {**section, "fields": [{key: value for key, value in field.items() if key != "pdf"} for field in section["fields"]]}
+            for section in raw["sections"]
         ],
     }
 
 
 def request_schema(request: TemplateRegistrationRequest) -> FormSchema:
     """template 등록 요청을 항상 draft 상태의 내부 계약으로 변환한다."""
-    return FormSchema(
-        request.schema_id,
-        request.version,
-        request.purpose,
-        tuple(
-            FormSection(
-                section.section_id,
-                tuple(
-                    FormField(
-                        field.field_id,
-                        field.type,
-                        field.required,
-                        field.llm_allowed,
-                        field.fact_id,
-                        field.conditional_required_when,
-                        field.label,
-                        field.display_order,
-                    )
-                    for field in section.fields
-                ),
-                section.label,
-                section.display_order,
-            )
-            for section in request.sections
-        ),
-        status=SchemaStatus.DRAFT,
-    )
+    return from_json_dict(FormSchema, {**request.model_dump(), "status": SchemaStatus.DRAFT})
 
 
 def candidate_id(phase: str, tool_name: str, index: int) -> str:
@@ -87,23 +44,11 @@ def candidate_id(phase: str, tool_name: str, index: int) -> str:
 
 
 def gateway_verification_response(result) -> dict[str, Any]:
-    return {
-        "phase": result.phase,
-        "status": result.status,
-        "tool_names": list(result.tool_names),
-        "auto_apply": result.auto_apply,
-        "occurrences": [
-            {
-                "candidate_id": candidate_id(result.phase, item.tool_name, index),
-                "tool_name": item.tool_name, "start_offset": item.start_offset, "end_offset": item.end_offset,
-                "input_text": item.input_text, "normalized_text": item.normalized_text,
-                "field_id": item.field_id, "category": item.category,
-                "review_status": item.review_status,
-                "suggestions": [{"text": suggestion.text, "score": suggestion.score, "reason": suggestion.reason} for suggestion in item.suggestions],
-            }
-            for index, item in enumerate(result.occurrences)
-        ],
-    }
+    raw = to_json_dict(result)
+    for index, item in enumerate(raw["occurrences"]):
+        del item["phase"]
+        item["candidate_id"] = candidate_id(result.phase, item["tool_name"], index)
+    return raw
 
 
 def candidate_ids(*results) -> tuple[str, ...]:
@@ -130,36 +75,11 @@ def draft_candidates(*results) -> tuple[DraftCandidate, ...]:
 
 def numeric_verification_response(findings) -> dict[str, Any]:
     """출처에 없는 초안 수치 목록이다. 비어 있지 않으면 확정 시 수치 확인이 필요하다."""
-    return {
-        "status": "needs_review" if findings else "ok",
-        "findings": [
-            {"finding_id": item.finding_id, "field_id": item.field_id, "start_offset": item.start_offset,
-             "end_offset": item.end_offset, "text": item.text, "reason": item.reason}
-            for item in findings
-        ],
-    }
+    return {"status": "needs_review" if findings else "ok", "findings": [to_json_dict(item) for item in findings]}
 
 
 def report_validation_response(result: ReportValidationResult) -> dict[str, Any]:
-    return {
-        "status": result.status,
-        "tool_name": result.tool_name,
-        "review_required": result.review_required,
-        "summary": result.summary,
-        "criteria": [
-            {
-                "criterion_id": criterion.criterion_id,
-                "description": criterion.description,
-                "status": criterion.status,
-                "warnings": list(criterion.warnings),
-                "elements": [
-                    {"element_id": element.element_id, "field_id": element.field_id, "status": element.status, "warnings": list(element.warnings)}
-                    for element in criterion.elements
-                ],
-            }
-            for criterion in result.criteria
-        ],
-    }
+    return to_json_dict(result)
 
 
 def sections_response(schema: FormSchema, fields: dict[str, Any], evidence_refs: dict[str, Any] | None = None, candidates: tuple[DraftCandidate, ...] = ()) -> list[dict[str, Any]]:
@@ -202,13 +122,9 @@ def draft_review_response(record: DraftReviewRecord, schema: FormSchema, numeric
         "sections": sections_response(schema, latest.fields, candidates=record.candidates),
         "candidates": [
             {
-                "candidate_id": item.candidate_id, "phase": item.phase, "tool_name": item.tool_name,
-                "field_id": item.field_id, "category": item.category,
-                "start_offset": item.start_offset, "end_offset": item.end_offset,
-                "input_text": item.input_text, "suggestions": list(item.suggestions),
+                **to_json_dict(item),
                 "decision": latest.candidate_decisions.get(item.candidate_id, "pending"),
                 "applicable": bool(item.field_id) and not item.stale,
-                "stale": item.stale,
             }
             for item in record.candidates
         ],
@@ -223,7 +139,7 @@ def draft_review_response(record: DraftReviewRecord, schema: FormSchema, numeric
 
 
 def note_response(note: FinalizedNursingNote, pdf_status: str) -> dict[str, Any]:
-    return {**note.as_dict(), "pdf_status": pdf_status, "pdf_url": f"/v1/nursing-notes/{note.note_id}/pdf" if pdf_status == "ready" else None}
+    return {**to_json_dict(note), "pdf_status": pdf_status, "pdf_url": f"/v1/nursing-notes/{note.note_id}/pdf" if pdf_status == "ready" else None}
 
 
 def workflow_result_response(result, review: DraftReviewRecord, schema: FormSchema, trace_id: str) -> dict[str, Any]:

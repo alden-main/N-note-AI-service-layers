@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 
+from dotenv import load_dotenv
+
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, open_document_store
 from n_note_ai_service_layers.adapters.form_definition_loader import FormDefinitionLoader
@@ -36,44 +38,46 @@ class AppServices:
 
 def build_ner() -> NamedEntityRecognizer | None:
     """설정된 로컬 NER 모델을 기동 시점에 올린다. 설정했는데 못 올리면 기동을 중단한다(조용한 보호 해제 방지)."""
-    model = settings.ner_model()
+    config = settings.get()
+    model = config.ner_model
     if not model:
         return None
     from n_note_ai_service_layers.adapters.transformers_ner import TransformersNerRecognizer
 
-    recognizer = TransformersNerRecognizer(model, settings.ner_min_score(), settings.ner_person_labels(), settings.ner_threads())
+    recognizer = TransformersNerRecognizer(model, config.ner_min_score, config.ner_person_labels, config.ner_threads)
     recognizer.load()
     return recognizer
 
 
 def build_services() -> AppServices:
     """설정을 읽어 저장소와 양식 레지스트리를 만든다. 잘못된 양식 정의는 기동을 중단한다."""
-    settings.load_dotenv()
-    configure_logging(settings.log_level())
-    db_path = settings.state_db_path()
+    load_dotenv(".env")
+    config = settings.get()
+    configure_logging(config.log_level)
+    db_path = config.state_db_path
     documents = open_document_store(db_path)
     audit = AuditTrail(documents)
     registry = FormSchemaRegistry(documents)
     # 운영자가 배포한 양식 정의(N_NOTE_FORMS_DIR)를 활성 양식으로 등록한다.
-    for form in FormDefinitionLoader(settings.forms_dir()).load_all(settings.enabled_form_ids()):
+    for form in FormDefinitionLoader(config.forms_dir).load_all(config.enabled_form_ids):
         registry.add_base(form)
     ner = build_ner()
-    jobs = JobStore(documents, settings.job_timeout_seconds(), settings.draft_retention_hours())
+    jobs = JobStore(documents, config.job_timeout_seconds, config.draft_retention_hours)
     log_event(
         get_logger("startup"), "services_ready",
         state_store="sqlite" if db_path else "memory", forms=len(registry.list_versions()),
-        timezone=str(settings.local_timezone()), require_local_stt=settings.require_local_stt(),
-        ner_model=settings.ner_model(), job_concurrency=settings.job_concurrency(),
+        timezone=str(config.local_timezone), require_local_stt=config.require_local_stt,
+        ner_model=config.ner_model, job_concurrency=config.job_concurrency,
     )
     return AppServices(
         documents,
         audit,
         registry,
         SchemaReviewService(registry),
-        DraftReviewStore(documents, audit, settings.draft_retention_hours()),
+        DraftReviewStore(documents, audit, config.draft_retention_hours),
         HandoffStore(documents),
         jobs,
-        JobRunner(jobs, settings.job_concurrency(), settings.job_max_pending()),
+        JobRunner(jobs, config.job_concurrency, config.job_max_pending),
         ner,
     )
 

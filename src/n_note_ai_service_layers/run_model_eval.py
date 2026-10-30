@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from dotenv import load_dotenv
+
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
@@ -187,6 +189,7 @@ def run_case(case: EvalCase, stt_provider: Any | None = None) -> dict[str, Any]:
 
 
 def summarize(profile: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+    config = settings.get()
     ok = [item for item in records if item["status"] == "ok"]
 
     def mean(key: str) -> float | None:
@@ -196,10 +199,10 @@ def summarize(profile: str, records: list[dict[str, Any]]) -> dict[str, Any]:
     required_total = sum(item["required_total"] for item in ok)
     return {
         "profile": profile,
-        "stt_model": settings.stt_endpoint().model,
-        "llm_model": next((item["model_version"] for item in ok), settings.llm_endpoint().model),
-        "llm_api": settings.llm_api(),
-        "tool_calling": settings.llm_tool_calling_enabled(),
+        "stt_model": config.stt_endpoint.model,
+        "llm_model": next((item["model_version"] for item in ok), config.llm_endpoint.model),
+        "llm_api": config.llm_api,
+        "tool_calling": config.llm_tool_calling_enabled,
         "cases": len(records),
         "ok": len(ok),
         "errors": [f"{item['case_id']}: {item['error']}" for item in records if item["status"] != "ok"],
@@ -236,7 +239,8 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    settings.load_dotenv()
+    load_dotenv(".env")
+    config = settings.get()
     parser = argparse.ArgumentParser(description="N-note STT·LLM 모델 프로필 비교 평가")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="현재 설정(모델 프로필)으로 평가 사례를 실행한다")
@@ -252,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_table(compare(args.out))
         return 0
 
-    profile = args.profile or settings.model_profile() or settings.llm_endpoint().model.replace("/", "_")
+    profile = args.profile or config.model_profile or config.llm_endpoint.model.replace("/", "_")
     cases = [case for case in load_cases(args.cases) if not args.case or case.case_id in args.case]
     if not cases:
         print(f"no evaluation cases in {args.cases}", file=sys.stderr)

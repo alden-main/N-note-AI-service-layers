@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, InMemoryDocumentStore, VersionConflict
+from n_note_ai_service_layers.contracts.codec import from_json_dict, to_json_dict
 
 from n_note_ai_service_layers.contracts.draft_review import (
     CandidateDecision,
@@ -62,11 +63,11 @@ class DraftReviewStore:
         stored = self.store.get(DRAFT_COLLECTION, draft_id)
         if stored is None:
             raise LookupError("draft not found")
-        return DraftReviewRecord.from_dict(stored.payload), stored.version
+        return from_json_dict(DraftReviewRecord, stored.payload), stored.version
 
     def _save(self, record: DraftReviewRecord, expected_version: int) -> None:
         try:
-            self.store.put(DRAFT_COLLECTION, record.draft_id, record.as_dict(), expected_version=expected_version)
+            self.store.put(DRAFT_COLLECTION, record.draft_id, to_json_dict(record), expected_version=expected_version)
         except VersionConflict as exc:
             raise DraftRevisionConflict("draft was modified by another request; reload and retry") from exc
 

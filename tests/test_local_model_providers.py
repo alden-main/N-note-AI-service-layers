@@ -57,10 +57,10 @@ class _Gateway:
 class ModelSettingsTests(unittest.TestCase):
     def test_openai_is_default_and_legacy_variables_still_apply(self):
         with patch.dict(os.environ, {"OPENAI_DRAFT_MODEL": "gpt-legacy", "N_NOTE_LLM_BASE_URL": ""}, clear=True):
-            self.assertEqual(settings.llm_endpoint(), settings.ModelEndpoint("gpt-legacy"))
-            self.assertEqual(settings.llm_api(), "responses")
-            self.assertTrue(settings.llm_tool_calling_enabled())
-            self.assertEqual(settings.stt_endpoint().provider, "openai")
+            self.assertEqual(settings.get().llm_endpoint, settings.ModelEndpoint("gpt-legacy"))
+            self.assertEqual(settings.get().llm_api, "responses")
+            self.assertTrue(settings.get().llm_tool_calling_enabled)
+            self.assertEqual(settings.get().stt_endpoint.provider, "openai")
 
     def test_local_server_profile_selects_chat_api_and_parses_options(self):
         env = {
@@ -72,11 +72,11 @@ class ModelSettingsTests(unittest.TestCase):
             "N_NOTE_STT_BASE_URL": "http://local-stt:8000/v1",
         }
         with patch.dict(os.environ, env, clear=True):
-            self.assertEqual(settings.llm_api(), "chat")
-            self.assertFalse(settings.llm_tool_calling_enabled())
-            self.assertEqual(settings.llm_extra_body(), {"chat_template_kwargs": {"enable_thinking": False}})
-            self.assertEqual(settings.llm_max_tokens(), 2048)
-            self.assertEqual(settings.stt_endpoint().provider, "openai-compatible")
+            self.assertEqual(settings.get().llm_api, "chat")
+            self.assertFalse(settings.get().llm_tool_calling_enabled)
+            self.assertEqual(settings.get().llm_extra_body, {"chat_template_kwargs": {"enable_thinking": False}})
+            self.assertEqual(settings.get().llm_max_tokens, 2048)
+            self.assertEqual(settings.get().stt_endpoint.provider, "openai-compatible")
 
     def test_factory_builds_chat_adapter_without_tools_when_disabled(self):
         env = {"N_NOTE_LLM_BASE_URL": "http://local-llm:8000/v1", "N_NOTE_LLM_MODEL": "medgemma-27b", "N_NOTE_LLM_TOOL_CALLING": "false", "OPENAI_API_KEY": "test-key"}

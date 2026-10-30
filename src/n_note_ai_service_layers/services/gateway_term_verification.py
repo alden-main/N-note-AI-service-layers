@@ -6,6 +6,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
+from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.contracts.term_verification import (
     GatewaySuggestion,
     GatewayTermOccurrence,
@@ -32,11 +33,11 @@ class GatewayTermVerificationFlow:
     def __init__(
         self, gateway: McpGatewayClient, tool_names: tuple[str, ...] | None = None, chunk_chars: int | None = None, max_concurrency: int | None = None,
     ) -> None:
-        from n_note_ai_service_layers.settings import gateway_max_concurrency, term_review_chunk_chars, term_review_tool_names
+        config = settings.get()
         self.gateway = gateway
-        self.tool_names = tool_names if tool_names is not None else term_review_tool_names()
-        self.chunk_chars = chunk_chars or term_review_chunk_chars()
-        self.max_concurrency = max_concurrency or gateway_max_concurrency()
+        self.tool_names = tool_names if tool_names is not None else config.term_review_tool_names
+        self.chunk_chars = chunk_chars or config.term_review_chunk_chars
+        self.max_concurrency = max_concurrency or config.gateway_max_concurrency
 
     def verify(self, phase: str, text: str, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> GatewayTermVerificationResult:
         """전사문 같은 단일 텍스트를 검토하고 원문 기준 offset 후보를 반환한다."""

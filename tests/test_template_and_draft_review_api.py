@@ -17,7 +17,7 @@ from n_note_ai_service_layers.api import (
     template_registry,
 )
 from n_note_ai_service_layers.contracts.report_validation import ReportValidationCriterion, ReportValidationResult
-from n_note_ai_service_layers.settings import pdf_font_path
+from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
@@ -171,7 +171,7 @@ class TemplateAndDraftReviewApiTests(unittest.TestCase):
                 again = self.client.post(f"/v1/nursing-note-drafts/{body['draft_id']}/revisions", json={"edited_by": "nurse-1", "edited_fields": {"assessment": "x"}})
                 self.assertEqual(again.status_code, 409)
 
-                if pdf_font_path() is not None:
+                if settings.get().pdf_font_path is not None:
                     self.assertEqual(note["pdf_status"], "ready")
                     pdf = self.client.get(note["pdf_url"])
                     self.assertEqual(pdf.status_code, 200)

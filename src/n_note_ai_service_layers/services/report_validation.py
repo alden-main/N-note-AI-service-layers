@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.report_validation import (
     ReportValidationCriterion,
@@ -27,9 +28,8 @@ class FormReportValidationFlow:
     """
 
     def __init__(self, gateway: McpGatewayClient, tool_name: str | None = None) -> None:
-        from n_note_ai_service_layers.settings import report_validation_tool_name
         self.gateway = gateway
-        self.tool_name = tool_name if tool_name is not None else report_validation_tool_name()
+        self.tool_name = tool_name if tool_name is not None else settings.get().report_validation_tool_name
 
     def validate(self, schema: FormSchema, document: DraftDocument, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> ReportValidationResult:
         standard = self.standard_for(schema)

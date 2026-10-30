@@ -10,7 +10,11 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
     "files-to-prompt>=0.6",
+    "httpx2>=2.13",
+    "jsonschema>=4.23",
     "openai>=2.0.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.6",
     "pypdf>=5.0",
     "python-multipart>=0.0.20",
     "reportlab>=4.2",

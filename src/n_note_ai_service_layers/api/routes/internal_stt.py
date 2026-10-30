@@ -64,8 +64,9 @@ def _templates(raw: str) -> list[dict]:
 
 
 def _extract(transcript: str, template: dict, hints: tuple[dict, ...]) -> dict:
-    endpoint = settings.llm_endpoint()
-    client = model_providers.openai_client(endpoint, settings.llm_timeout_seconds(), settings.model_max_retries())
+    config = settings.get()
+    endpoint = config.llm_endpoint
+    client = model_providers.openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
     instructions = (
         "Extract fields from the transcript using the supplied schema. Return JSON with fields and relatedSentences objects. "
         "Include every field_id. text is a string; radio is an option string or empty string; checkbox is an array of options. "
@@ -75,14 +76,14 @@ def _extract(transcript: str, template: dict, hints: tuple[dict, ...]) -> dict:
         "Preserve privacy tokens exactly and do not infer identities."
     )
     payload = json.dumps({"transcript": transcript, "schemaDefinition": template["schemaDefinition"], "term_review_hints": hints}, ensure_ascii=False)
-    if settings.llm_api() == "chat":
+    if config.llm_api == "chat":
         request = {"model": endpoint.model, "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": payload}]}
-        if settings.llm_extra_body():
-            request["extra_body"] = settings.llm_extra_body()
-        if settings.llm_max_tokens() is not None:
-            request["max_tokens"] = settings.llm_max_tokens()
-        if settings.llm_temperature() is not None:
-            request["temperature"] = settings.llm_temperature()
+        if config.llm_extra_body:
+            request["extra_body"] = config.llm_extra_body
+        if config.llm_max_tokens is not None:
+            request["max_tokens"] = config.llm_max_tokens
+        if config.llm_temperature is not None:
+            request["temperature"] = config.llm_temperature
         content = _message(client.chat.completions.create(**request))["content"]
     else:
         response = client.responses.create(model=endpoint.model, instructions=instructions, input=payload)

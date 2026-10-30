@@ -249,7 +249,7 @@ class PersistenceTests(unittest.TestCase):
 class TimezoneAndPayloadTests(unittest.TestCase):
     def test_reference_time_uses_ward_timezone_not_container_timezone(self) -> None:
         with patch.dict(os.environ, {"N_NOTE_TIMEZONE": "Asia/Seoul"}):
-            self.assertEqual(datetime.now(settings.local_timezone()).utcoffset(), timedelta(hours=9))
+            self.assertEqual(datetime.now(settings.get().local_timezone).utcoffset(), timedelta(hours=9))
             from n_note_ai_service_layers.services.clock import now_local
             self.assertEqual(now_local().utcoffset(), timedelta(hours=9))
 
@@ -374,7 +374,7 @@ class ModelProviderPolicyTests(unittest.TestCase):
 
     def test_model_clients_have_bounded_timeouts(self) -> None:
         with patch.dict(os.environ, {"N_NOTE_LLM_BASE_URL": "http://local-llm:8000/v1", "N_NOTE_LLM_TIMEOUT_SECONDS": "42", "N_NOTE_MODEL_MAX_RETRIES": "0"}):
-            client = model_providers.openai_client(settings.llm_endpoint(), settings.llm_timeout_seconds(), settings.model_max_retries())
+            client = model_providers.openai_client(settings.get().llm_endpoint, settings.get().llm_timeout_seconds, settings.get().model_max_retries)
         self.assertEqual(client.timeout, 42)
         self.assertEqual(client.max_retries, 0)
 

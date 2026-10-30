@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 import os
 import tempfile
-from n_note_ai_service_layers.settings import load_dotenv
+from dotenv import load_dotenv
 
 
 class _FakeTranscriptions:

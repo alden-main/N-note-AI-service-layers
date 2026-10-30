@@ -3,13 +3,13 @@
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-import http.client
 import json
 import logging
 from threading import Lock
 from time import monotonic
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+
+import httpx2
 
 from .config import UpstreamConfig
 
@@ -44,57 +44,17 @@ class McpResponse:
     session_id: str | None = None
 
 
-class _ConnectionPool:
-    """upstream host별 keep-alive 연결을 스레드 간에 공유한다.
-
-    Gateway는 요청마다 새 handler 스레드를 쓰므로 스레드 로컬이 아닌 공용 유휴 연결 목록을 둔다.
-    ``http.client`` 연결은 스레드 안전하지 않으므로 한 번에 한 스레드만 빌려 쓴다.
-    """
-
-    def __init__(self, max_idle: int = DEFAULT_MAX_IDLE_CONNECTIONS) -> None:
-        self._idle: dict[tuple[str, str, int | None], list[http.client.HTTPConnection]] = {}
-        self._max_idle = max_idle
-        self._lock = Lock()
-
-    def acquire(self, key: tuple[str, str, int | None], timeout: float) -> tuple[http.client.HTTPConnection, bool]:
-        """유휴 연결을 꺼내거나 새로 만든다. 두 번째 값은 재사용 여부다."""
-        with self._lock:
-            idle = self._idle.get(key)
-            connection = idle.pop() if idle else None
-        if connection is not None:
-            if connection.sock is not None:
-                connection.sock.settimeout(timeout)
-            return connection, True
-        scheme, host, port = key
-        factory = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-        return factory(host, port, timeout=timeout), False
-
-    def release(self, key: tuple[str, str, int | None], connection: http.client.HTTPConnection) -> None:
-        with self._lock:
-            idle = self._idle.setdefault(key, [])
-            if len(idle) < self._max_idle:
-                idle.append(connection)
-                return
-        connection.close()
-
-    def close(self) -> None:
-        with self._lock:
-            idle, self._idle = self._idle, {}
-        for connections in idle.values():
-            for connection in connections:
-                connection.close()
-
-
 class HttpTransport:
-    """표준 라이브러리만 사용해 Streamable HTTP MCP 서버에 요청한다.
+    """Streamable HTTP MCP 서버에 요청한다.
 
-    upstream 연결은 keep-alive로 재사용해 호출마다 TCP 연결을 새로 맺지 않는다.
+    ``httpx2`` 연결 풀로 upstream keep-alive 연결을 여러 handler 스레드가 공유한다.
+    통신·시간 초과·HTTP 오류는 모두 ``OSError``로 바꾼다.
     """
 
     def __init__(self, timeout: float = DEFAULT_UPSTREAM_TIMEOUT_SECONDS, max_idle_connections: int = DEFAULT_MAX_IDLE_CONNECTIONS) -> None:
         """upstream MCP·health 요청에 공통으로 적용할 timeout(초)을 설정한다."""
-        self._timeout = timeout
-        self._pool = _ConnectionPool(max_idle_connections)
+        # upstream은 내부망이므로 프록시 환경 변수를 따르지 않는다.
+        self._client = httpx2.Client(timeout=timeout, limits=httpx2.Limits(max_keepalive_connections=max_idle_connections), trust_env=False)
 
     def request_json(
         self, url: str, payload: dict[str, Any], request_id: str | None = None, session_id: str | None = None
@@ -108,14 +68,14 @@ class HttpTransport:
             headers["X-Request-ID"] = request_id
         if session_id:
             headers["Mcp-Session-Id"] = session_id
-        status, response_headers, raw = self._send("POST", url, json.dumps(payload).encode("utf-8"), headers)
-        if status >= 400:
-            raise OSError(f"upstream MCP가 HTTP {status}를 반환했습니다")
+        response = self._send("POST", url, json.dumps(payload).encode("utf-8"), headers)
+        if response.status_code >= 400:
+            raise OSError(f"upstream MCP가 HTTP {response.status_code}를 반환했습니다")
         try:
-            parsed = _decode_mcp_response(raw.decode("utf-8"))
+            parsed = _decode_mcp_response(response.content.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise OSError("upstream MCP 응답 형식이 올바르지 않습니다") from error
-        return McpResponse(parsed, response_headers.get("mcp-session-id"))
+        return McpResponse(parsed, response.headers.get("mcp-session-id"))
 
     def send_notification(self, url: str, payload: dict[str, Any], session_id: str | None = None) -> None:
         """세션을 유지해 MCP notification을 전송한다.
@@ -125,51 +85,28 @@ class HttpTransport:
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         if session_id:
             headers["Mcp-Session-Id"] = session_id
-        status, _, _ = self._send("POST", url, json.dumps(payload).encode("utf-8"), headers)
-        if status >= 400:
+        if self._send("POST", url, json.dumps(payload).encode("utf-8"), headers).status_code >= 400:
             raise OSError("upstream MCP notification 요청에 실패했습니다")
 
     def healthy(self, url: str) -> bool:
         """비민감 health endpoint가 HTTP 200을 반환하는지 확인한다."""
         try:
-            status, _, _ = self._send("GET", url, None, {})
+            return self._send("GET", url, None, {}).status_code == 200
         except OSError:
             return False
-        return status == 200
 
     def close(self) -> None:
         """유휴 upstream 연결을 모두 닫는다."""
-        self._pool.close()
+        self._client.close()
 
-    def _send(self, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
-        """풀의 연결로 요청을 보내고 (상태, 소문자 헤더, 본문)을 반환한다.
-
-        재사용한 유휴 연결을 upstream이 이미 닫았다면 새 연결로 한 번만 다시 보낸다. 시간 초과는
-        호출자의 대기 시간을 두 배로 늘리므로 재시도하지 않는다. 통신 실패는 ``OSError``다.
-        """
-        parts = urlsplit(url)
-        key = (parts.scheme, parts.hostname or "", parts.port)
-        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-        for _ in range(2):
-            connection, reused = self._pool.acquire(key, self._timeout)
-            try:
-                connection.request(method, path, body=body, headers=headers)
-                response = connection.getresponse()
-                raw = response.read()
-            except TimeoutError as error:
-                connection.close()
-                raise OSError("upstream 요청 시간이 초과되었습니다") from error
-            except (OSError, http.client.HTTPException) as error:
-                connection.close()
-                if reused and isinstance(error, (http.client.RemoteDisconnected, http.client.CannotSendRequest, ConnectionResetError, BrokenPipeError)):
-                    continue
-                raise OSError("upstream 연결에 실패했습니다") from error
-            if response.will_close:
-                connection.close()
-            else:
-                self._pool.release(key, connection)
-            return response.status, {name.lower(): value for name, value in response.getheaders()}, raw
-        raise OSError("upstream 연결에 실패했습니다")
+    def _send(self, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> httpx2.Response:
+        """시간 초과는 호출자의 대기 시간을 두 배로 늘리므로 재시도하지 않는다."""
+        try:
+            return self._client.request(method, url, content=body, headers=headers)
+        except httpx2.TimeoutException as error:
+            raise OSError("upstream 요청 시간이 초과되었습니다") from error
+        except httpx2.TransportError as error:
+            raise OSError("upstream 연결에 실패했습니다") from error
 
 
 @dataclass

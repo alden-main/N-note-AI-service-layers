@@ -2,23 +2,83 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from n_note_ai_service_layers.contracts.form_schema import (
-    FormField,
-    FormSchema,
-    FormSection,
-    PdfPlacement,
-    SchemaStatus,
-)
+from pydantic import BaseModel, BeforeValidator, StrictInt, StringConstraints, ValidationError, model_validator
+
+from n_note_ai_service_layers.contracts.codec import from_json_dict
+from n_note_ai_service_layers.contracts.form_schema import FormSchema, SchemaStatus
 from n_note_ai_service_layers.services.schema_validation import SchemaValidationError, validate_schema_structure
 
 FORM_DEFINITION_FILE = "form.json"
-SUPPORTED_FIELD_TYPES = {"string", "text", "integer", "number", "boolean", "array", "date", "datetime", "enum"}
-META_KEYS = {"form_title", "patient_id", "encounter_id", "finalized_by", "finalized_at", "note_id"}
+FieldType = Literal["string", "text", "integer", "number", "boolean", "array", "date", "datetime", "enum"]
+MetaKey = Literal["form_title", "patient_id", "encounter_id", "finalized_by", "finalized_at", "note_id"]
+Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class _Placement(BaseModel):
+    """AcroForm 필드명 또는 쪽·좌표·크기로 지정한 PDF 배치 정보다."""
+
+    field_name: str | None = None
+    page: int | None = None
+    x: float | None = None
+    y: float | None = None
+    width: float | None = None
+    height: float | None = None
+    font_size: float = 10.0
+
+    @model_validator(mode="after")
+    def _located(self) -> _Placement:
+        if not self.field_name and None in (self.page, self.x, self.y, self.width, self.height):
+            raise ValueError("pdf placement requires field_name or page/x/y/width/height")
+        return self
+
+
+class _Field(BaseModel):
+    field_id: Text
+    type: FieldType = "text"
+    required: bool = False
+    llm_allowed: bool = True
+    fact_id: Text | None = None
+    conditional_required_when: Text | None = None
+    label: Text | None = None
+    display_order: StrictInt | None = None
+    description: Text | None = None
+    options: list[Annotated[str, BeforeValidator(str)]] = []
+    pdf: _Placement | None = None
+
+    @model_validator(mode="after")
+    def _enum_has_options(self) -> _Field:
+        if self.type == "enum" and not self.options:
+            raise ValueError("enum field requires options")
+        return self
+
+
+class _Section(BaseModel):
+    section_id: Text
+    fields: list[_Field]
+    label: Text | None = None
+    display_order: StrictInt | None = None
+
+
+class _PdfConfig(BaseModel):
+    template: str | None = None
+    meta: dict[MetaKey, _Placement] | None = None
+
+
+class _FormDefinition(BaseModel):
+    """``form.json``의 계약이다."""
+
+    schema_id: Text
+    version: Text
+    purpose: Text
+    sections: list[_Section]
+    title: Text | None = None
+    instructions: Text | None = None
+    pdf: _PdfConfig | None = None
+    validation_criteria: list[dict[str, Any]] = []
 
 
 class FormDefinitionError(ValueError):
@@ -59,125 +119,28 @@ class FormDefinitionLoader:
     def load(self, path: Path) -> FormSchema:
         """양식 정의 파일 하나를 검증해 활성 스키마로 변환한다."""
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            definition = _FormDefinition.model_validate_json(path.read_bytes())
+        except OSError as exc:
             raise FormDefinitionError(f"cannot read form definition: {path}") from exc
-        if not isinstance(raw, dict):
-            raise FormDefinitionError(f"form definition must be an object: {path}")
+        except ValidationError as exc:
+            raise FormDefinitionError(f"invalid form definition {path}: {exc}") from exc
+        pdf = definition.pdf or _PdfConfig()
         pdf_template = None
-        pdf_config = raw.get("pdf") or {}
-        if not isinstance(pdf_config, dict):
-            raise FormDefinitionError(f"pdf must be an object: {path}")
-        template_name = pdf_config.get("template")
-        meta = pdf_config.get("meta") or {}
-        if not isinstance(meta, dict) or set(meta) - META_KEYS:
-            raise FormDefinitionError(f"pdf.meta keys must be among {sorted(META_KEYS)}: {path}")
-        pdf_meta = tuple((key, _placement(value, path)) for key, value in meta.items())
-        if template_name:
-            template_path = (path.parent / template_name).resolve()
+        if pdf.template:
+            template_path = (path.parent / pdf.template).resolve()
             if path.parent.resolve() not in template_path.parents or not template_path.is_file():
                 raise FormDefinitionError(f"PDF template must be an existing file in the form directory: {path}")
             pdf_template = str(template_path)
-        sections = tuple(self._section(item, path) for item in _list(raw.get("sections"), "sections", path))
-        schema = FormSchema(
-            _text(raw.get("schema_id"), "schema_id", path),
-            _text(raw.get("version"), "version", path),
-            _text(raw.get("purpose"), "purpose", path),
-            sections,
-            status=SchemaStatus.ACTIVE,
-            approved_by=f"form-definition:{path.parent.name}",
-            approved_at=datetime.fromtimestamp(path.stat().st_mtime, timezone.utc),
-            title=_optional_text(raw.get("title"), "title", path),
-            instructions=_optional_text(raw.get("instructions"), "instructions", path),
-            pdf_template=pdf_template,
-            pdf_meta=pdf_meta,
-            validation_criteria=tuple(_list(raw.get("validation_criteria", []), "validation_criteria", path)),
-        )
+        schema = from_json_dict(FormSchema, {
+            **definition.model_dump(exclude={"pdf"}),
+            "status": SchemaStatus.ACTIVE,
+            "approved_by": f"form-definition:{path.parent.name}",
+            "approved_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc),
+            "pdf_template": pdf_template,
+            "pdf_meta": [(key, placement.model_dump()) for key, placement in (pdf.meta or {}).items()],
+        })
         try:
             validate_schema_structure(schema)
         except SchemaValidationError as exc:
             raise FormDefinitionError(f"{path}: {exc}") from exc
         return schema
-
-    def _section(self, raw: Any, path: Path) -> FormSection:
-        if not isinstance(raw, dict):
-            raise FormDefinitionError(f"section must be an object: {path}")
-        fields = tuple(self._field(item, path) for item in _list(raw.get("fields"), "fields", path))
-        return FormSection(
-            _text(raw.get("section_id"), "section_id", path),
-            fields,
-            _optional_text(raw.get("label"), "label", path),
-            _optional_int(raw.get("display_order"), path),
-        )
-
-    @staticmethod
-    def _field(raw: Any, path: Path) -> FormField:
-        if not isinstance(raw, dict):
-            raise FormDefinitionError(f"field must be an object: {path}")
-        field_type = raw.get("type", "text")
-        if field_type not in SUPPORTED_FIELD_TYPES:
-            raise FormDefinitionError(f"unsupported field type {field_type!r}: {path}")
-        options = tuple(str(item) for item in _list(raw.get("options", []), "options", path))
-        if field_type == "enum" and not options:
-            raise FormDefinitionError(f"enum field requires options: {path}")
-        placement = _placement(raw.get("pdf"), path) if raw.get("pdf") is not None else None
-        return FormField(
-            _text(raw.get("field_id"), "field_id", path),
-            field_type,
-            bool(raw.get("required", False)),
-            bool(raw.get("llm_allowed", True)),
-            _optional_text(raw.get("fact_id"), "fact_id", path),
-            _optional_text(raw.get("conditional_required_when"), "conditional_required_when", path),
-            _optional_text(raw.get("label"), "label", path),
-            _optional_int(raw.get("display_order"), path),
-            _optional_text(raw.get("description"), "description", path),
-            options,
-            placement,
-        )
-
-
-def _placement(pdf: Any, path: Path) -> PdfPlacement:
-    """AcroForm 필드명 또는 쪽·좌표·크기로 지정한 PDF 배치 정보를 읽는다."""
-    if not isinstance(pdf, dict):
-        raise FormDefinitionError(f"pdf placement must be an object: {path}")
-    try:
-        placement = PdfPlacement(
-            field_name=pdf.get("field_name"),
-            page=int(pdf["page"]) if "page" in pdf else None,
-            x=float(pdf["x"]) if "x" in pdf else None,
-            y=float(pdf["y"]) if "y" in pdf else None,
-            width=float(pdf["width"]) if "width" in pdf else None,
-            height=float(pdf["height"]) if "height" in pdf else None,
-            font_size=float(pdf.get("font_size", 10.0)),
-        )
-    except (TypeError, ValueError) as exc:
-        raise FormDefinitionError(f"invalid pdf placement: {path}") from exc
-    if not placement.field_name and not placement.has_box:
-        raise FormDefinitionError(f"pdf placement requires field_name or page/x/y/width/height: {path}")
-    return placement
-
-
-def _list(value: Any, name: str, path: Path) -> list[Any]:
-    if not isinstance(value, list):
-        raise FormDefinitionError(f"{name} must be a list: {path}")
-    return value
-
-
-def _text(value: Any, name: str, path: Path) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise FormDefinitionError(f"{name} must be a non-empty string: {path}")
-    return value.strip()
-
-
-def _optional_text(value: Any, name: str, path: Path) -> str | None:
-    if value is None:
-        return None
-    return _text(value, name, path)
-
-
-def _optional_int(value: Any, path: Path) -> int | None:
-    if value is None:
-        return None
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise FormDefinitionError(f"display_order must be an integer: {path}")
-    return value

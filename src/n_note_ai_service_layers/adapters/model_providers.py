@@ -40,12 +40,13 @@ def _cached_client(endpoint: settings.ModelEndpoint, timeout_seconds: float | No
 
 
 def speech_to_text_provider() -> OpenAiSpeechToTextAdapter:
-    endpoint = settings.stt_endpoint()
-    if settings.require_local_stt() and not endpoint.base_url:
+    config = settings.get()
+    endpoint = config.stt_endpoint
+    if config.require_local_stt and not endpoint.base_url:
         # 비식별화는 전사 이후이므로, 원본 음성이 외부 SaaS로 나가는 구성을 막는다.
         raise LocalSttRequired("N_NOTE_REQUIRE_LOCAL_STT requires N_NOTE_STT_BASE_URL")
-    client = openai_client(endpoint, settings.stt_timeout_seconds(), settings.model_max_retries())
-    return OpenAiSpeechToTextAdapter(client, model=endpoint.model, prompt=settings.stt_prompt(), provider=endpoint.provider)
+    client = openai_client(endpoint, config.stt_timeout_seconds, config.model_max_retries)
+    return OpenAiSpeechToTextAdapter(client, model=endpoint.model, prompt=config.stt_prompt, provider=endpoint.provider)
 
 
 def draft_generator(gateway: McpGatewayClient | None) -> OpenAiDraftGenerationAdapter:
@@ -54,17 +55,18 @@ def draft_generator(gateway: McpGatewayClient | None) -> OpenAiDraftGenerationAd
     tool call을 지원하지 않는 모델(``N_NOTE_LLM_TOOL_CALLING=false``)은 Gateway 사전 도구 없이
     전사문 용어 검토 힌트만으로 초안을 만든다.
     """
-    endpoint = settings.llm_endpoint()
-    client = openai_client(endpoint, settings.llm_timeout_seconds(), settings.model_max_retries())
-    tool_gateway = gateway if settings.llm_tool_calling_enabled() else None
-    if settings.llm_api() == "chat":
+    config = settings.get()
+    endpoint = config.llm_endpoint
+    client = openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
+    tool_gateway = gateway if config.llm_tool_calling_enabled else None
+    if config.llm_api == "chat":
         return OpenAiChatDraftGenerationAdapter(
             client,
             endpoint.model,
             gateway_client=tool_gateway,
-            allowed_tool_names=settings.llm_tool_names(),
-            extra_body=settings.llm_extra_body(),
-            max_tokens=settings.llm_max_tokens(),
-            temperature=settings.llm_temperature(),
+            allowed_tool_names=config.llm_tool_names,
+            extra_body=config.llm_extra_body,
+            max_tokens=config.llm_max_tokens,
+            temperature=config.llm_temperature,
         )
-    return OpenAiDraftGenerationAdapter(client, endpoint.model, gateway_client=tool_gateway, allowed_tool_names=settings.llm_tool_names())
+    return OpenAiDraftGenerationAdapter(client, endpoint.model, gateway_client=tool_gateway, allowed_tool_names=config.llm_tool_names)

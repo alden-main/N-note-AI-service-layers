@@ -57,29 +57,31 @@ def _gateway_client(url: str, timeout_seconds: float, catalog_ttl_seconds: float
 
 def _expected_gateway_tools() -> tuple[str, ...]:
     """workflow가 쓰는 Gateway 도구다. 하나라도 catalog에 없으면(MCP 기동 중·장애) catalog를 자주 다시 조회한다."""
-    names = [*settings.term_review_tool_names()]
-    if settings.report_validation_tool_name():
-        names.append(settings.report_validation_tool_name())
-    if settings.llm_tool_calling_enabled():
-        names.extend(settings.llm_tool_names())
+    config = settings.get()
+    names = [*config.term_review_tool_names]
+    if config.report_validation_tool_name:
+        names.append(config.report_validation_tool_name)
+    if config.llm_tool_calling_enabled:
+        names.extend(config.llm_tool_names)
     return tuple(sorted(set(names)))
 
 
 def get_gateway_client() -> McpGatewayClient:
     """요청 간에 공유하는 Gateway 클라이언트다(커넥션 풀·catalog TTL 캐시)."""
+    config = settings.get()
     return _gateway_client(
-        settings.mcp_gateway_url(), settings.mcp_gateway_timeout_seconds(), settings.mcp_gateway_catalog_ttl_seconds(), _expected_gateway_tools(),
+        config.mcp_gateway_url, config.mcp_gateway_timeout_seconds, config.mcp_gateway_catalog_ttl_seconds, _expected_gateway_tools(),
     )
 
 
 def get_note_store() -> FileNursingNoteStore:
     """확정 간호기록 JSON·PDF 저장소를 만든다."""
-    return FileNursingNoteStore(settings.artifact_dir())
+    return FileNursingNoteStore(settings.get().artifact_dir)
 
 
 def get_pdf_renderer() -> NursingNotePdfRenderer:
     """설정한 한글 글꼴로 확정본 PDF renderer를 만든다."""
-    return NursingNotePdfRenderer(settings.pdf_font_path())
+    return NursingNotePdfRenderer(settings.get().pdf_font_path)
 
 
 def get_transcript_redactor() -> TranscriptRedactor:
@@ -108,13 +110,13 @@ def get_nursing_note_workflow(
     return NursingNoteWorkflow(
         stt, generator, GatewayTermVerificationFlow(gateway),
         redactor=get_transcript_redactor(), report_validation=FormReportValidationFlow(gateway),
-        hint_budget_seconds=settings.term_hint_budget_seconds(),
+        hint_budget_seconds=settings.get().term_hint_budget_seconds,
     )
 
 
 def get_authenticated_user(request: Request) -> str | None:
     """앞단(브리지·인증 프록시)이 인증해 넘긴 사용자 ID다(``N_NOTE_USER_HEADER``)."""
-    value = request.headers.get(settings.user_header())
+    value = request.headers.get(settings.get().user_header)
     return value.strip() if value and value.strip() else None
 
 
@@ -127,7 +129,7 @@ def resolve_actor(claimed: str | None, authenticated: str | None, field_name: st
         if claimed and claimed != authenticated:
             raise HTTPException(status_code=403, detail=f"{field_name} does not match the authenticated user")
         return authenticated
-    if settings.require_authenticated_user():
+    if settings.get().require_authenticated_user:
         raise HTTPException(status_code=401, detail="authenticated user header is required")
     if not claimed:
         raise HTTPException(status_code=422, detail=f"{field_name} is required")

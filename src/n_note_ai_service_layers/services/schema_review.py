@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import datetime
 
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, VersionConflict
-from n_note_ai_service_layers.adapters.form_schema_codec import schema_from_dict, schema_to_dict
+from n_note_ai_service_layers.contracts.codec import from_json_dict, to_json_dict
 from n_note_ai_service_layers.contracts.form_schema import (
     ChangeLogEntry, FormField, FormSchema, SchemaCandidate, SchemaReview, SchemaStatus,
 )
@@ -48,7 +48,7 @@ class FormSchemaRegistry:
         with self._lock:
             merged = dict(self._base)
             for document in self._store.list(TEMPLATE_COLLECTION):
-                schema = schema_from_dict(document.payload)
+                schema = from_json_dict(FormSchema, document.payload)
                 merged[(schema.schema_id, schema.version)] = schema
             self._schemas = merged
             self._fingerprint = fingerprint
@@ -98,7 +98,7 @@ class FormSchemaRegistry:
                 raise ValueError("only one active version is allowed")
             if self._store is not None:
                 try:
-                    self._store.put(TEMPLATE_COLLECTION, _store_key(*key), schema_to_dict(schema), expected_version=0)
+                    self._store.put(TEMPLATE_COLLECTION, _store_key(*key), to_json_dict(schema), expected_version=0)
                 except VersionConflict as exc:
                     raise ValueError("schema version already exists and is immutable") from exc
                 self._fingerprint = None
@@ -137,7 +137,7 @@ class FormSchemaRegistry:
     def _replace(self, schema: FormSchema) -> None:
         with self._lock:
             if self._store is not None:
-                self._store.put(TEMPLATE_COLLECTION, _store_key(schema.schema_id, schema.version), schema_to_dict(schema))
+                self._store.put(TEMPLATE_COLLECTION, _store_key(schema.schema_id, schema.version), to_json_dict(schema))
                 self._fingerprint = None
             self._schemas[(schema.schema_id, schema.version)] = schema
 

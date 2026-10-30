@@ -7,10 +7,11 @@ import re
 import time
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter, _value
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
-from n_note_ai_service_layers.services.json_schema import matches_schema
 
 FINAL_OUTPUT_INSTRUCTION = (
     "When you have the information you need, return only the final nursing draft as one JSON object that matches "
@@ -141,7 +142,7 @@ class OpenAiChatDraftGenerationAdapter(OpenAiDraftGenerationAdapter):
             evidence = [{"field_id": key, "refs": value} for key, value in evidence.items()]
         parsed["evidence_refs"] = evidence
         parsed.setdefault("needs_confirmation", False)
-        if not matches_schema(parsed, output_schema):
+        if not Draft202012Validator(output_schema).is_valid(parsed):
             return None
         return self._draft_result(json.dumps(parsed, ensure_ascii=False), schema)
 

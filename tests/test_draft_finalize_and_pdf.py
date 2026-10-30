@@ -13,7 +13,7 @@ from n_note_ai_service_layers.adapters.pdf_renderer import NursingNotePdfRendere
 from n_note_ai_service_layers.contracts.draft_review import DraftCandidate, FinalizedNursingNote
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, PdfPlacement, SchemaStatus
 from n_note_ai_service_layers.services.draft_review import DraftAlreadyFinalized, DraftReviewStore
-from n_note_ai_service_layers.settings import pdf_font_path
+from n_note_ai_service_layers import settings
 
 SCHEMA = FormSchema(
     "daily", "daily/v1", "DAILY",
@@ -70,10 +70,10 @@ def _text(pdf: bytes) -> str:
     return "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(pdf)).pages)
 
 
-@unittest.skipIf(pdf_font_path() is None, "Korean TrueType font is not available")
+@unittest.skipIf(settings.get().pdf_font_path is None, "Korean TrueType font is not available")
 class PdfRendererTests(unittest.TestCase):
     def test_generated_pdf_contains_form_sections_and_values(self):
-        pdf = NursingNotePdfRenderer(pdf_font_path()).render(SCHEMA, _note({"assessment": "통증 호소 없음", "plan": "낙상 예방 교육함"}))
+        pdf = NursingNotePdfRenderer(settings.get().pdf_font_path).render(SCHEMA, _note({"assessment": "통증 호소 없음", "plan": "낙상 예방 교육함"}))
         self.assertTrue(pdf.startswith(b"%PDF"))
         text = _text(pdf)
         self.assertIn("간호일지", text)
@@ -97,7 +97,7 @@ class PdfRendererTests(unittest.TestCase):
                 status=SchemaStatus.ACTIVE, title="간호일지", pdf_template=str(template),
                 pdf_meta=(("patient_id", PdfPlacement(page=1, x=72, y=720, width=200, height=20)),),
             )
-            pdf = NursingNotePdfRenderer(pdf_font_path()).render(schema, _note({"assessment": "통증 호소 없음", "plan": "낙상 예방 교육함"}))
+            pdf = NursingNotePdfRenderer(settings.get().pdf_font_path).render(schema, _note({"assessment": "통증 호소 없음", "plan": "낙상 예방 교육함"}))
         reader = PdfReader(BytesIO(pdf))
         self.assertEqual(len(reader.pages), 2)  # 배치하지 않은 메타데이터는 추가 기록 쪽으로 간다.
         first = reader.pages[0].extract_text()
@@ -114,7 +114,7 @@ class PdfRendererTests(unittest.TestCase):
             canvas.Canvas(str(template)).save()
             schema = FormSchema(SCHEMA.schema_id, SCHEMA.version, SCHEMA.purpose, (FormSection("s", (FormField("assessment", "text", pdf=PdfPlacement(field_name="missing")),)),), status=SchemaStatus.ACTIVE, pdf_template=str(template))
             with self.assertRaises(PdfConfigurationError):
-                NursingNotePdfRenderer(pdf_font_path()).render(schema, _note({"assessment": "x"}))
+                NursingNotePdfRenderer(settings.get().pdf_font_path).render(schema, _note({"assessment": "x"}))
 
 
 class NoteStoreTests(unittest.TestCase):

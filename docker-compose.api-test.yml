@@ -1,0 +1,5 @@
+# 테스트에서만 사용: ai-service API만 호스트에 공개한다.
+services:
+  ai-service:
+    ports:
+      - "${N_NOTE_API_BIND_ADDRESS:-0.0.0.0}:${N_NOTE_API_PORT:-8100}:8000"
