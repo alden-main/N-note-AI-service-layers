@@ -90,7 +90,7 @@ def create_server(
     validator: SuggestionValidator | None = None
     store: AnalysisStore | None = None
     server = GatewayFastMCP(
-        "medical-term-review",
+        "medic",
         host=host,
         port=port,
         streamable_http_path="/mcp",
@@ -127,7 +127,7 @@ def create_server(
         """
         ready = dependencies() is not None
         return JSONResponse(
-            {"status": "ok" if ready else "unavailable", "service_id": "medical-term-review"},
+            {"status": "ok" if ready else "unavailable", "service_id": "medic"},
             status_code=200 if ready else 503,
         )
 

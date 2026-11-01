@@ -33,7 +33,7 @@ class SafeAuditLog:
     def record(self, *, request_id: str | None, tool_name: str, result_code: str, standard_version: str | None, started_at: float) -> None:
         """허용 목록의 metadata만 감사 이벤트로 추가한다."""
         self.events.append(AuditEvent(
-            request_id, "report-validation", "0.1.0", tool_name,
+            request_id, "report", "0.1.0", tool_name,
             result_code, standard_version, int((perf_counter() - started_at) * 1000),
         ))
 

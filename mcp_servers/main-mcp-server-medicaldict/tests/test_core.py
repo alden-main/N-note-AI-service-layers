@@ -161,7 +161,7 @@ class MedicalDictionaryTests(unittest.TestCase):
 
             response = asyncio.run(request_health())
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok", "service_id": "medical-term-review"})
+        self.assertEqual(response.json(), {"status": "ok", "service_id": "medic"})
 
     def test_gateway_tool_contract_returns_structured_success_and_safe_errors(self) -> None:
         """Gateway는 성공·입력 오류·과대 요청을 MCP tool result로 구분할 수 있다."""
@@ -207,7 +207,7 @@ class MedicalDictionaryTests(unittest.TestCase):
 
             health = asyncio.run(request_health())
             self.assertEqual(health.status_code, 503)
-            self.assertEqual(health.json(), {"status": "unavailable", "service_id": "medical-term-review"})
+            self.assertEqual(health.json(), {"status": "unavailable", "service_id": "medic"})
             handler = server._mcp_server.request_handlers[types.CallToolRequest]
             result = asyncio.run(handler(types.CallToolRequest(
                 params=types.CallToolRequestParams(name="analyze_document_terms", arguments={"text": "당뇨병"}),

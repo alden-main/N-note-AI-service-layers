@@ -18,7 +18,7 @@ from .validation import ReportValidationService
 EVALUATE_TOOL = "evaluate_report_against_standard"
 GUIDANCE_TOOL = "get_validation_guidance"
 EVIDENCE_SEARCH_TOOL = "find_evidence_candidates"
-SERVICE_ID = "report-validation"
+SERVICE_ID = "report"
 MAX_REQUEST_BYTES = 1_048_576
 MAX_TEXT_CHARS = 100_000
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-06-18"})
@@ -179,7 +179,7 @@ class McpApplication:
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "report-validation", "version": "0.1.0"},
+                "serverInfo": {"name": "report", "version": "0.1.0"},
             }}
         if request.get("method") == "notifications/initialized":
             return None

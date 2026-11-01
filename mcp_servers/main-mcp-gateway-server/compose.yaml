@@ -1,6 +1,7 @@
 services:
   gateway:
     build: .
+    image: n-note-mcp-gateway:${N_NOTE_IMAGE_TAG:-local}
     command: ["gateway", "--port", "8080"]
     environment:
       # Station C의 STATIONC_MCP_GATEWAY_TIMEOUT(기본 15초)보다 작게 유지한다.

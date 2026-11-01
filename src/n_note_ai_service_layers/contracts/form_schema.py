@@ -109,7 +109,7 @@ class FormSchema:
     pdf_template: str | None = None
     # 양식 PDF 위에 환자 ID·확정자 등 확정 메타데이터를 그릴 위치다.
     pdf_meta: tuple[tuple[str, PdfPlacement], ...] = ()
-    # report-validation MCP의 report-validation-standard/v1 criteria에 추가할 양식별 기준이다.
+    # report MCP의 report-validation-standard/v1 criteria에 추가할 양식별 기준이다.
     validation_criteria: tuple[dict[str, Any], ...] = ()
 
     @property

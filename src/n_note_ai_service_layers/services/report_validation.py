@@ -21,7 +21,7 @@ _STATUSES = {"satisfied", "missing", "insufficient", "uncertain"}
 
 
 class FormReportValidationFlow:
-    """Gateway의 report-validation 도구로 섹션별 필수 항목 작성 여부를 검증한다.
+    """Gateway의 report 도구로 섹션별 필수 항목 작성 여부를 검증한다.
 
     입력: Gateway client와 사용할 도구 이름이다.
     출력: 섹션·추가 기준별 ``satisfied/missing/insufficient/uncertain`` 결과이며 초안을 수정하지 않는다.

@@ -1,7 +1,7 @@
 services:
-  medical-term-review:
+  medic:
     build: .
-    image: medical-term-review-mcp:local
+    image: n-note-mcp-medic:local
     environment:
       MEDICALDICT_MCP_TRANSPORT: streamable-http
       MEDICALDICT_MCP_HOST: 0.0.0.0

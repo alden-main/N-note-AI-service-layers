@@ -8,8 +8,8 @@ from n_note_ai_service_layers.services.draft_document import DraftDocument
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
-KOREAN_TOOL = "korean-standard-dictionary__review_standard_korean_text"
-MEDICAL_TOOL = "medical-term-review__analyze_document_terms"
+KOREAN_TOOL = "korean__review_standard_korean_text"
+MEDICAL_TOOL = "medic__analyze_document_terms"
 TEXT_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"], "additionalProperties": False}
 MEDICAL_SCHEMA = {
     "type": "object",
@@ -50,7 +50,7 @@ class _Gateway:
             result = {"tools": [
                 {"name": KOREAN_TOOL, "description": "review", "inputSchema": TEXT_SCHEMA},
                 {"name": MEDICAL_TOOL, "description": "analyze", "inputSchema": MEDICAL_SCHEMA},
-                {"name": "medical-term-review__submit_review_suggestions", "description": "submit", "inputSchema": {"type": "object", "properties": {"analysis_id": {"type": "string"}, "text": {"type": "string"}}, "required": ["analysis_id", "text"]}},
+                {"name": "medic__submit_review_suggestions", "description": "submit", "inputSchema": {"type": "object", "properties": {"analysis_id": {"type": "string"}, "text": {"type": "string"}}, "required": ["analysis_id", "text"]}},
             ]}
         else:
             result = self._tool(message["params"]["name"], message["params"]["arguments"])
@@ -91,7 +91,7 @@ class GatewayTermVerificationTests(unittest.TestCase):
         self.assertEqual(result.occurrences[0].category, "standard_korean")
         self.assertEqual(result.occurrences[0].suggestions[0].text, "금세")
         self.assertFalse(result.auto_apply)
-        self.assertNotIn("medical-term-review__submit_review_suggestions", [name for name, _ in gateway.calls])
+        self.assertNotIn("medic__submit_review_suggestions", [name for name, _ in gateway.calls])
 
     def test_rejects_offset_or_source_text_mismatch_instead_of_inventing_candidates(self):
         bad = {"findings": [{"start": 0, "end": 2, "source_text": "금세", "analysis_form": "금세", "status": "needs_review", "candidates": []}]}

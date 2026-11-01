@@ -18,15 +18,15 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # LLM 초안 생성 중 호출을 허용하는 Gateway 읽기 전용 도구다. 제출·승인·이력 도구는
 # upstream 상태를 바꾸므로 LLM tool 목록에서 제외한다.
 DEFAULT_LLM_TOOLS = (
-    "korean-standard-dictionary__lookup_standard_dictionary",
-    "medical-term-review__search_medical_terms",
+    "korean__lookup_standard_dictionary",
+    "medic__search_medical_terms",
 )
 # 전사문·초안 원문 범위 기준 검토 후보를 만드는 Gateway 도구다.
 DEFAULT_TERM_REVIEW_TOOLS = (
-    "korean-standard-dictionary__review_standard_korean_text",
-    "medical-term-review__analyze_document_terms",
+    "korean__review_standard_korean_text",
+    "medic__analyze_document_terms",
 )
-DEFAULT_REPORT_VALIDATION_TOOL = "report-validation__evaluate_report_against_standard"
+DEFAULT_REPORT_VALIDATION_TOOL = "report__evaluate_report_against_standard"
 # 표준국어 MCP의 기본 text 상한(10,000자)보다 작게 분할한다.
 DEFAULT_TERM_REVIEW_CHUNK_CHARS = 8000
 # Docker(fonts-nanum)와 macOS에서 바로 쓸 수 있는 TrueType 한글 글꼴 후보다.

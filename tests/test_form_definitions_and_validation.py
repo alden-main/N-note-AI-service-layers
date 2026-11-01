@@ -12,7 +12,7 @@ from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClien
 from n_note_ai_service_layers.services.report_validation import FormReportValidationFlow
 
 FORMS_DIR = Path(__file__).parents[1] / "forms"
-VALIDATION_TOOL = "report-validation__evaluate_report_against_standard"
+VALIDATION_TOOL = "report__evaluate_report_against_standard"
 
 
 def _write_form(root: Path, form_id: str, **overrides) -> Path:
@@ -68,7 +68,7 @@ class FormDefinitionLoaderTests(unittest.TestCase):
 
 
 class _ValidationGateway:
-    """report-validation MCP의 citation 검증 규칙을 흉내 내는 Gateway다."""
+    """report MCP의 citation 검증 규칙을 흉내 내는 Gateway다."""
 
     def __init__(self):
         self.arguments = None

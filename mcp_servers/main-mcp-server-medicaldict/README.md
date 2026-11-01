@@ -10,10 +10,10 @@ Gateway에 전달할 서비스별 등록 정보는 [MCP Gateway 등록 정보 �
 이미지에는 활성 사전 스냅샷을 포함하고, 쓰기 가능한 승인 이력은 `/var/lib/medicaldict` 볼륨에만 저장합니다.
 
 ```bash
-docker build -t medical-term-review-mcp:local .
+docker build -t n-note-mcp-medic:local .
 docker run --rm -i \
   --mount type=volume,src=medicaldict-history,dst=/var/lib/medicaldict \
-  medical-term-review-mcp:local
+  n-note-mcp-medic:local
 ```
 
 `-i`는 필수입니다. stdio MCP 프로토콜은 표준 입력과 출력을 사용합니다.
@@ -33,7 +33,7 @@ stdio MCP를 지원하는 LLM 호스트/클라이언트에는 아래와 같이 D
   "args": [
     "run", "--rm", "-i",
     "--mount", "type=volume,src=medicaldict-history,dst=/var/lib/medicaldict",
-    "medical-term-review-mcp:local"
+    "n-note-mcp-medic:local"
   ]
 }
 ```
@@ -52,14 +52,14 @@ docker compose up --build
 Gateway는 같은 네트워크에서 다음 MCP 및 health endpoint에 연결합니다.
 
 ```text
-http://medical-term-review:8000/mcp
-http://medical-term-review:8000/healthz
+http://medic:8000/mcp
+http://medic:8000/healthz
 ```
 
 외부 AI 서비스에 제공할 때는 이 컨테이너를 직접 공개하지 말고, 인증·TLS·서비스별 도구 권한·속도 제한을 담당하는 MCP Gateway 또는 리버스 프록시 뒤에 배치합니다.
 
 ```text
-AI service ── HTTPS + 인증 ── Gateway / Proxy ── http://medical-term-review:8000/mcp
+AI service ── HTTPS + 인증 ── Gateway / Proxy ── http://medic:8000/mcp
 ```
 
 원격 MCP 클라이언트에는 Gateway가 제공하는 HTTPS endpoint를 등록합니다. 예시는 다음과 같으며, 실제 설정 키는 AI 서비스 제품의 MCP 클라이언트 문서를 따릅니다.

@@ -34,8 +34,8 @@ upstreams:
 
 ```json
 // 요청 (X-Request-ID 헤더는 모든 upstream 호출에 전달된다)
-{"calls": [{"name": "korean-standard-dictionary__review_standard_korean_text", "arguments": {"text": "..."}},
-           {"name": "medical-term-review__analyze_document_terms", "arguments": {"text": "..."}}]}
+{"calls": [{"name": "korean__review_standard_korean_text", "arguments": {"text": "..."}},
+           {"name": "medic__analyze_document_terms", "arguments": {"text": "..."}}]}
 // 응답 200
 {"results": [{"structuredContent": {...}, "isError": false}, {"structuredContent": {"error": {...}}, "isError": true}]}
 ```

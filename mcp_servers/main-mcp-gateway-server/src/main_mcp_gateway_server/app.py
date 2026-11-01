@@ -179,7 +179,7 @@ def _response(message_id: Any, result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _demo_tools(service_id: str) -> list[dict[str, Any]]:
-    tools = {"korean-standard-dictionary": ["review_standard_korean_text"], "medical-term-review": ["analyze_document_terms"]}
+    tools = {"korean": ["review_standard_korean_text"], "medic": ["analyze_document_terms"]}
     return [{"name": name, "description": f"{service_id} 예제 도구", "inputSchema": {"type": "object", "additionalProperties": True}} for name in tools[service_id]]
 
 
@@ -278,7 +278,7 @@ def main() -> None:
     gateway = subparsers.add_parser("gateway")
     gateway.add_argument("--port", type=int, default=8080)
     upstream = subparsers.add_parser("demo-upstream")
-    upstream.add_argument("--service-id", choices=("korean-standard-dictionary", "medical-term-review"), required=True)
+    upstream.add_argument("--service-id", choices=("korean", "medic"), required=True)
     upstream.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     if args.command == "gateway":

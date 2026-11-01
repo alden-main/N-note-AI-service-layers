@@ -14,7 +14,7 @@ from main_mcp_server_document_analysis.observability import SafeAuditLog
 def arguments() -> dict:
     """MCP 도구 호출에 사용할 최소 유효 인자를 반환한다."""
     return {
-        "report": {"text": "report", "tenant_id": "tenant-a"},
+        "report": {"text": "confidential report text", "tenant_id": "tenant-a"},
         "validation_standard": {
             "schema_version": "report-validation-standard/v1", "standard_id": "s", "standard_version": "v1", "status": "approved",
             "usage": {"result_policy": "candidate_only_human_review_required", "mutation_policy": "no_automatic_report_modification"},
@@ -36,7 +36,7 @@ class McpApplicationTest(unittest.TestCase):
         app = McpApplication()
         response = app.evaluate(arguments())
         self.assertTrue(response["review_required"])
-        self.assertNotIn("report", app._audit.events[-1].__dict__.values())
+        self.assertNotIn("confidential report text", app._audit.events[-1].__dict__.values())
 
     def test_guidance_exposes_policy_and_required_elements(self) -> None:
         """LLM이 기준별 근거를 수집할 정책과 요소 설명을 받을 수 있다."""
@@ -72,7 +72,7 @@ class McpApplicationTest(unittest.TestCase):
     def test_initialize_advertises_streamable_http_tool_capability(self) -> None:
         """Gateway는 MCP initialize에서 서버와 도구 capability를 발견한다."""
         response = McpApplication()._handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
-        self.assertEqual(response["result"]["serverInfo"]["name"], "report-validation")
+        self.assertEqual(response["result"]["serverInfo"]["name"], "report")
         self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
         self.assertIn("tools", response["result"]["capabilities"])
 
@@ -118,7 +118,7 @@ class McpApplicationTest(unittest.TestCase):
         response = McpApplication()._handle_rpc({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {
-                "name": "report-validation__get_validation_guidance",
+                "name": "report__get_validation_guidance",
                 "arguments": {"validation_standard": arguments()["validation_standard"]},
             },
         })
@@ -131,7 +131,7 @@ class McpApplicationTest(unittest.TestCase):
         request = {
             "jsonrpc": "2.0", "id": 8, "method": "tools/call",
             "params": {
-                "name": "report-validation__find_evidence_candidates",
+                "name": "report__find_evidence_candidates",
                 "arguments": {
                     **arguments(),
                     "report": {"text": "3개월 동안의 결과분석"},

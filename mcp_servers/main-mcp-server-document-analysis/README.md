@@ -21,7 +21,7 @@ MCP는 `Authorization`, JWT, API key, claim, scope 헤더를 요구·해석·저
 
 | 항목 | 값 |
 | --- | --- |
-| service_id | `report-validation` |
+| service_id | `report` |
 | service_version | `0.1.0` |
 | mcp_endpoint / transport | `/mcp` / `streamable-http` |
 | tool_contract_version | `v1` |

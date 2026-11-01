@@ -6,7 +6,7 @@ import unittest
 ROOT = Path(__file__).parents[1]
 
 
-MCP_SERVICES = ("korean-standard-dictionary", "medical-term-review", "report-validation")
+MCP_SERVICES = ("korean", "medic", "report")
 
 
 def _service_networks(compose: str) -> dict[str, list[str]]:

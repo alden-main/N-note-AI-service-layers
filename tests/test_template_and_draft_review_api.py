@@ -131,7 +131,7 @@ class TemplateAndDraftReviewApiTests(unittest.TestCase):
             def build(self, query): return object()
 
         draft_candidate = GatewayTermOccurrence("draft", "korean__review", 7, 9, "금새", "금새", (GatewaySuggestion("금세"),), field_id="assessment", category="standard_korean")
-        validation = ReportValidationResult("ok", (ReportValidationCriterion("section:nursing_process", "필수 항목", "satisfied"),), {"satisfied": 1}, "report-validation__evaluate_report_against_standard")
+        validation = ReportValidationResult("ok", (ReportValidationCriterion("section:nursing_process", "필수 항목", "satisfied"),), {"satisfied": 1}, "report__evaluate_report_against_standard")
 
         class Workflow:
             def generate(self, snapshot, audio, selected_schema, known_identifiers=(), progress=None):

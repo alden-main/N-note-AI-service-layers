@@ -20,7 +20,7 @@ from .review import TextReviewer
 from .recommendations import RecommendationCatalog
 
 
-SERVICE_ID = "korean-standard-dictionary"
+SERVICE_ID = "korean"
 logger = logging.getLogger(__name__)
 
 

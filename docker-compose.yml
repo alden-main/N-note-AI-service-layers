@@ -121,11 +121,11 @@ services:
     # MCP 서버 하나가 실패해도 Gateway·ai-service는 뜬다(해당 검토만 unavailable). 늦게 준비된 MCP는
     # 다음 tools/list에서 Gateway가 다시 찾고, ai-service는 도구가 빠진 catalog를 15초마다 다시 조회한다.
     depends_on:
-      korean-standard-dictionary:
+      korean:
         condition: service_started
-      medical-term-review:
+      medic:
         condition: service_started
-      report-validation:
+      report:
         condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
@@ -139,13 +139,13 @@ services:
 
   # 아래 MCP 서버의 서비스 이름은 upstreams.yaml의 호스트명과 같아야 한다. host port는 공개하지 않는다.
   # 표준국어대사전 MCP. 검증된 SQLite 릴리스를 이미지에 포함한다(사전 교체 = 이미지 재빌드).
-  korean-standard-dictionary:
+  korean:
     build:
       context: ./mcp_servers/main-mcp-server-kodict
       args:
         # 포함할 사전 릴리스(mcp_servers/main-mcp-server-kodict/data/releases/<버전>/)다. 감사 로그의 사전 버전이 된다.
         KODICT_RELEASE: ${KODICT_RELEASE:-2026.10}
-    image: n-note-mcp-kodict:${N_NOTE_IMAGE_TAG:-local}
+    image: n-note-mcp-korean:${N_NOTE_IMAGE_TAG:-local}
     environment:
       KODICT_MAX_CONCURRENT_REQUESTS: ${KODICT_MAX_CONCURRENT_REQUESTS:-4}
       KODICT_MAX_FINDINGS: ${KODICT_MAX_FINDINGS:-1000}
@@ -155,9 +155,9 @@ services:
     restart: unless-stopped
 
   # 의학용어 MCP. 사전 snapshot은 이미지에 포함하고 검토 이력만 volume에 남긴다.
-  medical-term-review:
+  medic:
     build: ./mcp_servers/main-mcp-server-medicaldict
-    image: n-note-mcp-medicaldict:${N_NOTE_IMAGE_TAG:-local}
+    image: n-note-mcp-medic:${N_NOTE_IMAGE_TAG:-local}
     environment:
       MEDICALDICT_MCP_TRANSPORT: streamable-http
       MEDICALDICT_MCP_HOST: 0.0.0.0
@@ -170,9 +170,9 @@ services:
     restart: unless-stopped
 
   # 보고서(양식) 완결성 검증 MCP. 상태가 없으므로 읽기 전용 파일 시스템으로 실행한다.
-  report-validation:
+  report:
     build: ./mcp_servers/main-mcp-server-document-analysis
-    image: n-note-mcp-report-validation:${N_NOTE_IMAGE_TAG:-local}
+    image: n-note-mcp-report:${N_NOTE_IMAGE_TAG:-local}
     environment:
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"

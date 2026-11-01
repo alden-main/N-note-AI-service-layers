@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: report-validation-mcp:0.1.0
+    image: n-note-mcp-report:0.1.0
     restart: unless-stopped
     environment:
       MCP_HOST: 0.0.0.0
