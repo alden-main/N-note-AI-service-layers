@@ -10,7 +10,7 @@ docker compose up --build -d
 ```
 
 Gateway 컨테이너는 같은 `mcp-gateway-network`에 연결한 뒤
-`http://report-validation-mcp:8000/mcp` 및 `http://report-validation-mcp:8000/healthz`로 접근한다.
+`http://report:8000/mcp` 및 `http://report:8000/healthz`로 접근한다.
 
 ## Gateway 운영 계약
 

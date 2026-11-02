@@ -77,7 +77,9 @@ def _citations(raw: Any) -> tuple[Citation, ...]:
     for citation in raw:
         if not isinstance(citation, dict) or not isinstance(citation.get("start"), int) or not isinstance(citation.get("end"), int):
             raise InputError("invalid citation")
-        citations.append(Citation(citation["start"], citation["end"], _required_text(citation.get("quote"), "citation quote")))
+        # quote는 원문 범위와 그대로 비교하므로 앞뒤 공백을 보존한다.
+        _required_text(citation.get("quote"), "citation quote")
+        citations.append(Citation(citation["start"], citation["end"], citation["quote"]))
     return tuple(citations)
 
 

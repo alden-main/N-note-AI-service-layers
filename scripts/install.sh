@@ -126,7 +126,8 @@ compose() {
     docker compose "$@"
   fi
 }
-if compose up -d --no-build --wait --wait-timeout "$timeout"; then
+# 버전 사이에 서비스 이름이 바뀌면 이전 컨테이너가 남으므로 함께 정리한다(volume은 유지된다).
+if compose up -d --no-build --remove-orphans --wait --wait-timeout "$timeout"; then
   compose ps
   echo
   echo "기동 완료. 로그: docker compose logs -f ai-service gateway"

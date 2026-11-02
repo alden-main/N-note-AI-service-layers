@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta, timezone, tzinfo
+import json
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -47,7 +48,13 @@ def _split_names(value: Any) -> Any:
     return tuple(name.strip() for name in value.split(",") if name.strip()) if isinstance(value, str) else value
 
 
+def _json_object(value: Any) -> Any:
+    """JSON 문자열을 읽는다. 빈 값(compose의 ``${VAR:-}``)은 ``_blank_is_unset``이 먼저 걸러낸다."""
+    return json.loads(value) if isinstance(value, str) else value
+
+
 Names = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_split_names)]
+JsonObject = Annotated[dict[str, Any], NoDecode, BeforeValidator(_json_object)]
 
 
 def _env(*names: str) -> AliasChoices:
@@ -85,7 +92,7 @@ class Settings(BaseSettings):
     # tool call을 지원하지 않는 모델은 끈다.
     llm_tool_calling_enabled: bool = Field(True, validation_alias="N_NOTE_LLM_TOOL_CALLING")
     # OpenAI 호환 서버에 그대로 전달할 추가 요청 필드(JSON 객체)다. 예: thinking 끄기.
-    llm_extra_body: dict[str, Any] = {}
+    llm_extra_body: JsonObject = {}
     # 로컬 서버의 문맥 길이에 맞춰 제한한다. 미설정이면 서버 기본값을 쓴다.
     llm_max_tokens: int | None = None
     llm_temperature: float | None = None

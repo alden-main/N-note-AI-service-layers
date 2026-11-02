@@ -9,10 +9,10 @@
 
 | Gateway 도구 | MCP 서버 | 용도 |
 |---|---|---|
-| `korean-standard-dictionary__review_standard_korean_text` | main-mcp-server-kodict | 전사문·초안 표준어 후보 |
-| `medical-term-review__analyze_document_terms` | main-mcp-server-medicaldict | 전사문·초안 의학용어 후보 |
-| `korean-standard-dictionary__lookup_standard_dictionary`, `medical-term-review__search_medical_terms` | 위 두 서버 | 초안 생성 중 LLM 사전 조회(읽기 전용) |
-| `report-validation__evaluate_report_against_standard` | main-mcp-server-document-analysis | 양식 섹션별 필수 항목 검증 |
+| `korean__review_standard_korean_text` | main-mcp-server-kodict | 전사문·초안 표준어 후보 |
+| `medic__analyze_document_terms` | main-mcp-server-medicaldict | 전사문·초안 의학용어 후보 |
+| `korean__lookup_standard_dictionary`, `medic__search_medical_terms` | 위 두 서버 | 초안 생성 중 LLM 사전 조회(읽기 전용) |
+| `report__evaluate_report_against_standard` | main-mcp-server-document-analysis | 양식 섹션별 필수 항목 검증 |
 
 AI 서비스는 `MCP_GATEWAY_URL`(기본 `http://gateway:8080/mcp`)만 호출합니다. 후보는 항상 `auto_apply=false`이며, 간호사가 승인한 후보만 필드에 반영됩니다.
 
@@ -37,13 +37,28 @@ docker compose ps                 # 5개 서비스가 healthy인지 확인
 
 `docker compose` 하나로 다음 서비스가 함께 뜹니다. 네트워크는 Compose가 만들므로 `docker network create`가 필요 없습니다.
 
+### 외부 API 테스트
+
+테스트 시 다음 명령으로 API 포트만 공개할 수 있습니다. Gateway, MCP 서버와 로컬 모델 서버의 포트는 공개하지 않습니다.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.api-test.yml up -d --build
+curl http://127.0.0.1:8100/healthz
+# 다른 컴퓨터에서: curl http://<서버-IP>:8100/healthz
+# API 문서: http://<서버-IP>:8100/docs
+```
+
+기본적으로 모든 호스트 인터페이스의 8100 포트에 바인딩합니다. `N_NOTE_API_BIND_ADDRESS`와 `N_NOTE_API_PORT` 환경 변수 또는 `.env`로 변경할 수 있습니다(예: 로컬에서만 접근하려면 `N_NOTE_API_BIND_ADDRESS=127.0.0.1`). 원격 접속에는 서버 방화벽과 네트워크의 해당 포트 허용이 필요합니다. 테스트 종료 후 기본 설정으로 되돌리려면 `docker compose -f docker-compose.yml -f docker-compose.api-test.yml down` 후 `docker compose up -d`를 실행합니다.
+
+이 설정은 API 앱 전체(`/internal/v1`, `/docs` 포함)를 공개하며 별도의 인증을 추가하지 않습니다. `X-Authenticated-User` 헤더는 인증 프록시가 검증한 값을 신뢰하는 용도이므로 직접 공개된 API의 인증 수단이 아닙니다. 신뢰할 수 있는 테스트 네트워크에서 합성 데이터만 사용하고, 인터넷에 공개하려면 인증 프록시와 접근 제한을 먼저 구성하세요.
+
 | 서비스 | 소스 | 네트워크 | 역할 |
 |---|---|---|---|
 | `ai-service` | 이 저장소 | `ai-gateway-network` | API·STT·초안 생성 |
 | `gateway` | `mcp_servers/main-mcp-gateway-server` | 두 네트워크 모두 | ai-service가 호출하는 유일한 MCP endpoint |
-| `korean-standard-dictionary` | `mcp_servers/main-mcp-server-kodict` | `mcp-gateway-network` | 표준국어 검토 |
-| `medical-term-review` | `mcp_servers/main-mcp-server-medicaldict` | `mcp-gateway-network` | 의학용어 검토 |
-| `report-validation` | `mcp_servers/main-mcp-server-document-analysis` | `mcp-gateway-network` | 양식 완결성 검증 |
+| `korean` | `mcp_servers/main-mcp-server-kodict` | `mcp-gateway-network` | 표준국어 검토 |
+| `medic` | `mcp_servers/main-mcp-server-medicaldict` | `mcp-gateway-network` | 의학용어 검토 |
+| `report` | `mcp_servers/main-mcp-server-document-analysis` | `mcp-gateway-network` | 양식 완결성 검증 |
 
 MCP 서버 하나가 기동에 실패해도 Gateway와 ai-service는 뜨고, 해당 검토만 `unavailable`로 표시됩니다(`docker compose ps`에서 `unhealthy` 확인). 서버가 복구되면 Gateway가 다음 도구 목록 조회에서 다시 찾고, ai-service는 필요한 도구가 빠진 동안 15초마다 목록을 다시 조회하므로 재시작할 필요가 없습니다.
 
@@ -103,7 +118,7 @@ uv run n-note-model-eval compare                  # 프로필별 최근 결과 �
 | `N_NOTE_LLM_TOOLS` | 사전 조회 도구 2종 | LLM에 노출할 Gateway 도구(쉼표 구분) |
 | `N_NOTE_TERM_REVIEW_TOOLS` | 표준어·의학용어 검토 도구 2종 | 후보 생성 도구 |
 | `N_NOTE_TERM_HINT_BUDGET_SECONDS` | `3` | 전사문 용어 검토를 LLM 힌트로 쓰려고 기다리는 최대 시간. 넘으면 힌트 없이 초안 생성을 시작하고 검토 후보는 나중에 응답에 담음 |
-| `N_NOTE_REPORT_VALIDATION_TOOL` | `report-validation__evaluate_report_against_standard` | 비우면 양식 검증 생략 |
+| `N_NOTE_REPORT_VALIDATION_TOOL` | `report__evaluate_report_against_standard` | 비우면 양식 검증 생략 |
 | `N_NOTE_STATE_DB` | 없음(메모리) · Docker는 `/var/lib/n-note/state/state.sqlite3` | 초안·핸드오프·감사 이력·양식 상태 SQLite. 미설정이면 재시작 시 사라지고 worker 간에 공유되지 않는다 |
 | `N_NOTE_WORKERS` | `1` · Docker는 `2` | uvicorn worker 수(`N_NOTE_STATE_DB`가 있어야 2 이상 가능) |
 | `N_NOTE_DRAFT_RETENTION_HOURS` | `72` | 확정 전 초안(전사문·환자 ID 포함) 보관 시간 |
@@ -142,7 +157,7 @@ curl http://localhost:8000/v1/nursing-note-jobs/{job_id}
 # 3) 후보 승인(제안어 선택) 또는 직접 수정 → 새 revision
 curl -X POST http://localhost:8000/v1/nursing-note-drafts/{draft_id}/revisions \
   -H 'Content-Type: application/json' \
-  -d '{"edited_by":"nurse-1","expected_revision":1,"candidate_decisions":{"draft:korean-standard-dictionary__review_standard_korean_text:0":"accepted"},"selected_suggestions":{}}'
+  -d '{"edited_by":"nurse-1","expected_revision":1,"candidate_decisions":{"draft:korean__review_standard_korean_text:0":"accepted"},"selected_suggestions":{}}'
 
 # 4) 확정 → 불변 확정본 + PDF 생성
 #    전사문에 없는 수치가 남아 있으면 확인 표시(numeric_review_confirmed)가 있어야 확정된다.

@@ -68,6 +68,21 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(result["criteria"][0]["finding"]["status"], "satisfied")
         self.assertEqual(result["criteria"][0]["elements"][0]["status"], "missing")
 
+    def test_citation_quote_keeps_surrounding_whitespace(self) -> None:
+        """앞뒤 공백이 있는 원문 범위도 그대로 일치하면 satisfied로 남는다."""
+        text = "Result: 0.04 \n"
+        quote = text[8:]
+        candidate = {"criteria": [{"criterion_id": "endpoint", "status": "satisfied", "citations": [{"start": 8, "end": len(text), "quote": quote}]}]}
+        finding = service().evaluate({"text": text}, standard(), candidate).as_dict()["criteria"][0]["finding"]
+        self.assertEqual(finding["status"], "satisfied")
+        self.assertEqual(finding["citations"][0]["quote"], quote)
+
+    def test_blank_citation_quote_is_normalized_to_uncertain(self) -> None:
+        """공백뿐인 quote는 근거가 아니므로 satisfied가 되지 않는다."""
+        candidate = {"criteria": [{"criterion_id": "endpoint", "status": "satisfied", "citations": [{"start": 0, "end": 2, "quote": "  "}]}]}
+        finding = service().evaluate({"text": "  report"}, standard(), candidate).as_dict()["criteria"][0]["finding"]
+        self.assertEqual(finding["status"], "uncertain")
+
     def test_invalid_citation_is_normalized_to_uncertain(self) -> None:
         """조작된 quote는 성공 결과가 아니라 uncertain warning이 된다."""
         candidate = {"criteria": [{"criterion_id": "endpoint", "status": "satisfied", "citations": [{"start": 0, "end": 3, "quote": "bad"}]}]}

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import re
 import unittest
+from unittest.mock import patch
+
+from n_note_ai_service_layers import settings
 
 ROOT = Path(__file__).parents[1]
 
@@ -80,6 +85,20 @@ class DockerGatewayConfigurationTests(unittest.TestCase):
                     self.assertIn("N_NOTE_LOCAL_LLM_MODEL", values)
                 if "local-stt" in values["N_NOTE_COMPOSE_PROFILES"]:
                     self.assertEqual(values["N_NOTE_STT_BASE_URL"], "http://local-stt:8000/v1")
+
+    def test_settings_accept_every_blank_value_that_compose_passes(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        blank = dict.fromkeys(re.findall(r"^\s+([A-Z][A-Z0-9_]*): \$\{.*:-\}+\s*$", compose, re.MULTILINE), "")
+        self.assertIn("N_NOTE_LLM_EXTRA_BODY", blank)
+        with patch.dict(os.environ, blank, clear=True):
+            self.assertEqual(settings.get().llm_extra_body, {})
+
+    def test_standalone_report_compose_uses_the_gateway_upstream_host(self):
+        compose = (ROOT / "mcp_servers" / "main-mcp-server-document-analysis" / "compose.yaml").read_text()
+        self.assertIn("\n  report:\n", compose)
+
+    def test_install_removes_containers_of_renamed_services(self):
+        self.assertIn("--remove-orphans", (ROOT / "scripts" / "install.sh").read_text())
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 services:
-  report-validation-mcp:
+  report:
     build:
       context: .
       dockerfile: Dockerfile
