@@ -2,4 +2,4 @@
 services:
   ai-service:
     ports:
-      - "${N_NOTE_API_BIND_ADDRESS:-0.0.0.0}:${N_NOTE_API_PORT:-8100}:8000"
+      - "${N_NOTE_API_BIND_ADDRESS:-0.0.0.0}:${N_NOTE_API_PORT:-8400}:8000"

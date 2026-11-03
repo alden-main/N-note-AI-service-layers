@@ -99,8 +99,8 @@ if [[ -z "$profile" && -z "$(env_value OPENAI_API_KEY)" ]]; then
   echo "        .env에 키를 넣고 ./scripts/install.sh --skip-load 로 다시 기동하세요." >&2
 fi
 
-# 예전 절차(docker network create)로 만든 같은 이름의 네트워크는 Compose가 쓰지 못한다.
-for network in ai-gateway-network mcp-gateway-network; do
+# 예전 절차(docker network create)로 만든 같은 이름의 네트워크가 있으면 Compose가 그대로 써서 internal 설정이 적용되지 않는다.
+for network in n-note-edge ai-gateway-network mcp-gateway-network; do
   if docker network inspect "$network" >/dev/null 2>&1; then
     owner="$(docker network inspect "$network" --format '{{index .Labels "com.docker.compose.project"}}')"
     if [[ "$owner" != "$project" ]]; then

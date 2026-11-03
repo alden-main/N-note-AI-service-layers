@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 from threading import RLock
 from collections import OrderedDict
 from difflib import SequenceMatcher
@@ -15,6 +16,19 @@ from .models import DictionaryTerm, MatchType, SearchHit, SearchResult
 
 
 KOREAN_PREFIX_CACHE_SIZE = 1_024
+PHONETIC_MIN_SYLLABLES = 3
+_PHONETIC_NAME = re.compile(rf"[가-힣]{{{PHONETIC_MIN_SYLLABLES},12}}")
+# STT가 자주 혼동하는 초성(평음·경음·격음)과 모음(ㅐ/ㅔ 계열)을 같은 소리로 묶는다.
+_PHONETIC_JAMO = str.maketrans({
+    "\u1101": "\u1100", "\u110f": "\u1100",  # ㄲ ㅋ → ㄱ
+    "\u1104": "\u1103", "\u1110": "\u1103",  # ㄸ ㅌ → ㄷ
+    "\u1108": "\u1107", "\u1111": "\u1107",  # ㅃ ㅍ → ㅂ
+    "\u110a": "\u1109",                       # ㅆ → ㅅ
+    "\u110d": "\u110c", "\u110e": "\u110c",  # ㅉ ㅊ → ㅈ
+    "\u1162": "\u1166",                       # ㅐ → ㅔ
+    "\u1164": "\u1168",                       # ㅒ → ㅖ
+    "\u116b": "\u1170", "\u116c": "\u1170",  # ㅙ ㅚ → ㅞ
+})
 
 
 class DictionaryConfigurationError(RuntimeError):
@@ -29,6 +43,20 @@ def normalize_term(value: str) -> str:
 def comparison_key(value: str) -> str:
     """공백·대소문자·일반 구분 기호 차이를 비교할 보조 키를 만든다."""
     return re.sub(r"[^\w가-힣]", "", normalize_term(value))
+
+
+def phonetic_key(value: str) -> str:
+    """받침을 지우고 혼동하기 쉬운 자모를 묶은 발음 키다. 첫 음절이 틀린 오인식도 같은 키가 된다.
+
+    예: '강경변증'과 '간경변증'은 받침만 달라 키가 같다.
+    """
+    jamo = unicodedata.normalize("NFD", value)
+    return "".join(char for char in jamo if not "\u11a8" <= char <= "\u11ff").translate(_PHONETIC_JAMO)
+
+
+def jamo_similarity(left: str, right: str) -> float:
+    """자모 단위 문자열 유사도다. 음절 단위보다 한 글자 안의 받침·모음 차이를 작게 본다."""
+    return _similarity(unicodedata.normalize("NFD", left), unicodedata.normalize("NFD", right))
 
 
 class DictionaryRepository:
@@ -51,6 +79,9 @@ class DictionaryRepository:
         # 제한된 LRU로 재사용해 반복 SQLite 연결·질의를 피한다.
         self._korean_prefix_cache: OrderedDict[str, tuple[DictionaryTerm, ...]] = OrderedDict()
         self._korean_prefix_cache_lock = RLock()
+        # 접두어 색인으로 찾을 수 없는 첫 음절 오류용이다. 스냅샷은 읽기 전용이라 메모리에 만든다.
+        self._phonetic_index: dict[str, tuple[str, ...]] | None = None
+        self._phonetic_index_lock = RLock()
 
     def find_exact(self, expression: str) -> list[DictionaryTerm]:
         """표현의 한글·영문 정규화 컬럼을 모두 조회한다.
@@ -122,6 +153,26 @@ class DictionaryRepository:
                 self._korean_prefix_cache.popitem(last=False)
         return list(terms)
 
+    def load_phonetic_index(self) -> dict[str, tuple[str, ...]]:
+        """발음 키 → 정규화 한글 용어명 색인을 한 번만 만든다."""
+        with self._phonetic_index_lock:
+            if self._phonetic_index is None:
+                with self._connect() as connection:
+                    rows = connection.execute("SELECT DISTINCT normalized_kor_name FROM snapshot_term").fetchall()
+                index: dict[str, list[str]] = {}
+                for (name,) in rows:
+                    if name and _PHONETIC_NAME.fullmatch(name):
+                        index.setdefault(phonetic_key(name), []).append(name)
+                self._phonetic_index = {key: tuple(names) for key, names in index.items()}
+            return self._phonetic_index
+
+    def _phonetic_candidates(self, normalized: str) -> list[DictionaryTerm]:
+        """발음 키가 같은 용어를 찾는다. 짧은 표현은 일반 단어와 겹쳐 제외한다."""
+        if not _PHONETIC_NAME.fullmatch(normalized):
+            return []
+        names = self.load_phonetic_index().get(phonetic_key(normalized), ())
+        return [term for name in names for term in self.find_exact(name)]
+
     def search(self, query: str, limit: int = 10, match_modes: set[MatchType] | None = None) -> SearchResult:
         """색인된 정규화 키의 제한된 접두 후보만 점수화해 검색한다.
 
@@ -155,7 +206,7 @@ class DictionaryRepository:
         # The snapshot's normalized-name indexes are the dedicated search keys.
         # At most 200 indexed prefix candidates are read; the 339k-term table is
         # never walked for an individual similar search.
-        for term in self._prefix_candidates(normalized, candidate_limit=100):
+        for term in [*self._prefix_candidates(normalized, candidate_limit=100), *self._phonetic_candidates(normalized)]:
             key = _term_key(term)
             if key in hits:
                 continue

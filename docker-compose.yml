@@ -4,8 +4,11 @@
 # local-stt·local-llm도 띄운다.
 #   scripts/compose-model.sh medgemma-27b up -d
 #
-# 네트워크 경계: ai-service는 ai-gateway-network에만, MCP 서버는 mcp-gateway-network(internal)에만 연결한다.
-# Gateway만 두 네트워크에 연결되므로 ai-service는 MCP 서버에 직접 접근할 수 없다.
+# 네트워크 경계:
+#   n-note-edge               외부 연결용(API 노출·OpenAI 호출·브리지 연동). ai-service만 연결한다.
+#   ai-gateway-network        내부 전용(internal). ai-service ↔ Gateway·로컬 모델 서버.
+#   mcp-gateway-network       내부 전용(internal). Gateway ↔ MCP 서버.
+# Gateway만 두 내부 네트워크에 연결되므로 ai-service는 MCP 서버에, 외부는 Gateway에 직접 접근할 수 없다.
 x-mcp-healthcheck: &mcp-healthcheck
   test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
   interval: 10s
@@ -16,9 +19,9 @@ x-mcp-healthcheck: &mcp-healthcheck
 x-vllm: &vllm
   ipc: host
   environment:
-    # gated 모델(MedGemma 등) 다운로드용이다. 폐쇄망에서는 미리 받은 캐시만 쓰도록 HF_HUB_OFFLINE=1로 둔다.
+    # ai-gateway-network는 인터넷이 막혀 있으므로 모델은 scripts/download_models.sh로 미리 받은 캐시만 쓴다.
     HF_TOKEN: ${HF_TOKEN:-}
-    HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+    HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
   volumes:
     - ${N_NOTE_MODEL_CACHE:-./model-cache}:/root/.cache/huggingface
   networks:
@@ -104,6 +107,7 @@ services:
       start_period: 30s
     networks:
       - ai-gateway-network
+      - n-note-edge
 
   # MCP Gateway: ai-service가 호출하는 유일한 MCP endpoint(http://gateway:8080/mcp)다.
   gateway:
@@ -231,8 +235,13 @@ volumes:
 
 # Compose가 만들고 관리한다(사전 docker network create 불필요). 이름은 기존 문서·외부 스택과 맞춘다.
 networks:
+  # 브리지·프록시 컨테이너는 이 네트워크에 연결해 http://ai-service:8000으로 호출한다.
+  n-note-edge:
+    name: n-note-edge
   ai-gateway-network:
     name: ai-gateway-network
+    # 인터넷과 외부 컨테이너를 차단한다. ai-service의 외부 통신은 n-note-edge로 나간다.
+    internal: true
   mcp-gateway-network:
     name: mcp-gateway-network
     # MCP 서버는 외부 인터넷이 필요 없다(사전 데이터가 이미지·volume에 있다).

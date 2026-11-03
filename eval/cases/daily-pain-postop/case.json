@@ -1,0 +1,12 @@
+{
+  "schema_id": "nursing-daily-note",
+  "language_hint": "ko",
+  "expected": {
+    "keywords": {
+      "assessment": ["수술 부위", "NRS", "6"],
+      "plan_and_intervention": ["진통제", "자세"],
+      "evaluation": ["3"]
+    },
+    "forbidden": ["2023", "2024", "2025", "감염"]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "schema_id": "nursing-daily-note",
+  "language_hint": "ko",
+  "expected": {
+    "keywords": {
+      "assessment": ["어지러", "낙상"],
+      "plan_and_intervention": ["침상 난간", "호출벨", "보호자"]
+    },
+    "forbidden": ["2023", "2024", "2025", "골절", "160"]
+  }
+}

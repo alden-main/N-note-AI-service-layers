@@ -2,7 +2,7 @@
 
 사례 디렉터리(``eval/cases/<case_id>/``)마다 ``case.json``과 ``transcript.txt`` 또는 음성 파일
 (``audio.wav`` 등)을 둔다. 전사문만 있으면 STT를 건너뛰어 LLM만 비교하고, 음성과
-``reference_transcript.txt``가 있으면 STT 문자 오류율(CER)도 잰다. 결과는 사례별 JSONL과 요약 JSON으로
+``reference_transcript.txt``가 있으면 STT 문자 오류율(CER)과 의학용어 재현율도 잰다. 결과는 사례별 JSONL과 요약 JSON으로
 ``eval/results/<profile>/<시각>/``에 저장하며(전사문에 없는 수치 검출 포함), ``compare``로 프로필별 요약을 표로 비교한다.
 
 실제 환자 음성·기록은 평가 사례에 넣지 않는다(합성 또는 비식별 자료만 사용).
@@ -111,6 +111,13 @@ def character_error_rate(reference: str, hypothesis: str) -> float:
     return previous[-1] / len(ref)
 
 
+def score_transcript(transcript: str, expected: dict[str, Any]) -> dict[str, Any]:
+    """``expected.stt_terms``(전사문에 그대로 나와야 할 의학용어)의 재현율을 계산한다."""
+    terms = expected.get("stt_terms", [])
+    missing = [term for term in terms if term not in transcript]
+    return {"stt_term_recall": round(1 - len(missing) / len(terms), 3) if terms else None, "missing_stt_terms": missing}
+
+
 def score_draft(schema: FormSchema, fields: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
     """필수 항목 작성률, 기대 핵심어 포함률, 금지어(지어낸 사실) 검출을 계산한다.
 
@@ -184,6 +191,7 @@ def run_case(case: EvalCase, stt_provider: Any | None = None) -> dict[str, Any]:
         # 전사문에 없는 초안 수치(바뀐 활력징후, 지어낸 시각 등)다.
         "numeric_findings": [f"{item.field_id}: {item.text}" for item in result.numeric_findings],
         **score_draft(schema, result.draft.proposed_fields, case.expected),
+        **(score_transcript(result.transcript.text, case.expected) if uses_audio else {}),
     })
     return record
 
@@ -211,13 +219,14 @@ def summarize(profile: str, records: list[dict[str, Any]]) -> dict[str, Any]:
         "forbidden_cases": sum(1 for item in ok if item["forbidden_found"]),
         "numeric_flag_cases": sum(1 for item in ok if item["numeric_findings"]),
         "mean_cer": mean("cer"),
+        "mean_stt_term_recall": mean("stt_term_recall"),
         "mean_llm_seconds": mean("llm_seconds"),
         "mean_stt_seconds": mean("stt_seconds"),
         "mean_total_seconds": mean("total_seconds"),
     }
 
 
-COLUMNS = ("profile", "llm_model", "ok", "cases", "required_fill_rate", "keyword_recall", "forbidden_cases", "numeric_flag_cases", "mean_cer", "mean_llm_seconds", "mean_total_seconds")
+COLUMNS = ("profile", "llm_model", "ok", "cases", "required_fill_rate", "keyword_recall", "forbidden_cases", "numeric_flag_cases", "mean_cer", "mean_stt_term_recall", "mean_llm_seconds", "mean_total_seconds")
 
 
 def compare(results_root: Path) -> list[dict[str, Any]]:

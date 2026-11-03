@@ -7,11 +7,15 @@ Docker 내부망에서 AI 서비스의 MCP 요청을 서비스별 upstream MCP �
 ```bash
 uv sync
 uv run python -m unittest discover -s tests -v
-docker network inspect mcp-gateway-network >/dev/null 2>&1 || docker network create mcp-gateway-network
-docker compose up --build -d
 ```
 
-Gateway endpoint는 Compose 내부의 `http://gateway:8080/mcp`입니다. 이 Compose는 Gateway와 AI 서비스 예제만 실행합니다. upstream MCP 서버는 각각 별도 Compose 프로젝트에서 공용 `mcp-gateway-network`에 연결해 실행합니다.
+Gateway는 저장소 root의 `docker-compose.yml`로 ai-service, MCP 서버 3종과 함께 실행합니다. 이 폴더에는 별도 Compose 파일이 없습니다. Gateway만 다시 빌드해 교체하려면 root에서 다음을 실행합니다.
+
+```bash
+docker compose up -d --build --no-deps gateway
+```
+
+Gateway endpoint는 Compose 내부의 `http://gateway:8080/mcp`입니다. upstream MCP 서버는 같은 root Compose에서 `mcp-gateway-network`에 연결됩니다.
 
 ## Upstream 등록
 
@@ -24,7 +28,7 @@ upstreams:
     health_url: http://new-mcp-server:8000/healthz
 ```
 
-각 서버는 `mcp-gateway-network` external network에 연결하고 URL hostname과 일치하는 network alias를 제공해야 합니다. Gateway는 upstream의 `initialize` 응답에서 받은 `Mcp-Session-Id`를 `notifications/initialized`, `tools/list`, `tools/call`에 전달하므로 세션을 요구하는 Streamable HTTP MCP 서버와도 연동됩니다.
+각 서버는 root `docker-compose.yml`에 URL hostname과 같은 이름의 서비스로 정의하고 `mcp-gateway-network`에 연결해야 합니다. Gateway는 upstream의 `initialize` 응답에서 받은 `Mcp-Session-Id`를 `notifications/initialized`, `tools/list`, `tools/call`에 전달하므로 세션을 요구하는 Streamable HTTP MCP 서버와도 연동됩니다.
 
 ### 동시 호출과 일괄 호출
 
@@ -44,6 +48,6 @@ upstreams:
 
 Gateway가 upstream보다 먼저 기동돼도 다음 클라이언트의 `tools/list` 요청에서 discovery를 다시 수행합니다. 새 MCP 서버를 등록하거나 도구 schema를 바꾼 뒤에는 클라이언트에서 MCP 연결/도구 목록을 새로고침하세요. 설정을 즉시 검증하거나 현재 연결을 모두 새로 만들려면 YAML 저장 후 `docker compose restart gateway`를 실행합니다. `UPSTREAM_CONFIG_PATH`로 다른 read-only 설정 파일 경로를 지정할 수도 있습니다.
 
-검증 후에는 `docker compose down`으로 컨테이너와 네트워크를 정리합니다. 인증·인가·claim 전달은 현재 요구사항의 범위 밖입니다.
+검증 후에는 root에서 `docker compose down`으로 컨테이너와 네트워크를 정리합니다. 인증·인가·claim 전달은 현재 요구사항의 범위 밖입니다.
 
-Linux 서버 배포 절차는 [macOS 개발 PC에서 Linux 서버로 Gateway 배포](docs/linux_server_deployment.md)를 참고하세요.
+Linux 서버 배포 절차는 [Linux 서버 Docker 배포 가이드](../../docs/linux_docker_model_deployment.md)를 참고하세요.

@@ -37,6 +37,11 @@ DEFAULT_PDF_FONT_CANDIDATES = (
     "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
 )
 DEFAULT_TIMEZONE = "Asia/Seoul"
+# STT가 간호 구술 어휘로 전사하도록 주는 기본 문맥이다. Whisper 프롬프트 상한(약 224토큰)보다 짧게 유지한다.
+DEFAULT_STT_PROMPT = (
+    "간호기록 구술입니다. V/S, NPO, I/O, POD, 활력징후, 주호소, 현병력, 과거력, 수술력, 가족력, 고혈압, 당뇨, "
+    "간경변증, 흑색변, 어지럼증, 두드러기, 알레르기, 혈색소, 위내시경, 수혈, 금식, 아스피린, 프로프라놀롤"
+)
 # tzdata가 없는 최소 이미지에서도 병동 시각을 잃지 않도록 고정 오프셋을 둔다(서머타임 없는 지역만).
 _FIXED_OFFSET_ZONES = {"Asia/Seoul": timezone(timedelta(hours=9), "KST")}
 # 비우면 '사용하지 않음'을 뜻하는 환경 변수다. 나머지는 빈 값을 미설정(기본값)으로 본다.
@@ -83,7 +88,7 @@ class Settings(BaseSettings):
     stt_base_url: str | None = None
     stt_api_key: str | None = None
     # 병동 약어·의학용어 인식률을 높이는 STT 문맥 힌트다.
-    stt_prompt: str | None = Field(None, validation_alias=_env("N_NOTE_STT_PROMPT", "OPENAI_STT_PROMPT"))
+    stt_prompt: str = Field(DEFAULT_STT_PROMPT, validation_alias=_env("N_NOTE_STT_PROMPT", "OPENAI_STT_PROMPT"))
     llm_model: str = Field("gpt-4o-mini", validation_alias=_env("N_NOTE_LLM_MODEL", "OPENAI_DRAFT_MODEL"))
     llm_base_url: str | None = None
     llm_api_key: str | None = None

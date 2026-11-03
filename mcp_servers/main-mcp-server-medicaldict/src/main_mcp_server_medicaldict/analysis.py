@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from uuid import uuid4
 
-from .dictionary import DictionaryRepository
+from .dictionary import PHONETIC_MIN_SYLLABLES, DictionaryRepository, comparison_key, jamo_similarity
 from .models import (
     AnalysisResult,
     AnalysisStatus,
@@ -20,6 +20,11 @@ from .models import (
 
 
 DEFAULT_MAX_ANALYSIS_SUGGESTIONS = 1_000
+MAX_TYPO_TERMS = 3
+# 받침·모음 하나 정도의 차이만 오타로 본다. 낮추면 '상공묘→상공막'처럼 글자만 닮은 후보가 늘어난다.
+MIN_TYPO_JAMO_SIMILARITY = 0.85
+_PARTICLES = ("에서", "으로", "은", "는", "을", "를", "이", "가", "의", "와", "과", "도", "에", "로")
+_TYPO_ENDINGS = ("입니다", "이며", "이고", *_PARTICLES)
 
 
 class ValidationError(ValueError):
@@ -155,9 +160,9 @@ class DocumentAnalyzer:
         for start, end, source in self._token_expressions(text):
             if (start, end) in seen_ranges:
                 continue
-            similar = [hit.term for hit in self._dictionary.search(source, limit=3).results if hit.match_type.value == "similar"]
+            base, similar = self._typo_terms(source)
             if similar:
-                candidates.append(DocumentTermCandidate(str(uuid4()), start + document_offset, end + document_offset, CandidateType.UNKNOWN_OR_POSSIBLE_TYPO, similar))
+                candidates.append(DocumentTermCandidate(str(uuid4()), start + document_offset, start + len(base) + document_offset, CandidateType.UNKNOWN_OR_POSSIBLE_TYPO, similar))
         return AnalysisResult(
             str(uuid4()),
             self._dictionary.version,
@@ -165,6 +170,27 @@ class DocumentAnalyzer:
             error_code="result_limit_exceeded" if truncated else None,
             candidates=candidates,
         )
+
+    def _typo_terms(self, source: str) -> tuple[str, list[DictionaryTerm]]:
+        """오타 후보와 조사·어미를 뺀 원문을 반환한다. 한글은 자모 차이가 작은 용어만 남긴다."""
+        if not re.fullmatch(r"[가-힣]+", source):
+            return source, [hit.term for hit in self._dictionary.search(source, limit=MAX_TYPO_TERMS).results if hit.match_type.value == "similar"]
+        bases = [source, *(source[:-len(ending)] for ending in _TYPO_ENDINGS if source.endswith(ending))]
+        for base in bases:
+            if len(base) < PHONETIC_MIN_SYLLABLES:
+                continue
+            if self._dictionary.find_exact(base):
+                return source, []
+            hits = [hit.term for hit in self._dictionary.search(base, limit=20).results if hit.match_type.value == "similar"]
+            close = [term for term in hits if self._is_close_typo(base, comparison_key(term.kor_name))]
+            if close:
+                return base, close[:MAX_TYPO_TERMS]
+        return source, []
+
+    @staticmethod
+    def _is_close_typo(source: str, name: str) -> bool:
+        """음절 수가 같고 자모 차이가 작은 다른 표기만 오타로 본다. '절제(술)'처럼 기호만 다르면 같은 용어다."""
+        return source != name and len(source) == len(name) and jamo_similarity(source, name) >= MIN_TYPO_JAMO_SIMILARITY
 
     def _exact_suggestions(self, text: str) -> tuple[list[Suggestion], bool]:
         """정확 일치 결과를 상한까지 만들고, 초과 여부를 함께 반환한다."""
@@ -221,10 +247,9 @@ class DocumentAnalyzer:
 
     def _variant_expressions(self, text: str) -> list[tuple[int, int, str, str]]:
         """조사·어미가 결합했으나 기본 표기가 사전에 있는 후보를 만든다."""
-        suffixes = ("에서", "으로", "은", "는", "을", "를", "이", "가", "의", "와", "과", "도", "에", "로")
         variants: list[tuple[int, int, str, str]] = []
         for start, end, source in self._token_expressions(text):
-            for suffix in suffixes:
+            for suffix in _PARTICLES:
                 if source.endswith(suffix) and len(source) > len(suffix) + 1:
                     base = source[:-len(suffix)]
                     if self._dictionary.find_exact(base):

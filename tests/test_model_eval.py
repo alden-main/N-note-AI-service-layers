@@ -26,6 +26,16 @@ class _Generator:
 
 
 class ModelEvalTests(unittest.TestCase):
+    def test_transcript_term_recall_reports_missing_terms(self):
+        scored = run_model_eval.score_transcript("강경변증 진단, 흑색변 있음", {"stt_terms": ["흑색변", "간경변증"]})
+        self.assertEqual(scored, {"stt_term_recall": 0.5, "missing_stt_terms": ["간경변증"]})
+        self.assertEqual(run_model_eval.score_transcript("전사문", {}), {"stt_term_recall": None, "missing_stt_terms": []})
+
+    def test_synthetic_audio_case_has_reference_and_terms(self):
+        case = next(item for item in run_model_eval.load_cases(ROOT / "eval/cases") if item.case_id == "stt-admission-tts")
+        self.assertEqual(case.audio_path.suffix, ".wav")
+        self.assertTrue(all(term in case.reference_transcript for term in case.expected["stt_terms"]))
+
     def test_character_error_rate_ignores_spacing(self):
         self.assertEqual(run_model_eval.character_error_rate("체온 38.2도", "체온38.2도"), 0.0)
         self.assertAlmostEqual(run_model_eval.character_error_rate("오한있음", "오환있음"), 0.25)
@@ -33,7 +43,22 @@ class ModelEvalTests(unittest.TestCase):
     def test_bundled_cases_are_loadable(self):
         cases = run_model_eval.load_cases(ROOT / "eval" / "cases")
         self.assertGreaterEqual(len(cases), 4)
-        self.assertTrue(all(case.transcript for case in cases))
+        self.assertTrue(all(case.transcript or case.audio_path for case in cases))
+
+    def test_run_scores_audio_case_with_cer_and_term_recall(self):
+        env = {
+            "N_NOTE_FORMS_DIR": str(ROOT / "forms"),
+            "MCP_GATEWAY_URL": "http://127.0.0.1:9/mcp",
+            "MCP_GATEWAY_TIMEOUT_SECONDS": "0.5",
+        }
+        case = next(item for item in run_model_eval.load_cases(ROOT / "eval/cases") if item.case_id == "stt-admission-tts")
+        stt = run_model_eval.FixedTranscriptProvider(case.reference_transcript.replace("간경변증", "강경변증"))
+        with patch.dict(os.environ, env), patch("n_note_ai_service_layers.adapters.model_providers.draft_generator", lambda gateway: _Generator()):
+            record = run_model_eval.run_case(case, stt)
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["missing_stt_terms"], ["간경변증"])
+        self.assertGreater(record["cer"], 0)
+        self.assertEqual(run_model_eval.summarize("fake", [record])["mean_stt_term_recall"], record["stt_term_recall"])
 
     def test_run_scores_transcript_case_without_gateway(self):
         env = {

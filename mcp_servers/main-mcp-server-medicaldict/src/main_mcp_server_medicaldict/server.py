@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
+from threading import Thread
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -107,6 +108,8 @@ def create_server(
         try:
             if dictionary is None:
                 dictionary = DictionaryRepository(root)
+                # 첫 요청이 Gateway upstream 제한 시간에 걸리지 않도록 색인을 미리 만든다.
+                Thread(target=dictionary.load_phonetic_index, name="medic-phonetic-index", daemon=True).start()
                 analyzer = DocumentAnalyzer(dictionary)
                 validator = SuggestionValidator(dictionary)
             dictionary.check_ready()

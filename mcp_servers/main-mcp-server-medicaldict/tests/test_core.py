@@ -219,6 +219,29 @@ class MedicalDictionaryTests(unittest.TestCase):
         """사용 중인 MCP 런타임이 Gateway의 2025-06-18 세션 협상을 지원한다."""
         self.assertIn("2025-06-18", SUPPORTED_PROTOCOL_VERSIONS)
 
+    def test_first_syllable_error_is_found_by_phonetic_search(self) -> None:
+        """접두어가 다른 오인식도 받침·유사 자모가 같으면 올바른 용어를 찾는다."""
+        names = [hit.term.kor_name for hit in self.repository.search("강경변증").results]
+        self.assertIn("간경변증", names)
+
+    def test_typo_candidate_drops_particle_and_keeps_source_range(self) -> None:
+        """오타 후보 범위는 조사·어미를 뺀 원문을 가리키고 사전 용어를 제안한다."""
+        text = "과거력은 강경변증으로 진단"
+        result = DocumentAnalyzer(self.repository).analyze_document(text)
+        typos = {text[item.start_offset:item.end_offset]: [term.kor_name for term in item.terms] for item in result.candidates if item.candidate_type is CandidateType.UNKNOWN_OR_POSSIBLE_TYPO}
+        self.assertIn("간경변증", typos.get("강경변증", []))
+
+    def test_loose_lookalikes_are_not_typo_candidates(self) -> None:
+        """글자 일부만 닮은 일반 표현은 의학용어 오타로 제안하지 않는다."""
+        for text in ("이력이 있습니다", "간도 기록", "시스토이며", "상부프 통증", "상공묘 농거"):
+            result = DocumentAnalyzer(self.repository).analyze_document(text)
+            self.assertEqual([], [item for item in result.candidates if item.candidate_type is CandidateType.UNKNOWN_OR_POSSIBLE_TYPO], text)
+
+    def test_registered_term_with_ending_is_not_a_typo(self) -> None:
+        """사전에 있는 용어에 어미가 붙었을 뿐이면 비슷한 다른 용어를 제안하지 않는다."""
+        result = DocumentAnalyzer(self.repository).analyze_document("진단은 당뇨병입니다")
+        self.assertEqual([], [item for item in result.candidates if item.candidate_type is CandidateType.UNKNOWN_OR_POSSIBLE_TYPO])
+
     def test_review_suggestion_requires_owned_candidate_and_matching_code(self) -> None:
         """확장 제안은 같은 분석 후보 범위와 그 후보가 허용한 코드에만 연결된다."""
         text = "당뇨뼝"

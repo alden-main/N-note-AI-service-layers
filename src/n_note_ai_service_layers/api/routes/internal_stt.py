@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from jsonschema import Draft202012Validator
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel
 
@@ -15,6 +16,7 @@ from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.openai_chat_draft_generation import _json_text, _message
 from n_note_ai_service_layers.api.deps import get_gateway_client, get_speech_to_text_provider, get_transcript_redactor
 from n_note_ai_service_layers.contracts.audio import AudioInput
+from n_note_ai_service_layers.observability import get_logger, stage
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
 
@@ -33,6 +35,24 @@ class InternalSttResponse(BaseModel):
 router = APIRouter(tags=["internal-stt"])
 _MAX_AUDIO = 50 * 1024 * 1024
 _EXTENSIONS = {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac", ".webm"}
+_logger = get_logger("api.internal_stt")
+_INSTRUCTIONS = (
+    "You fill Korean nursing forms from a dictated transcript that may contain speech recognition errors. "
+    "Return one JSON object with exactly two keys, fields and relatedSentences. Both are flat objects keyed by field_id; "
+    "never repeat sections or section_id, and include every field_id. "
+    "text is a string; radio is an option string or empty string; checkbox is an array of options. "
+    "When has_detail_text is true, radio is {status, detail} and checkbox is {selected, detail}. "
+    "Choose the option that means the same as the transcript even when it is worded differently, such as nonsmoker for 비흡연. "
+    "Rewrite spoken language, dialect, fillers, and misrecognized words in field values into standard Korean and standard "
+    "medical terminology, in concise Korean nursing-record style (for example sentences ending in '~함', '~임', '~호소함'). "
+    "Correct a word only when the context makes the intended term clear, and never change numbers. "
+    "Leave out an unintelligible part, but still fill the field from the readable facts around it: "
+    "a field with related sentences must not be empty unless those sentences are unintelligible. "
+    "Use only facts supported by the transcript; do not guess, and leave a field empty when the transcript has no information for it. "
+    "relatedSentences values must be exact, uncorrected substrings of the transcript; use an empty array when there is no evidence. "
+    "Term review hints are suggestions, not facts: use them only if supported by context, never introduce a diagnosis the transcript does not state. "
+    "Preserve privacy tokens exactly and do not infer identities."
+)
 
 
 def _templates(raw: str) -> list[dict]:
@@ -63,21 +83,55 @@ def _templates(raw: str) -> list[dict]:
         raise HTTPException(status_code=422, detail="invalid templates JSON or schema") from None
 
 
+def _value_schema(field: dict) -> dict:
+    """응답 계약(docs/STT_API.md 3.1)의 필드 값 모양을 JSON 스키마로 만든다."""
+    kind = field["field_type"]
+    if kind == "text":
+        return {"type": "string"}
+    if kind == "radio":
+        key, value = "status", {"type": "string", "enum": list(dict.fromkeys([*field["options"], ""]))}
+    else:
+        options = list(dict.fromkeys(field["options"]))
+        key, value = "selected", {"type": "array", "items": {"type": "string", "enum": options} if options else {"type": "string"}}
+    if field.get("has_detail_text") is not True:
+        return value
+    return {"type": "object", "properties": {key: value, "detail": {"type": "string"}}, "required": [key, "detail"], "additionalProperties": False}
+
+
+def _output_schema(template: dict) -> dict:
+    """서식 스키마를 LLM 출력 JSON 스키마로 바꾼다. field_id를 ``fields`` 바로 아래에 평면으로 둔다."""
+    fields = [field for section in template["schemaDefinition"]["sections"] for field in section["fields"]]
+    ids = [field["field_id"] for field in fields]
+    values = {}
+    for field in fields:
+        label = " - ".join(str(field[key]) for key in ("label", "sub_label") if field.get(key))
+        values[field["field_id"]] = {**_value_schema(field), "description": label} if label else _value_schema(field)
+    related = {key: {"type": "array", "items": {"type": "string"}} for key in ids}
+    return {
+        "type": "object",
+        "properties": {
+            "fields": {"type": "object", "properties": values, "required": ids, "additionalProperties": False},
+            "relatedSentences": {"type": "object", "properties": related, "required": ids, "additionalProperties": False},
+        },
+        "required": ["fields", "relatedSentences"],
+        "additionalProperties": False,
+    }
+
+
 def _extract(transcript: str, template: dict, hints: tuple[dict, ...]) -> dict:
     config = settings.get()
     endpoint = config.llm_endpoint
     client = model_providers.openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
-    instructions = (
-        "Extract fields from the transcript using the supplied schema. Return JSON with fields and relatedSentences objects. "
-        "Include every field_id. text is a string; radio is an option string or empty string; checkbox is an array of options. "
-        "When has_detail_text is true, radio is {status, detail} and checkbox is {selected, detail}. "
-        "Use only facts supported by the transcript; do not guess. Related sentences must be exact substrings of the transcript. "
-        "Term review hints are suggestions, not facts: use them only if supported by context, never introduce a diagnosis. "
-        "Preserve privacy tokens exactly and do not infer identities."
-    )
+    schema = _output_schema(template)
     payload = json.dumps({"transcript": transcript, "schemaDefinition": template["schemaDefinition"], "term_review_hints": hints}, ensure_ascii=False)
     if config.llm_api == "chat":
-        request = {"model": endpoint.model, "messages": [{"role": "system", "content": instructions}, {"role": "user", "content": payload}]}
+        # 구조화 출력을 강제하지 못하는 서버(MLX, 일부 llama.cpp 등)도 따르도록 프롬프트에도 스키마를 넣는다.
+        system = _INSTRUCTIONS + "\nJSON schema:\n" + json.dumps(schema, ensure_ascii=False)
+        request = {
+            "model": endpoint.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": payload}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "form_extraction", "schema": schema, "strict": True}},
+        }
         if config.llm_extra_body:
             request["extra_body"] = config.llm_extra_body
         if config.llm_max_tokens is not None:
@@ -86,11 +140,13 @@ def _extract(transcript: str, template: dict, hints: tuple[dict, ...]) -> dict:
             request["temperature"] = config.llm_temperature
         content = _message(client.chat.completions.create(**request))["content"]
     else:
-        response = client.responses.create(model=endpoint.model, instructions=instructions, input=payload)
+        output_format = {"type": "json_schema", "name": "form_extraction", "schema": schema, "strict": True}
+        response = client.responses.create(model=endpoint.model, instructions=_INSTRUCTIONS, input=payload, text={"format": output_format})
         content = response.output_text
     result = json.loads(_json_text(content))
-    if not isinstance(result, dict):
-        raise ValueError("invalid extraction")
+    # 구조가 다르면 빈 서식으로 오인하지 않고 실패로 처리한다. options 밖의 값만 _normalize가 빈 값으로 바꾼다.
+    if any(error.validator != "enum" for error in Draft202012Validator(schema).iter_errors(result)):
+        raise ValueError("extraction did not follow the form schema")
     return result
 
 
@@ -120,6 +176,10 @@ def _normalize(template: dict, transcript: str, result: dict) -> dict:
             if isinstance(sentences, list):
                 related[key] = [s for s in sentences if isinstance(s, str) and s and s in transcript]
     return {"templateType": template["templateType"], "templateName": template["templateName"], "fields": fields, "relatedSentences": related}
+
+
+def _is_filled(value: object) -> bool:
+    return any(value.values()) if isinstance(value, dict) else bool(value)
 
 
 @router.post(
@@ -182,8 +242,15 @@ async def internal_transcription(request: Request, provider=Depends(get_speech_t
     forms = []
     for template in templates:
         try:
-            result = await run_in_threadpool(_extract, redacted.text, template, hints)
-            forms.append(_normalize(template, redacted.text, result))
+            with stage(_logger, trace_id, "form_extraction", template_type=template["templateType"], hints=len(hints)) as metrics:
+                result = await run_in_threadpool(_extract, redacted.text, template, hints)
+                extracted = _normalize(template, redacted.text, result)
+                metrics.update(
+                    fields=len(extracted["fields"]),
+                    filled=sum(_is_filled(value) for value in extracted["fields"].values()),
+                    with_evidence=sum(bool(value) for value in extracted["relatedSentences"].values()),
+                )
+            forms.append(extracted)
         except Exception:
             forms.append({"templateType": template["templateType"], "templateName": template["templateName"], "fields": {}, "relatedSentences": {}})
     return {"transcript": redacted.text, "forms": forms}

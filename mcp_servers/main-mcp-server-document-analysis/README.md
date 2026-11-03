@@ -3,14 +3,19 @@
 ## Docker 실행
 
 이 서비스는 host port를 공개하지 않고 Gateway와 공유하는 Docker network에서만 실행한다.
+Gateway와 함께 실행하려면 저장소 root의 `docker-compose.yml`을 사용한다. 이 서버만 다시 빌드해
+교체할 때도 root에서 실행한다.
 
 ```bash
-docker network create --internal mcp-gateway-network
-docker compose up --build -d
+docker compose up -d --build --no-deps report
 ```
 
 Gateway 컨테이너는 같은 `mcp-gateway-network`에 연결한 뒤
 `http://report:8000/mcp` 및 `http://report:8000/healthz`로 접근한다.
+
+이 폴더의 `compose.yaml`은 서버 단독 기동 확인용이다. 전용 internal 네트워크에서 실행되므로 Gateway와
+연결되지 않는다. `docker network create`로 공유 네트워크를 직접 만들면 Compose가 그 네트워크를 그대로
+쓰므로 root의 설정이 적용되지 않는다.
 
 ## Gateway 운영 계약
 

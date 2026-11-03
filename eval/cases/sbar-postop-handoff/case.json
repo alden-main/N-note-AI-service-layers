@@ -1,0 +1,12 @@
+{
+  "schema_id": "sbar-handoff",
+  "language_hint": "ko",
+  "expected": {
+    "keywords": {
+      "s.diagnosis": ["담낭"],
+      "a.status": ["JP", "150"],
+      "r.next_plan": ["금식"]
+    },
+    "forbidden": ["2023", "2024", "2025"]
+  }
+}

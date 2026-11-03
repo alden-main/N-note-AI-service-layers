@@ -1,0 +1,12 @@
+{
+  "schema_id": "nursing-daily-note",
+  "language_hint": "ko",
+  "expected": {
+    "keywords": {
+      "assessment": ["38.2", "오한"],
+      "plan_and_intervention": ["해열제", "보고"],
+      "evaluation": ["37.4"]
+    },
+    "forbidden": ["2023", "2024", "2025", "폐렴"]
+  }
+}

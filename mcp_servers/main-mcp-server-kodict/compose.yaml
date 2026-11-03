@@ -17,11 +17,9 @@ services:
       timeout: 3s
       retries: 3
       start_period: 10s
-    networks:
-      - mcp-gateway-network
     restart: unless-stopped
 
+# 단독 실행 전용 네트워크다. Gateway와의 연동은 root docker-compose.yml로 실행한다.
 networks:
-  mcp-gateway-network:
-    external: true
-    name: mcp-gateway-network
+  default:
+    internal: true

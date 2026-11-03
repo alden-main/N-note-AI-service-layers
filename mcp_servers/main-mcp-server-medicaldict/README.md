@@ -42,12 +42,13 @@ FastAPI는 필요하지 않습니다. 현재 서버는 FastMCP의 stdio 전송�
 
 ## 여러 AI 서비스용 Streamable HTTP 배포
 
-여러 AI 서비스가 도구를 공유하는 경우에는 `compose.yaml`을 사용합니다. Compose 구성은 호스트 포트를 공개하지 않고, 사전에 생성한 `mcp-gateway-network`에만 8000번 포트를 노출합니다. MCP 서버는 AI 서비스용 네트워크에 연결하지 않습니다.
+Gateway와 함께 실행하려면 저장소 root의 `docker-compose.yml`을 사용합니다. 호스트 포트를 공개하지 않고 `mcp-gateway-network`에만 8000번 포트를 노출합니다. MCP 서버는 AI 서비스용 네트워크에 연결하지 않습니다. 이 서버만 다시 빌드해 교체할 때도 root에서 실행합니다.
 
 ```bash
-docker network create mcp-gateway-network
-docker compose up --build
+docker compose up -d --build --no-deps medic
 ```
+
+이 폴더의 `compose.yaml`은 서버 단독 기동 확인용입니다. 전용 internal 네트워크에서 실행되므로 Gateway와 연결되지 않습니다. `docker network create`로 공유 네트워크를 직접 만들지 마세요. Compose가 그 네트워크를 그대로 쓰면서 `internal` 설정이 적용되지 않습니다.
 
 Gateway는 같은 네트워크에서 다음 MCP 및 health endpoint에 연결합니다.
 
