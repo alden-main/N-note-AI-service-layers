@@ -48,11 +48,14 @@ class TextReviewer:
         self.catalog = catalog
         self.generator = generator or RuleBasedCandidateGenerator()
 
-    def review(self, text: str) -> dict[str, object]:
+    def review(self, text: str, compact: bool = False) -> dict[str, object]:
         """입력 텍스트의 분석 단위마다 상태와 사전 근거 후보를 반환한다.
 
         Args:
             text: 검토할 UTF-8 문자열이다. 저장하거나 로그에 남기지 않는다.
+            compact: 참이면 응답을 위치·상태·교정 후보만으로 줄인다. ``matched``는 후보를 비우고,
+                나머지 후보에서는 사전 근거(``evidence``)를 뺀다. 이때 ``max_findings``는 교정 후보가 있는
+                결과에만 적용한다. 줄어든 나머지 결과는 텍스트 길이 상한 안에서 크기가 정해진다.
 
         Returns:
             findings와 warnings를 가진 JSON 직렬화 가능한 검토 결과다.
@@ -62,30 +65,56 @@ class TextReviewer:
         except Exception:
             return {"findings": [{"start": 0, "end": len(text), "source_text": text, "analysis_form": "", "status": "needs_review", "candidates": []}], "warnings": [{"code": "analysis_incomplete", "retryable": False}]}
         findings: list[dict[str, object]] = []
+        # 상한에 포함되는 결과 수다. 전체 모드에서는 모든 결과를, 간결 모드에서는 교정 후보가 있는 결과만 센다.
+        counted = 0
         truncated = False
+
+        def add(finding: dict[str, object]) -> None:
+            nonlocal counted
+            if compact:
+                finding = self._compact(finding)
+            if not compact or finding["candidates"]:
+                counted += 1
+            findings.append(finding)
+
         # 문서 검토에 필요한 모든 정확 조회가 하나의 읽기 전용 연결을 공유한다.
         # 동일 분석형은 요청 안에서 한 번만 DB에서 읽는다.
         lookup_cache: dict[tuple[str, int], list[Entry]] = {}
         with self.repository.read_session() as connection:
             for unit in self._word_units(text, tokens):
-                if len(findings) >= self.max_findings:
+                if unit.start == unit.end:
+                    continue
+                if counted >= self.max_findings:
                     truncated = True
                     break
                 recommendations = self._recommend(unit, connection, lookup_cache)
                 if recommendations:
-                    findings.append(self._word_finding(unit, recommendations))
+                    add(self._word_finding(unit, recommendations))
                     continue
                 for token in unit.tokens:
-                    if token.tag.startswith(PARTICLE_TAG_PREFIXES):
+                    # Kiwi가 복원한 서술격조사 '이'처럼 원문에 없는 형태소는 검토할 구간이 없다.
+                    if token.tag.startswith(PARTICLE_TAG_PREFIXES) or token.start == token.end:
                         continue
-                    if len(findings) >= self.max_findings:
+                    if counted >= self.max_findings:
                         truncated = True
                         break
-                    findings.append(self._review_token(token, connection, lookup_cache))
+                    add(self._review_token(token, connection, lookup_cache))
         warnings: list[dict[str, object]] = []
         if truncated:
             warnings.append({"code": "findings_truncated", "retryable": False})
         return {"findings": findings, "warnings": warnings}
+
+    @staticmethod
+    def _compact(finding: dict[str, object]) -> dict[str, object]:
+        """사전 근거를 뺀 결과다. ``matched``의 후보는 원문 그대로라 교정 후보가 아니므로 비운다.
+
+        문서 검토 결과의 대부분은 ``matched``이고, 그 크기의 대부분은 뜻풀이 같은 사전 근거다.
+        """
+        candidates = finding["candidates"] if isinstance(finding["candidates"], list) else []
+        compacted = [] if finding["status"] == "matched" else [
+            {key: value for key, value in candidate.items() if key != "evidence"} for candidate in candidates
+        ]
+        return {**finding, "candidates": compacted}
 
     @staticmethod
     def _word_units(text: str, tokens: list[MorphToken]) -> list[WordUnit]:

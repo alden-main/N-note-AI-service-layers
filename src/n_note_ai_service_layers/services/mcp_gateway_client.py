@@ -23,6 +23,8 @@ MCP_PROTOCOL_VERSION = "2025-06-18"
 INCOMPLETE_CATALOG_TTL_SECONDS = 15.0
 # Gateway의 일괄 도구 호출 경로다. MCP endpoint와 같은 host·접두 경로를 쓴다.
 BATCH_CALL_PATH = "/v1/tools/batch-call"
+# Gateway가 일괄 호출 한 번에 받는 최대 호출 수(GATEWAY_BATCH_MAX_CALLS 기본값)다. 넘으면 요청 전체를 거부하므로 나눠 보낸다.
+DEFAULT_BATCH_MAX_CALLS = 32
 HttpTransport = Callable[[str, bytes, Mapping[str, str], float], tuple[int, Mapping[str, str], bytes]]
 
 
@@ -65,6 +67,7 @@ class McpGatewayClient:
         batch_url: str | None = None,
         expected_tools: tuple[str, ...] = (),
         incomplete_catalog_ttl_seconds: float = INCOMPLETE_CATALOG_TTL_SECONDS,
+        batch_max_calls: int = DEFAULT_BATCH_MAX_CALLS,
     ) -> None:
         config = settings.get()
         self._url = url or config.mcp_gateway_url
@@ -81,6 +84,7 @@ class McpGatewayClient:
         self._batch_url = batch_url or _batch_url(self._url)
         # An older Gateway answers 404 for the batch path; fall back to one tools/call per item.
         self._batch_supported = True
+        self._batch_max_calls = max(1, batch_max_calls)
 
     @property
     def catalog(self) -> tuple[dict[str, Any], ...]:
@@ -168,7 +172,7 @@ class McpGatewayClient:
                 pending.append(index)
         if pending:
             selected = [calls[index] for index in pending]
-            outcomes = self._batch(selected, request_id) if self._batch_supported else None
+            outcomes = self._batches(selected, request_id) if self._batch_supported else None
             if outcomes is None:
                 outcomes = self._each(selected, request_id, max_concurrency)
             for index, outcome in zip(pending, outcomes):
@@ -181,6 +185,21 @@ class McpGatewayClient:
             raise McpGatewayProtocolError("tool is not in the current Gateway catalog")
         if not isinstance(arguments, dict) or not Draft202012Validator(tool["inputSchema"]).is_valid(arguments):
             raise McpGatewayProtocolError("tool arguments do not match the Gateway input schema")
+
+    def _batches(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None) -> list[dict[str, Any] | McpGatewayError] | None:
+        """Gateway 상한(``batch_max_calls``)씩 나눠 일괄 호출한다. ``None``은 Gateway에 일괄 호출 경로가 없다는 뜻이다.
+
+        나눈 묶음은 동시에 보낸다. 각 묶음 안의 호출은 Gateway가 동시에 중계한다.
+        """
+        size = self._batch_max_calls
+        groups = [calls[start:start + size] for start in range(0, len(calls), size)]
+        if len(groups) == 1:
+            return self._batch(groups[0], request_id)
+        with ThreadPoolExecutor(max_workers=len(groups), thread_name_prefix="gateway-batch") as pool:
+            results = list(pool.map(lambda group: self._batch(group, request_id), groups))
+        if any(result is None for result in results):
+            return None
+        return [outcome for result in results for outcome in result]  # type: ignore[union-attr]
 
     def _batch(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None) -> list[dict[str, Any] | McpGatewayError] | None:
         """POST the batch; ``None`` means this Gateway has no batch endpoint."""

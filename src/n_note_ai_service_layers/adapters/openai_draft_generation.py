@@ -49,6 +49,7 @@ class OpenAiDraftGenerationAdapter:
         gateway_client: McpGatewayClient | None = None,
         max_tool_calls: int = 6,
         tool_timeout_seconds: float = 30.0,
+        max_tool_rounds: int = 2,
         max_gateway_retries: int = 1,
         allowed_tool_names: tuple[str, ...] | None = None,
     ) -> None:
@@ -60,6 +61,8 @@ class OpenAiDraftGenerationAdapter:
         self._prompt_version = prompt_version
         self._gateway_client = gateway_client
         self._max_tool_calls = max_tool_calls
+        # 도구 결과를 LLM에 돌려주는 왕복 횟수 상한이다. LLM 호출은 최대 ``1 + max_tool_rounds``번이다. 0이면 도구를 주지 않는다.
+        self._max_tool_rounds = max_tool_rounds
         self._tool_timeout_seconds = tool_timeout_seconds
         self._max_gateway_retries = max_gateway_retries
         self._allowed_tool_names = allowed_tool_names
@@ -118,7 +121,7 @@ class OpenAiDraftGenerationAdapter:
 
     def _model_tools(self) -> list[dict[str, Any]]:
         """Gateway catalog의 허용 도구만 반환하고, Gateway 장애 시 도구 없이 초안을 만든다."""
-        if self._gateway_client is None:
+        if self._gateway_client is None or self._max_tool_rounds <= 0:
             return []
         try:
             self._gateway_client.discover()
@@ -127,14 +130,20 @@ class OpenAiDraftGenerationAdapter:
         return self._gateway_client.model_tools(self._allowed_tool_names)
 
     def _run_tool_loop(self, response: Any, request: dict[str, Any]) -> Any:
-        """Return tool results to OpenAI while limiting Gateway calls and elapsed time."""
+        """도구 결과를 돌려주며 초안을 받는다. 왕복 수·Gateway 호출 수·경과 시간에 상한을 둔다.
+
+        상한에 닿으면 마지막 요청을 ``tool_choice="none"``으로 보내 모델이 도구를 더 부르지 못하고 초안을 내게 한다.
+        이렇게 하지 않으면 상한 뒤에도 모델이 도구를 계속 요청해 LLM 왕복이 끝없이 늘어날 수 있다.
+        """
         assert self._gateway_client is not None
         started = time.monotonic()
         calls = 0
+        rounds = 0
         while True:
             function_calls = [item for item in getattr(response, "output", []) if _value(item, "type") == "function_call"]
-            if not function_calls:
+            if not function_calls or request.get("tool_choice") == "none":
                 return response
+            rounds += 1
             results, calls = self._run_tool_calls([(_value(call, "name"), _value(call, "arguments")) for call in function_calls], started, calls)
             outputs = [
                 {"type": "function_call_output", "call_id": str(_value(call, "call_id")), "output": json.dumps(result, ensure_ascii=False)}
@@ -145,7 +154,14 @@ class OpenAiDraftGenerationAdapter:
             response_id = getattr(response, "id", None)
             if response_id:
                 next_request["previous_response_id"] = response_id
+            if self._tool_budget_spent(rounds, calls, started):
+                next_request["tool_choice"] = "none"
+            request = next_request
             response = self._client.responses.create(**next_request)
+
+    def _tool_budget_spent(self, rounds: int, calls: int, started: float) -> bool:
+        """도구 왕복·호출 수 또는 시간 상한에 닿았는지다. 닿으면 다음 LLM 요청이 마지막이다."""
+        return rounds >= self._max_tool_rounds or calls >= self._max_tool_calls or time.monotonic() - started >= self._tool_timeout_seconds
 
     def _run_tool_calls(self, calls: list[tuple[Any, Any]], started: float, used: int) -> tuple[list[dict[str, Any]], int]:
         """한 응답의 도구 호출을 상한(횟수·시간) 안에서 동시에 Gateway로 보낸다.
@@ -177,7 +193,7 @@ class OpenAiDraftGenerationAdapter:
         except json.JSONDecodeError:
             return {"error": "invalid_tool_arguments"}
         try:
-            return self._gateway_client.call_tool(name, arguments)
+            return model_tool_output(self._gateway_client.call_tool(name, arguments))
         except McpGatewayToolError as exc:
             if exc.code == "not_found":
                 self._gateway_client.discover()
@@ -185,7 +201,7 @@ class OpenAiDraftGenerationAdapter:
             if exc.retryable:
                 for _ in range(self._max_gateway_retries):
                     try:
-                        return self._gateway_client.call_tool(name, arguments)
+                        return model_tool_output(self._gateway_client.call_tool(name, arguments))
                     except McpGatewayToolError as retry_error:
                         exc = retry_error
                         if not exc.retryable:
@@ -286,3 +302,58 @@ def _evidence_by_field(evidence: Any) -> dict[str, tuple[str, ...]]:
 def _value(item: Any, key: str) -> Any:
     """Read an SDK object or a fixture dictionary without depending on SDK internals."""
     return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+
+
+# 사전 뜻풀이는 문맥 판단에 필요한 첫 부분만 준다. 동음이의어가 여럿이면 앞부분만으로 구분된다.
+MAX_DEFINITION_CHARS = 120
+
+
+def model_tool_output(result: dict[str, Any]) -> dict[str, Any]:
+    """Gateway 도구 결과를 LLM에 돌려줄 최소 형태로 줄인다.
+
+    MCP 결과는 같은 내용을 ``content``(JSON 문자열)와 ``structuredContent``에 두 번 담고, 사전 결과에는
+    원본 파일·행·해시 같은 추적 정보와 같은 용어의 코드별 중복 항목이 들어 있다. LLM은 표기 판단에 쓰는
+    표제어·품사·뜻풀이 앞부분, 한글·영문 용어명과 일치 유형만 받는다(입력 토큰과 응답 지연을 줄인다).
+    모르는 구조의 결과는 ``structuredContent``만, 구조화 결과가 없으면 원래 결과를 그대로 준다.
+    """
+    payload = result.get("structuredContent")
+    # FastMCP는 Union 반환 타입의 구조화 결과를 {"result": ...}로 감싼다.
+    if isinstance(payload, dict) and set(payload) == {"result"} and isinstance(payload["result"], dict):
+        payload = payload["result"]
+    if not isinstance(payload, dict):
+        return result
+    if isinstance(payload.get("entries"), list):
+        return {"entries": [_dictionary_entry(item) for item in payload["entries"]]}
+    if isinstance(payload.get("results"), list):
+        return {"results": _medical_terms(payload["results"])}
+    return payload
+
+
+def _dictionary_entry(item: Any) -> Any:
+    """표준국어 사전 항목에서 표제어·품사·뜻풀이 앞부분만 남긴다."""
+    if not isinstance(item, dict) or not isinstance(item.get("evidence"), dict):
+        return item
+    evidence = item["evidence"]
+    definition = " ".join(str(evidence.get("definition") or "").split())
+    return {
+        "surface": item.get("surface"),
+        "part_of_speech": " ".join(str(evidence.get("part_of_speech") or "").split()).strip("「」"),
+        "definition": definition[:MAX_DEFINITION_CHARS],
+    }
+
+
+def _medical_terms(results: list[Any]) -> list[Any]:
+    """의학용어 검색 결과에서 한글·영문 용어명·일치 유형·점수만 남기고, 코드만 다른 같은 용어는 하나로 합친다."""
+    compact: list[Any] = []
+    seen: set[tuple[Any, ...]] = set()
+    for item in results:
+        term = item.get("term") if isinstance(item, dict) else None
+        if not isinstance(term, dict):
+            compact.append(item)
+            continue
+        entry = {"kor_name": term.get("kor_name"), "eng_name": term.get("eng_name"), "match_type": item.get("match_type"), "score": item.get("score")}
+        key = (entry["kor_name"], entry["eng_name"], entry["match_type"])
+        if key not in seen:
+            seen.add(key)
+            compact.append(entry)
+    return compact

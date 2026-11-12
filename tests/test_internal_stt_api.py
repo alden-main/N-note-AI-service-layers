@@ -163,7 +163,7 @@ def test_malformed_extraction_returns_empty_form_and_logs_failure(monkeypatch):
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
     assert response.status_code == 200
     assert response.json()["forms"] == [{"templateType": "HAND_OVER", "templateName": "인계", "fields": {}, "relatedSentences": {}}]
-    assert logs == [("form_extraction", "ValueError")]
+    assert logs == [("transcript_term_review", {"status": "ok", "candidates": 0}), ("form_extraction", "ValueError")]
 
 
 def test_extraction_metrics_count_filled_fields_only(monkeypatch):
@@ -175,7 +175,7 @@ def test_extraction_metrics_count_filled_fields_only(monkeypatch):
     monkeypatch.setattr(internal_stt, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
     assert response.status_code == 200
-    assert logs == [("form_extraction", {"fields": 5, "filled": 4, "with_evidence": 1})]
+    assert logs[-1] == ("form_extraction", {"fields": 5, "filled": 4, "with_evidence": 1})
 
 
 @contextmanager
@@ -215,3 +215,14 @@ def test_stt_uses_nursing_context_prompt_when_setting_is_blank(monkeypatch):
     assert model_providers.speech_to_text_provider()._prompt == settings.DEFAULT_STT_PROMPT
     monkeypatch.setenv("N_NOTE_STT_PROMPT", "병동 문맥")
     assert model_providers.speech_to_text_provider()._prompt == "병동 문맥"
+
+
+def test_term_review_status_is_logged_when_it_stops_extraction(monkeypatch):
+    app = create_app()
+    setup_review(app, monkeypatch, GatewayTermVerificationResult("transcript", "unsupported"))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="전사문"))
+    logs = []
+    monkeypatch.setattr(internal_stt, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
+    response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
+    assert response.status_code == 503 and response.json() == {"detail": "term review is unavailable"}
+    assert logs == [("transcript_term_review", {"status": "unsupported", "candidates": 0})]

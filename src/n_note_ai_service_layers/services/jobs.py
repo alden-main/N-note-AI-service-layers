@@ -54,8 +54,13 @@ class JobStore:
         self.timeout_seconds = timeout_seconds
         self.retention_hours = retention_hours
 
-    def create(self, kind: str, trace_id: str, request: dict[str, Any], idempotency_key: str | None = None) -> tuple[dict[str, Any], bool]:
-        """대기 상태 작업을 만든다. 같은 ``idempotency_key``의 작업이 있으면 그 작업을 반환한다(두 번째 값 ``False``)."""
+    def create(
+        self, kind: str, trace_id: str, request: dict[str, Any], idempotency_key: str | None = None, extra: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """대기 상태 작업을 만든다. 같은 ``idempotency_key``의 작업이 있으면 그 작업을 반환한다(두 번째 값 ``False``).
+
+        ``extra``는 작업 종류별 추가 상태(예: 양식별 진행 ``forms``)의 초깃값이다.
+        """
         if self.retention_hours:
             cutoff = time.time() - self.retention_hours * 3600
             self.store.purge_older_than(JOB_COLLECTION, cutoff)
@@ -75,6 +80,7 @@ class JobStore:
             "job_id": job_id, "kind": kind, "status": "queued", "stage": None, "completed_stages": [],
             "trace_id": trace_id, "request": request, "result": None, "error": None,
             "created_at": now, "started_at": None, "finished_at": None, "updated_at": now,
+            **(extra or {}),
         }
         self.store.put(JOB_COLLECTION, job_id, job, expected_version=0)
         return job, True

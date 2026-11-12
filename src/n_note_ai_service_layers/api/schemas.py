@@ -125,7 +125,8 @@ class JobError(BaseModel):
     """실패한 작업의 오류 코드와 설명이다.
 
     ``code``: ``stt_unavailable``, ``redaction_failed``, ``draft_generation_unavailable``,
-    ``internal_error``, ``interrupted``(서버 중단 등으로 갱신이 멈춤), ``server_shutdown``, ``queue_full``.
+    ``internal_error``, ``interrupted``(서버 중단 등으로 갱신이 멈춤), ``server_shutdown``, ``queue_full``,
+    ``all_forms_failed``(여러 양식 작업에서 모든 양식이 실패, 양식별 원인은 ``forms[].error``).
     """
     code: str
     message: str
@@ -135,6 +136,22 @@ class JobLinks(BaseModel):
     self: str
     events: str
     draft: str | None = None
+    # 여러 양식 작업에서 지금까지 저장된 초안 링크다. 모든 양식이 끝나기 전에도 먼저 끝난 초안을 열 수 있다.
+    drafts: list[str] | None = None
+
+
+class WorkflowJobForm(BaseModel):
+    """여러 양식 작업에서 양식 하나의 진행 상태다.
+
+    ``status``: ``queued`` → ``running`` → ``succeeded`` | ``failed``. ``stage``는 ``draft_generation``·``draft_review``·
+    ``saving_draft``이다. ``succeeded``가 되는 즉시 ``draft_id``가 생겨 검토를 시작할 수 있다.
+    """
+    schema_id: str
+    schema_version: str
+    status: Literal["queued", "running", "succeeded", "failed"]
+    stage: str | None = None
+    draft_id: str | None = None
+    error: JobError | None = None
 
 
 class WorkflowJob(BaseModel):
@@ -144,6 +161,9 @@ class WorkflowJob(BaseModel):
     ``stage``: 실행 중인 단계(``stt``, ``redaction``, ``transcript_term_review``, ``draft_generation``,
     ``draft_review``, ``saving_draft``)이고, ``completed_stages``는 끝난 단계다.
     ``result``는 ``succeeded``일 때만 있으며 초안 생성 결과(``draft_id`` 포함)다.
+
+    ``schema_ids``로 여러 양식을 요청한 작업은 ``forms``에 양식별 진행 상태가 있고, ``result.forms``에 양식별
+    결과(각각 단일 양식 결과와 같은 형태) 또는 오류가 요청 순서대로 들어 있다. 양식이 하나라도 성공하면 ``succeeded``다.
     """
     job_id: str
     kind: str
@@ -154,6 +174,7 @@ class WorkflowJob(BaseModel):
     request: dict[str, Any]
     result: dict[str, Any] | None = None
     error: JobError | None = None
+    forms: list[WorkflowJobForm] | None = None
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None

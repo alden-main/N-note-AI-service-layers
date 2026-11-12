@@ -25,14 +25,17 @@ MEDICAL_SCHEMA = {
 class _Gateway:
     """Gateway가 upstream 결과를 그대로 중계하는 응답을 흉내 낸다."""
 
-    def __init__(self, results, batch=True):
+    def __init__(self, results, batch=True, korean_schema=TEXT_SCHEMA):
         self.results = results
         self.calls = []
+        self.arguments = []
         self.batch = batch
         self.batch_requests = 0
+        self.korean_schema = korean_schema
 
     def _tool(self, name, arguments):
         self.calls.append((name, arguments["text"]))
+        self.arguments.append((name, arguments))
         return self.results[name](arguments["text"])
 
     def __call__(self, url, body, headers, timeout):
@@ -48,7 +51,7 @@ class _Gateway:
             result = {"protocolVersion": "2025-06-18"}
         elif message["method"] == "tools/list":
             result = {"tools": [
-                {"name": KOREAN_TOOL, "description": "review", "inputSchema": TEXT_SCHEMA},
+                {"name": KOREAN_TOOL, "description": "review", "inputSchema": self.korean_schema},
                 {"name": MEDICAL_TOOL, "description": "analyze", "inputSchema": MEDICAL_SCHEMA},
                 {"name": "medic__submit_review_suggestions", "description": "submit", "inputSchema": {"type": "object", "properties": {"analysis_id": {"type": "string"}, "text": {"type": "string"}}, "required": ["analysis_id", "text"]}},
             ]}
@@ -99,6 +102,23 @@ class GatewayTermVerificationTests(unittest.TestCase):
         self.assertEqual(result.status, "unsupported")
         self.assertEqual(result.occurrences, ())
 
+    def test_zero_length_finding_does_not_discard_review_result(self):
+        """원문에 없는 형태소(start == end)는 건너뛰고 나머지 후보는 살린다."""
+        text = "금새 상지다"
+        findings = {"findings": [
+            {"start": 5, "end": 5, "source_text": "", "analysis_form": "이", "status": "needs_review", "candidates": []},
+            {"start": 0, "end": 2, "source_text": "금새", "analysis_form": "금새", "status": "needs_review", "candidates": [{"replacement": "금세", "confidence": 0.9}]},
+        ]}
+        result = self._flow(_Gateway({KOREAN_TOOL: _korean(lambda value: findings)}), (KOREAN_TOOL,)).verify("transcript", text)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([item.input_text for item in result.occurrences], ["금새"])
+
+    def test_only_zero_length_findings_mean_no_candidates_not_a_failure(self):
+        findings = {"findings": [{"start": 3, "end": 3, "source_text": "", "analysis_form": "이", "status": "needs_review", "candidates": []}]}
+        result = self._flow(_Gateway({KOREAN_TOOL: _korean(lambda value: findings)}), (KOREAN_TOOL,)).verify("transcript", "상지다")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.occurrences, ())
+
     def test_skips_dictionary_matches_that_need_no_change(self):
         matched = lambda text: {"findings": [_finding(text, "확인", "확인", "matched")]}
         result = self._flow(_Gateway({KOREAN_TOOL: _korean(matched)}), (KOREAN_TOOL,)).verify("transcript", "금새 확인")
@@ -138,6 +158,22 @@ class GatewayTermVerificationTests(unittest.TestCase):
             ]
         result = self._flow(_Gateway({KOREAN_TOOL: _korean(findings), MEDICAL_TOOL: _medical(candidates)})).verify("transcript", text)
         self.assertEqual([item.input_text for item in result.occurrences], ["헤모글로반"])
+
+    def test_medical_typo_partly_made_of_korean_words_is_kept(self):
+        """일반 단어가 일부 겹쳐도 활용형이 아니면 오인식 교정 후보를 유지한다."""
+        text = "강경변증 당뇨뼝 변경해"
+        def findings(chunk):
+            return {"findings": [
+                {"start": start, "end": start + len(word), "source_text": word, "analysis_form": word, "status": "matched", "candidates": [{"replacement": word, "confidence": 1.0}]}
+                for word, start in (("변증", 2), ("당뇨", 5), ("변경", 9))
+            ]}
+        def candidates(chunk):
+            return [
+                {"candidate_id": word, "source_text": word, "start_offset": chunk.index(word), "end_offset": chunk.index(word) + len(word), "candidate_type": "unknown_or_possible_typo", "terms": [_term(term, term)], "automatic_correction": False}
+                for word, term in (("강경변증", "간경변증"), ("당뇨뼝", "당뇨병"), ("변경해", "변경후"))
+            ]
+        result = self._flow(_Gateway({KOREAN_TOOL: _korean(findings), MEDICAL_TOOL: _medical(candidates)})).verify("transcript", text)
+        self.assertEqual([item.input_text for item in result.occurrences], ["강경변증", "당뇨뼝"])
 
     def test_long_text_is_split_and_offsets_refer_to_the_whole_text(self):
         text = "통증 호소함\n" * 5 + "금새 호전됨\n"
@@ -182,6 +218,22 @@ class GatewayTermVerificationTests(unittest.TestCase):
         result = self._flow(gateway).verify("transcript", "금새 확인")
         self.assertEqual(result.status, "ok")
         self.assertEqual([item.tool_name for item in result.occurrences], [KOREAN_TOOL])
+
+    def test_compact_detail_is_requested_only_from_tools_that_declare_it(self):
+        compact_schema = {
+            "type": "object",
+            "properties": {"text": {"type": "string"}, "detail": {"type": "string", "enum": ["full", "compact"], "default": "full"}},
+            "required": ["text"],
+        }
+        findings = lambda text: {"findings": [_finding(text, "금새", "금세")]}
+        for schema, expected in ((compact_schema, {"text": "금새 확인", "detail": "compact"}), (TEXT_SCHEMA, {"text": "금새 확인"})):
+            gateway = _Gateway({KOREAN_TOOL: _korean(findings), MEDICAL_TOOL: _medical(_no_candidates)}, korean_schema=schema)
+            result = self._flow(gateway).verify("transcript", "금새 확인")
+            sent = dict(gateway.arguments)
+            self.assertEqual(sent[KOREAN_TOOL], expected)
+            # 의학용어 도구는 detail을 모르므로 text만 받는다.
+            self.assertEqual(sent[MEDICAL_TOOL], {"text": "금새 확인"})
+            self.assertEqual([item.suggestions[0].text for item in result.occurrences], ["금세"])
 
 
 if __name__ == "__main__":

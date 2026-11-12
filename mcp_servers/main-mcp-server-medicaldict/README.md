@@ -76,6 +76,7 @@ FastAPI는 필요하지 않습니다. 이 서버는 FastMCP의 `streamable-http`
 - `MEDICALDICT_MCP_TRANSPORT`: `stdio`(기본값) 또는 `streamable-http`
 - `MEDICALDICT_MCP_HOST`: HTTP 리스너 주소. 컨테이너에서는 `0.0.0.0`을 사용합니다.
 - `MEDICALDICT_MCP_PORT`: HTTP 리스너 포트. 기본값은 `8000`입니다.
+- `MEDICALDICT_MAX_CONCURRENT_REQUESTS`: 동시에 실행할 도구 호출 수. 기본값은 `4`입니다. 도구는 worker thread에서 실행되므로 긴 분석이 진행 중이어도 `/healthz`와 다른 요청이 막히지 않고, 상한을 넘은 호출은 대기합니다.
 
 분석 응답은 최대 1,000개의 정확 일치 suggestion으로 제한됩니다. 한도를 넘으면 MCP 도구 호출은 성공으로 반환되지만 `status`는 `partially_completed`, `error_code`는 `result_limit_exceeded`가 됩니다. 호출자는 더 작은 문서 청크로 나누어 다시 분석해야 합니다.
 

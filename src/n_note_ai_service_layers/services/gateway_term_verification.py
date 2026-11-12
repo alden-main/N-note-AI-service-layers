@@ -17,6 +17,8 @@ from n_note_ai_service_layers.services.draft_document import DraftDocument
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient, McpGatewayError
 
 _HANGUL = re.compile(r"[가-힣]")
+# 일반 단어 뒤에 붙으면 용언 활용형으로 보는 어미다('말+라고', '설명+함', '변경+해').
+_WORD_ENDINGS = frozenset({"라고", "하기", "하고", "하여", "하며", "했다", "해", "함", "고", "며", "다", "음", "임"})
 
 
 class GatewayTermVerificationFlow:
@@ -54,8 +56,9 @@ class GatewayTermVerificationFlow:
         occurrences: list[GatewayTermOccurrence] = []
         known_words: list[tuple[int, int]] = []
         unsupported = unavailable = False
+        compact_tools = frozenset(tool["name"] for tool in tools if self._supports_compact(tool))
         tasks = [(tool["name"], offset, chunk) for tool in tools for offset, chunk in self._chunks(text) if chunk.strip()]
-        for (tool_name, offset, chunk), result in zip(tasks, self._call_all(tasks, request_id)):
+        for (tool_name, offset, chunk), result in zip(tasks, self._call_all(tasks, request_id, compact_tools)):
             if result is None:
                 unavailable = True
                 continue
@@ -92,9 +95,10 @@ class GatewayTermVerificationFlow:
             mapped.append(replace(item, start_offset=start, end_offset=end, field_id=span.field_id))
         return replace(result, occurrences=tuple(mapped))
 
-    def _call_all(self, tasks: list[tuple[str, int, str]], request_id: str | None) -> list[dict[str, Any] | None]:
+    def _call_all(self, tasks: list[tuple[str, int, str]], request_id: str | None, compact_tools: frozenset[str] = frozenset()) -> list[dict[str, Any] | None]:
         """도구·청크 호출을 Gateway 일괄 호출 한 번으로 보내고 입력 순서대로 결과(실패는 ``None``)를 반환한다."""
-        outcomes = self.gateway.call_tools([(tool_name, {"text": chunk}) for tool_name, _, chunk in tasks], request_id, self.max_concurrency)
+        calls = [(tool_name, {"text": chunk, **({"detail": "compact"} if tool_name in compact_tools else {})}) for tool_name, _, chunk in tasks]
+        outcomes = self.gateway.call_tools(calls, request_id, self.max_concurrency)
         return [None if isinstance(outcome, McpGatewayError) else outcome for outcome in outcomes]
 
     @staticmethod
@@ -106,6 +110,16 @@ class GatewayTermVerificationFlow:
         properties = schema.get("properties", {})
         required = schema.get("required", [])
         return isinstance(properties, dict) and isinstance(properties.get("text"), dict) and isinstance(required, list) and all(key == "text" for key in required)
+
+    @staticmethod
+    def _supports_compact(tool: dict[str, Any]) -> bool:
+        """표준어 검토처럼 ``detail="compact"``를 받는 도구인지 확인한다.
+
+        간결 응답에는 이 흐름이 쓰지 않는 사전 근거(뜻풀이 등)가 빠져 크기가 약 1/10이고, 결과 상한도
+        교정 후보에만 적용되어 긴 청크가 잘리지 않는다. 이 옵션이 없는 구버전 서버에는 보내지 않는다.
+        """
+        detail = tool.get("inputSchema", {}).get("properties", {}).get("detail")
+        return isinstance(detail, dict) and "compact" in (detail.get("enum") or ())
 
     def _chunks(self, text: str) -> list[tuple[int, str]]:
         """줄 경계를 우선해 upstream 길이 제한 이하의 조각과 시작 offset을 만든다."""
@@ -136,13 +150,19 @@ class GatewayTermVerificationFlow:
 
     @staticmethod
     def _ordinary_word_guess(item: GatewayTermOccurrence, known_words: list[tuple[int, int]]) -> bool:
-        """의학용어 사전의 유사어 추정이 표준국어 사전의 일반 단어 위에 걸치면 오탐으로 본다.
+        """의학용어 사전의 유사어 추정이 일반 단어 또는 그 활용형이면 오탐으로 본다.
 
-        예: '말라고'→'말라리아', '설명함'→'설명하기'. 정확·변형 일치 후보는 유지한다.
+        예: '말라고'→'말라리아', '설명함'→'설명하기'. 일부만 일반 단어인 오인식은 유지한다
+        (예: '변증'을 포함한 '강경변증'→'간경변증', '당뇨'로 시작하는 '당뇨뼝'→'당뇨병').
+        정확·변형 일치 후보도 유지한다.
         """
         if item.category != "medical_term" or not all(s.reason == "unknown_or_possible_typo" for s in item.suggestions):
             return False
-        return any(start < item.end_offset and item.start_offset < end for start, end in known_words)
+        return any(
+            (start <= item.start_offset and item.end_offset <= end)
+            or (start == item.start_offset and item.input_text[end - start:] in _WORD_ENDINGS)
+            for start, end in known_words
+        )
 
     def _parse_result(self, result: dict[str, Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
         payload = result.get("structuredContent")
@@ -165,6 +185,9 @@ class GatewayTermVerificationFlow:
             if not isinstance(finding, dict):
                 return None
             start, end = finding.get("start"), finding.get("end")
+            # 형태소 분석기가 복원해 원문에 없는 형태소다. 교정할 구간이 없을 뿐 응답 오류가 아니다.
+            if start == end and finding.get("source_text") == "":
+                continue
             input_text, analysis_form, candidates = finding.get("source_text"), finding.get("analysis_form"), finding.get("candidates")
             if not self._valid_span(start, end, input_text, source_text) or not isinstance(analysis_form, str) or not isinstance(candidates, list):
                 return None

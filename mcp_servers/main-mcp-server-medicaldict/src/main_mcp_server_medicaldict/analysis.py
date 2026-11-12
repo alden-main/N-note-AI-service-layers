@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from uuid import uuid4
 
 from .dictionary import PHONETIC_MIN_SYLLABLES, DictionaryRepository, comparison_key, jamo_similarity
@@ -143,7 +144,9 @@ class DocumentAnalyzer:
         self._validate_text(text)
         if not isinstance(document_offset, int) or document_offset < 0:
             raise ValidationError("document_offset은 0 이상의 Unicode code point 오프셋이어야 합니다.")
-        exact, truncated = self._exact_suggestions(text)
+        # 정확 일치·조사 변형·오타 단계가 같은 표현을 여러 번 조회하므로 이 분석 안에서만 결과를 재사용한다.
+        find_exact = _memoized_lookup(self._dictionary.find_exact)
+        exact, truncated = self._exact_suggestions(text, find_exact)
         candidates: list[DocumentTermCandidate] = []
         seen_ranges: set[tuple[int, int]] = set()
         by_range: dict[tuple[int, int], list[DictionaryTerm]] = {}
@@ -152,15 +155,15 @@ class DocumentAnalyzer:
         for (start, end), terms in by_range.items():
             candidates.append(DocumentTermCandidate(str(uuid4()), start + document_offset, end + document_offset, CandidateType.EXACT_MATCH, terms))
             seen_ranges.add((start, end))
-        for start, end, source, base in self._variant_expressions(text):
-            terms = self._dictionary.find_exact(base)
+        for start, end, source, base in self._variant_expressions(text, find_exact):
+            terms = find_exact(base)
             if terms:
                 candidates.append(DocumentTermCandidate(str(uuid4()), start + document_offset, end + document_offset, CandidateType.VARIANT_MATCH, terms))
                 seen_ranges.add((start, end))
         for start, end, source in self._token_expressions(text):
             if (start, end) in seen_ranges:
                 continue
-            base, similar = self._typo_terms(source)
+            base, similar = self._typo_terms(source, find_exact)
             if similar:
                 candidates.append(DocumentTermCandidate(str(uuid4()), start + document_offset, start + len(base) + document_offset, CandidateType.UNKNOWN_OR_POSSIBLE_TYPO, similar))
         return AnalysisResult(
@@ -171,7 +174,7 @@ class DocumentAnalyzer:
             candidates=candidates,
         )
 
-    def _typo_terms(self, source: str) -> tuple[str, list[DictionaryTerm]]:
+    def _typo_terms(self, source: str, find_exact: Callable[[str], list[DictionaryTerm]]) -> tuple[str, list[DictionaryTerm]]:
         """오타 후보와 조사·어미를 뺀 원문을 반환한다. 한글은 자모 차이가 작은 용어만 남긴다."""
         if not re.fullmatch(r"[가-힣]+", source):
             return source, [hit.term for hit in self._dictionary.search(source, limit=MAX_TYPO_TERMS).results if hit.match_type.value == "similar"]
@@ -179,7 +182,7 @@ class DocumentAnalyzer:
         for base in bases:
             if len(base) < PHONETIC_MIN_SYLLABLES:
                 continue
-            if self._dictionary.find_exact(base):
+            if find_exact(base):
                 return source, []
             hits = [hit.term for hit in self._dictionary.search(base, limit=20).results if hit.match_type.value == "similar"]
             close = [term for term in hits if self._is_close_typo(base, comparison_key(term.kor_name))]
@@ -192,8 +195,11 @@ class DocumentAnalyzer:
         """음절 수가 같고 자모 차이가 작은 다른 표기만 오타로 본다. '절제(술)'처럼 기호만 다르면 같은 용어다."""
         return source != name and len(source) == len(name) and jamo_similarity(source, name) >= MIN_TYPO_JAMO_SIMILARITY
 
-    def _exact_suggestions(self, text: str) -> tuple[list[Suggestion], bool]:
+    def _exact_suggestions(
+        self, text: str, find_exact: Callable[[str], list[DictionaryTerm]] | None = None,
+    ) -> tuple[list[Suggestion], bool]:
         """정확 일치 결과를 상한까지 만들고, 초과 여부를 함께 반환한다."""
+        find_exact = find_exact or self._dictionary.find_exact
         suggestions: list[Suggestion] = []
         seen: set[tuple[int, int, str, str, str]] = set()
         truncated = False
@@ -216,7 +222,7 @@ class DocumentAnalyzer:
                     first, last = words[index], words[index + size - 1]
                     start, end = match.start() + first.start(), match.start() + last.end()
                     source = text[start:end]
-                    for term in self._dictionary.find_exact(source):
+                    for term in find_exact(source):
                         append(start, end, term)
                         if truncated:
                             return suggestions, True
@@ -245,17 +251,29 @@ class DocumentAnalyzer:
         pattern = r"[가-힣]{2,}|[A-Za-z][A-Za-z0-9()/.+\-]*(?:\s+[A-Za-z][A-Za-z0-9()/.+\-]*)*(?:은|는|을|를|이|가|의|와|과|도|에|에서|으로|로)?"
         return [(match.start(), match.end(), match.group()) for match in re.finditer(pattern, text)]
 
-    def _variant_expressions(self, text: str) -> list[tuple[int, int, str, str]]:
+    def _variant_expressions(self, text: str, find_exact: Callable[[str], list[DictionaryTerm]]) -> list[tuple[int, int, str, str]]:
         """조사·어미가 결합했으나 기본 표기가 사전에 있는 후보를 만든다."""
         variants: list[tuple[int, int, str, str]] = []
         for start, end, source in self._token_expressions(text):
             for suffix in _PARTICLES:
                 if source.endswith(suffix) and len(source) > len(suffix) + 1:
                     base = source[:-len(suffix)]
-                    if self._dictionary.find_exact(base):
+                    if find_exact(base):
                         variants.append((start, end, source, base))
                     break
         return variants
+
+
+def _memoized_lookup(lookup: Callable[[str], list[DictionaryTerm]]) -> Callable[[str], list[DictionaryTerm]]:
+    """분석 한 번 동안만 쓰는 조회 캐시다. 호출부가 목록을 바꿔도 캐시가 오염되지 않게 복사본을 준다."""
+    cache: dict[str, tuple[DictionaryTerm, ...]] = {}
+
+    def cached(expression: str) -> list[DictionaryTerm]:
+        if expression not in cache:
+            cache[expression] = tuple(lookup(expression))
+        return list(cache[expression])
+
+    return cached
 
 
 def _same_term(left: DictionaryTerm | None, right: DictionaryTerm) -> bool:

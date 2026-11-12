@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import unittest
 import asyncio
 from pathlib import Path
@@ -262,3 +263,50 @@ class MedicalDictionaryTests(unittest.TestCase):
             self.assertIsNotNone(accepted)
             payload["end_offset"] = 2
             self.assertIsNone(SuggestionValidator(self.repository).validate_review(payload, text, restored.terms, restored))
+
+    def test_document_analysis_reuses_one_read_connection_per_thread(self) -> None:
+        """문서 분석은 조회마다 SQLite 연결을 열지 않고 thread의 읽기 전용 연결을 재사용한다."""
+        repository = DictionaryRepository(ROOT / "data/dictionary-snapshots")
+        repository.load_phonetic_index()
+        text = "환자 당뇨병 있고 고혈압으로 약 복용 중입니다. 강경변증 의심, 수술 후 통증 호소함."
+        with patch("main_mcp_server_medicaldict.dictionary.sqlite3.connect", wraps=sqlite3.connect) as connect:
+            first = DocumentAnalyzer(repository).analyze_document(text)
+            second = DocumentAnalyzer(repository).analyze_document(text)
+        self.assertEqual(connect.call_count, 0)  # 색인을 만들 때 연 연결을 그대로 쓴다.
+        self.assertEqual(
+            [(item.start_offset, item.end_offset, item.candidate_type) for item in first.candidates],
+            [(item.start_offset, item.end_offset, item.candidate_type) for item in second.candidates],
+        )
+
+    def test_health_responds_while_a_tool_call_is_running(self) -> None:
+        """도구는 worker thread에서 실행되므로 긴 분석이 /healthz와 다른 호출을 막지 않는다."""
+        started, release = threading.Event(), threading.Event()
+        original = DocumentAnalyzer.analyze_document
+
+        def slow_analyze(analyzer: DocumentAnalyzer, text: str, document_offset: int = 0):
+            started.set()
+            release.wait(timeout=10)
+            return original(analyzer, text, document_offset)
+
+        with TemporaryDirectory() as directory, patch.object(DocumentAnalyzer, "analyze_document", slow_analyze):
+            server = create_server(ROOT / "data/dictionary-snapshots", Path(directory) / "history.sqlite")
+            handler = server._mcp_server.request_handlers[types.CallToolRequest]
+
+            async def scenario() -> tuple[int, bool]:
+                call = asyncio.ensure_future(handler(types.CallToolRequest(
+                    params=types.CallToolRequestParams(name="analyze_document_terms", arguments={"text": "당뇨병"}),
+                )))
+                while not started.is_set():
+                    await asyncio.sleep(0.01)
+                transport = httpx.ASGITransport(app=server.streamable_http_app())
+                async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                    health = await asyncio.wait_for(client.get("/healthz"), timeout=5)
+                still_running = not call.done()
+                release.set()
+                result = (await call).root
+                self.assertFalse(result.isError)
+                return health.status_code, still_running
+
+            status, still_running = asyncio.run(scenario())
+        self.assertEqual(status, 200)
+        self.assertTrue(still_running)

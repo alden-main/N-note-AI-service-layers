@@ -166,6 +166,7 @@ services:
       MEDICALDICT_MCP_TRANSPORT: streamable-http
       MEDICALDICT_MCP_HOST: 0.0.0.0
       MEDICALDICT_MCP_PORT: "8000"
+      MEDICALDICT_MAX_CONCURRENT_REQUESTS: ${MEDICALDICT_MAX_CONCURRENT_REQUESTS:-4}
     volumes:
       - medicaldict-history:/var/lib/medicaldict
     healthcheck: *mcp-healthcheck

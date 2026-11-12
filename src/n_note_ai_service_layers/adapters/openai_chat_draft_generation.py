@@ -95,8 +95,11 @@ class OpenAiChatDraftGenerationAdapter(OpenAiDraftGenerationAdapter):
         """
         started = time.monotonic()
         calls = 0
+        rounds = 0
         history = list(messages)
-        while calls < self._max_tool_calls and time.monotonic() - started < self._tool_timeout_seconds:
+        # 도구를 줄 수 있는 LLM 호출은 ``max_tool_rounds``번까지다. 그 뒤에는 구조화 출력 호출 한 번으로 끝낸다.
+        while rounds < self._max_tool_rounds and calls < self._max_tool_calls and time.monotonic() - started < self._tool_timeout_seconds:
+            rounds += 1
             try:
                 response = self._client.chat.completions.create(**self._request(history), tools=tools, tool_choice="auto")
             except Exception as exc:

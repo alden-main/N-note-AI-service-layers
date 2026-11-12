@@ -96,6 +96,11 @@ class Settings(BaseSettings):
     llm_api_override: Literal["responses", "chat"] | None = Field(None, validation_alias="N_NOTE_LLM_API")
     # tool call을 지원하지 않는 모델은 끈다.
     llm_tool_calling_enabled: bool = Field(True, validation_alias="N_NOTE_LLM_TOOL_CALLING")
+    # 초안 생성 중 사전 도구 결과를 LLM에 돌려주는 왕복 횟수 상한이다. LLM 호출은 최대 ``1 + 이 값``번이다.
+    # 전사문 용어 검토 힌트를 이미 주므로 기본은 2이고, 0이면 도구를 주지 않는다(힌트만 사용).
+    llm_max_tool_rounds: NonNegativeInt = 2
+    # 초안 하나를 만드는 동안 호출할 수 있는 사전 도구 총 횟수다.
+    llm_max_tool_calls: PositiveInt = 6
     # OpenAI 호환 서버에 그대로 전달할 추가 요청 필드(JSON 객체)다. 예: thinking 끄기.
     llm_extra_body: JsonObject = {}
     # 로컬 서버의 문맥 길이에 맞춰 제한한다. 미설정이면 서버 기본값을 쓴다.
@@ -163,6 +168,11 @@ class Settings(BaseSettings):
 
     # worker 한 개가 동시에 실행할 초안 생성 작업 수다.
     job_concurrency: PositiveInt = 4
+    # 여러 양식을 함께 만드는 작업 하나가 동시에 초안을 생성할 양식 수다.
+    # worker 하나의 LLM 동시 호출은 최대 ``job_concurrency × form_concurrency``다.
+    form_concurrency: PositiveInt = 3
+    # 작업 하나에 요청할 수 있는 최대 양식 수다.
+    max_forms_per_job: PositiveInt = 7
     # worker 한 개의 대기열 상한이다. 넘으면 새 작업을 429로 거부한다.
     job_max_pending: PositiveInt = 32
     # 작업 상태가 이 시간 동안 갱신되지 않으면(서버 중단 등) 실패(``interrupted``)로 본다.

@@ -158,3 +158,23 @@ def test_request_body_limit_is_independent_from_text_limit(tmp_path: Path) -> No
             "retryable": False,
         }
     }
+
+
+def test_review_tool_accepts_optional_compact_detail(tmp_path: Path) -> None:
+    """detail은 선택 입력이라 text만 보내는 기존 호출자는 그대로 전체 근거를 받는다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    server = create_server(Settings(database_path=database))
+
+    async def scenario() -> tuple[dict, types.CallToolResult, types.CallToolResult]:
+        tool = next(item for item in await server.list_tools() if item.name == "review_standard_korean_text")
+        full = await server.call_tool("review_standard_korean_text", {"text": "가다"})
+        compact = await server.call_tool("review_standard_korean_text", {"text": "가다", "detail": "compact"})
+        return tool.inputSchema, full, compact
+
+    schema, full, compact = anyio.run(scenario)
+    assert schema["required"] == ["text"]
+    assert schema["properties"]["detail"]["enum"] == ["full", "compact"]
+    assert full.structuredContent["findings"][0]["candidates"][0]["evidence"]["headword"] == "가다"
+    assert compact.structuredContent["findings"][0]["status"] == "matched"
+    assert compact.structuredContent["findings"][0]["candidates"] == []

@@ -273,3 +273,70 @@ def test_real_kiwi_word_rule_runs_before_homonym_lookup(tmp_path: Path) -> None:
     assert finding["status"] == "needs_review"
     assert finding["candidates"][0]["replacement"] == "돼요"
     assert finding["candidates"][0]["evidence"]["headword"] == "되다"
+
+
+def test_real_kiwi_restored_copula_has_no_empty_finding(tmp_path: Path) -> None:
+    """Kiwi가 원문 없이 복원한 서술격조사는 길이 0 결과로 나가지 않는다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    analyzer = MorphologyAnalyzer()
+    text = "이상로 간온고누 시징니다."
+    assert any(token.start == token.end for token in analyzer.analyze(text))
+    result = TextReviewer(DictionaryRepository(database), analyzer, 10).review(text)
+    assert result["findings"]
+    assert all(finding["start"] < finding["end"] and finding["source_text"] for finding in result["findings"])
+
+
+def test_word_made_only_of_restored_morpheme_is_skipped(tmp_path: Path) -> None:
+    """원문 구간이 없는 어절은 어절 규칙도 적용하지 않는다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+
+    class EmptyTokenAnalyzer:
+        def analyze(self, text: str) -> list[MorphToken]:
+            return [MorphToken("", "이", "VCP", 0, 0)]
+
+    assert TextReviewer(DictionaryRepository(database), EmptyTokenAnalyzer(), 10).review("다")["findings"] == []
+
+
+def test_compact_review_drops_evidence_and_matched_candidates(tmp_path: Path) -> None:
+    """간결 모드는 위치·상태·교정 후보만 남긴다. 정확 일치는 교정 후보가 아니므로 후보를 비운다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    add_entry(database, "sample.xls:3", "되다")
+
+    class MixedAnalyzer:
+        def analyze(self, text: str) -> list[MorphToken]:
+            return [MorphToken("가다", "가다", "VV", 0, 2), MorphToken("되요", "되요", "VV", 3, 5)]
+
+    reviewer = TextReviewer(DictionaryRepository(database), MixedAnalyzer(), 10)
+    full, compact = reviewer.review("가다 되요"), reviewer.review("가다 되요", compact=True)
+
+    assert [(item["start"], item["end"], item["status"]) for item in compact["findings"]] == [
+        (item["start"], item["end"], item["status"]) for item in full["findings"]
+    ]
+    matched, typo = compact["findings"]
+    assert full["findings"][0]["candidates"] and matched["candidates"] == []
+    assert typo["candidates"] == [{key: value for key, value in candidate.items() if key != "evidence"} for candidate in full["findings"][1]["candidates"]]
+    assert typo["candidates"][0]["replacement"] == "돼요"
+    assert "evidence" not in typo["candidates"][0]
+
+
+def test_compact_review_limit_counts_only_findings_with_candidates(tmp_path: Path) -> None:
+    """간결 모드에서는 정확 일치가 상한을 채워 뒷부분 검토가 잘리는 일이 없다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    add_entry(database, "sample.xls:3", "되다")
+
+    class ManyMatchesThenTypo:
+        def analyze(self, text: str) -> list[MorphToken]:
+            tokens = [MorphToken("가다", "가다", "VV", index * 3, index * 3 + 2) for index in range(5)]
+            return [*tokens, MorphToken("되요", "되요", "VV", 15, 17)]
+
+    text = "가다 " * 5 + "되요"
+    reviewer = TextReviewer(DictionaryRepository(database), ManyMatchesThenTypo(), 10, max_findings=2)
+
+    assert reviewer.review(text)["warnings"] == [{"code": "findings_truncated", "retryable": False}]
+    compact = reviewer.review(text, compact=True)
+    assert compact["warnings"] == []
+    assert compact["findings"][-1]["candidates"][0]["replacement"] == "돼요"

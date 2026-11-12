@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -54,11 +54,33 @@ class NursingNoteWorkflowResult:
     llm_applied_term_hints: tuple[dict[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class PreparedTranscript:
+    """여러 양식이 함께 쓰는 공통 단계(STT·비식별화·전사문 용어 검토)의 결과다."""
+
+    trace_id: str
+    # 비식별화한 전사문이다. 외부 LLM·Gateway에는 이것만 보낸다.
+    transcript: Transcript
+    redaction_count: int
+    catalog: tuple[dict[str, Any], ...] | None
+    # 힌트 대기 상한 안에 끝난 전사문 검토로 만든 LLM 힌트다. 늦으면 비어 있다.
+    hints: tuple[dict[str, Any], ...]
+    reference_time: datetime
+    review: Future[GatewayTermVerificationResult]
+    review_pool: ThreadPoolExecutor
+
+    def close(self) -> None:
+        """검토 스레드 풀을 정리한다. 진행 중인 검토는 끝까지 실행되므로 ``review.result()``는 계속 쓸 수 있다."""
+        self.review_pool.shutdown(wait=False)
+
+
 class NursingNoteWorkflow:
     """문맥 준비가 완료된 요청만 외부 STT/LLM/Gateway로 전달하는 조립 경계다.
 
     순서: STT → 비식별화 → 전사문 표준어·의학용어 검토 → 검토 힌트를 포함한 양식 초안 생성 →
     초안 수치 대조 → (초안 필드별 용어 검토 ∥ 보고서 검증 MCP의 양식 완결성 검증)이다.
+    앞의 세 단계(``prepare``)는 양식과 무관하므로, 여러 양식을 만들 때(``generate_many``)는 한 번만 하고
+    양식별 단계(``draft``)만 병렬로 실행한다.
     전사문 검토가 ``hint_budget_seconds`` 안에 끝나지 않으면 힌트 없이 초안 생성을 시작하고, 검토 결과는
     초안 생성 뒤에 받아 응답(검토 후보)에 담는다. Gateway 지연이 LLM 시작을 붙잡지 않게 하기 위해서다.
     어떤 후보도 자동 적용하지 않는다. STT·초안 생성 실패는 ``WorkflowStageError``이고,
@@ -89,8 +111,64 @@ class NursingNoteWorkflow:
         progress: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
         """``progress``는 각 단계(stt, redaction, transcript_term_review, draft_generation, draft_review)를 시작할 때 호출된다."""
-        trace_id = audio.trace_id
         notify = progress or (lambda _: None)
+        prepared = self.prepare(audio, known_identifiers, notify)
+        try:
+            return self.draft(prepared, snapshot, schema, notify)
+        finally:
+            prepared.close()
+
+    def generate_many(
+        self,
+        audio: AudioInput,
+        forms: Sequence[tuple[FormSchema, Any]],
+        known_identifiers: Iterable[str] = (),
+        progress: Callable[[str], None] | None = None,
+        on_form_stage: Callable[[int, str], None] | None = None,
+        on_form_done: Callable[[int, NursingNoteWorkflowResult | Exception], None] | None = None,
+        max_parallel: int = 1,
+    ) -> list[NursingNoteWorkflowResult | Exception]:
+        """음성 하나로 여러 양식의 초안을 만든다.
+
+        STT·비식별화·전사문 용어 검토는 한 번만 하고, 양식별 초안 생성·수치 대조·초안 검토는
+        ``max_parallel``개까지 동시에 실행한다. ``forms``는 (양식, 그 양식의 임상 문맥) 목록이다.
+
+        공통 단계가 실패하면 ``WorkflowStageError``를 던진다. 양식 하나의 실패는 다른 양식에 영향을 주지 않고
+        결과 목록의 그 자리에 예외로 남는다(초안 생성 실패는 ``WorkflowStageError``).
+        ``on_form_stage(index, stage)``는 양식별 단계가 바뀔 때, ``on_form_done(index, outcome)``은 양식 하나가
+        끝나는 즉시 작업 스레드에서 호출된다. 먼저 끝난 초안을 바로 저장·표시하기 위해서다.
+        """
+        if not forms:
+            raise ValueError("at least one form is required")
+        notify = progress or (lambda _: None)
+        form_stage = on_form_stage or (lambda _index, _stage: None)
+        form_done = on_form_done or (lambda _index, _outcome: None)
+        prepared = self.prepare(audio, known_identifiers, notify)
+        notify("draft_generation")
+
+        def run(index: int, schema: FormSchema, snapshot: Any) -> NursingNoteWorkflowResult | Exception:
+            outcome: NursingNoteWorkflowResult | Exception
+            try:
+                outcome = self.draft(prepared, snapshot, schema, lambda name: form_stage(index, name))
+            except Exception as exc:  # 한 양식의 실패가 다른 양식의 결과를 버리지 않게 결과로 돌려준다.
+                outcome = exc
+            form_done(index, outcome)
+            return outcome
+
+        try:
+            workers = max(1, min(len(forms), max_parallel))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="form-draft") as pool:
+                futures = [pool.submit(run, index, schema, snapshot) for index, (schema, snapshot) in enumerate(forms)]
+                return [future.result() for future in futures]
+        finally:
+            prepared.close()
+
+    def prepare(self, audio: AudioInput, known_identifiers: Iterable[str], notify: Callable[[str], None]) -> PreparedTranscript:
+        """양식과 무관한 공통 단계다: STT → 비식별화 → 전사문 용어 검토 시작(힌트 대기 상한까지 기다림).
+
+        반환값의 ``close()``를 호출해 검토 스레드를 정리한다. 검토가 아직 진행 중이면 결과는 ``review``로 받는다.
+        """
+        trace_id = audio.trace_id
         notify("stt")
         with stage(_logger, trace_id, "stt", audio_bytes=len(audio.content)):
             try:
@@ -119,31 +197,41 @@ class NursingNoteWorkflow:
                     candidates=len(hint_source.occurrences) if hint_source else 0,
                     hints_deferred=not done,
                 )
-            reference_time = now_local()
-            hints = self.hints(hint_source) if hint_source else ()
-            notify("draft_generation")
-            with stage(_logger, trace_id, "draft_generation", schema_id=schema.schema_id) as metrics:
-                try:
-                    payload = self.projector.project(snapshot, external_transcript.text, schema, term_review_hints=hints, reference_time=reference_time)
-                    draft = self.generator.generate(payload, schema)
-                except Exception as exc:
-                    raise WorkflowStageError("draft_generation") from exc
-                metrics.update(fields=len(draft.proposed_fields), hints=len(hints))
-            # 힌트 대기 상한을 넘긴 검토도 화면의 검토 후보로는 필요하다. Gateway timeout 안에 끝난다.
-            transcript_gateway = review.result()
-        finally:
+        except BaseException:
             review_pool.shutdown(wait=False)
-        sources = self.numeric_sources(external_transcript.text, payload)
-        numeric_findings = NumericVerifier().check(schema, draft.proposed_fields, sources, reference_time)
+            raise
+        return PreparedTranscript(
+            trace_id, external_transcript, redacted.replacement_count, catalog,
+            self.hints(hint_source) if hint_source else (), now_local(), review, review_pool,
+        )
+
+    def draft(
+        self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None = None,
+    ) -> NursingNoteWorkflowResult:
+        """양식 하나의 단계다: 검토 힌트를 포함한 초안 생성 → 수치 대조 → (초안 용어 검토 ∥ 양식 완결성 검증)."""
+        notify = notify or (lambda _: None)
+        trace_id, transcript, hints = prepared.trace_id, prepared.transcript, prepared.hints
+        notify("draft_generation")
+        with stage(_logger, trace_id, "draft_generation", schema_id=schema.schema_id) as metrics:
+            try:
+                payload = self.projector.project(snapshot, transcript.text, schema, term_review_hints=hints, reference_time=prepared.reference_time)
+                draft = self.generator.generate(payload, schema)
+            except Exception as exc:
+                raise WorkflowStageError("draft_generation") from exc
+            metrics.update(fields=len(draft.proposed_fields), hints=len(hints))
+        # 힌트 대기 상한을 넘긴 검토도 화면의 검토 후보로는 필요하다. Gateway timeout 안에 끝난다.
+        transcript_gateway = prepared.review.result()
+        sources = self.numeric_sources(transcript.text, payload)
+        numeric_findings = NumericVerifier().check(schema, draft.proposed_fields, sources, prepared.reference_time)
         document = DraftDocument.build(schema, draft.proposed_fields)
         notify("draft_review")
-        with stage(_logger, trace_id, "draft_review") as metrics:
-            draft_gateway, validation = self._review_draft(schema, document, trace_id, catalog)
+        with stage(_logger, trace_id, "draft_review", schema_id=schema.schema_id) as metrics:
+            draft_gateway, validation = self._review_draft(schema, document, trace_id, prepared.catalog)
             metrics.update(term_status=draft_gateway.status, report_status=validation.status, numeric_findings=len(numeric_findings))
         return NursingNoteWorkflowResult(
-            external_transcript, draft, transcript_gateway, draft_gateway, redacted.replacement_count,
-            report_validation=validation, numeric_findings=numeric_findings, numeric_sources=sources, reference_time=reference_time,
-            llm_applied_term_hints=self.applied_hints(hints, external_transcript.text, document.text),
+            transcript, draft, transcript_gateway, draft_gateway, prepared.redaction_count,
+            report_validation=validation, numeric_findings=numeric_findings, numeric_sources=sources, reference_time=prepared.reference_time,
+            llm_applied_term_hints=self.applied_hints(hints, transcript.text, document.text),
         )
 
     def _start_transcript_review(

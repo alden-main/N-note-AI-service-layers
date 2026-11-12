@@ -65,8 +65,13 @@ def draft_generator(gateway: McpGatewayClient | None) -> OpenAiDraftGenerationAd
             endpoint.model,
             gateway_client=tool_gateway,
             allowed_tool_names=config.llm_tool_names,
+            max_tool_rounds=config.llm_max_tool_rounds,
+            max_tool_calls=config.llm_max_tool_calls,
             extra_body=config.llm_extra_body,
             max_tokens=config.llm_max_tokens,
             temperature=config.llm_temperature,
         )
-    return OpenAiDraftGenerationAdapter(client, endpoint.model, gateway_client=tool_gateway, allowed_tool_names=config.llm_tool_names)
+    return OpenAiDraftGenerationAdapter(
+        client, endpoint.model, gateway_client=tool_gateway, allowed_tool_names=config.llm_tool_names,
+        max_tool_rounds=config.llm_max_tool_rounds, max_tool_calls=config.llm_max_tool_calls,
+    )

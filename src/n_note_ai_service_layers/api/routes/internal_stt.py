@@ -233,7 +233,9 @@ async def internal_transcription(request: Request, provider=Depends(get_speech_t
     except Exception as exc:
         raise HTTPException(status_code=503, detail="transcript de-identification failed") from exc
     try:
-        review = await run_in_threadpool(GatewayTermVerificationFlow(gateway).verify, "transcript", redacted.text, trace_id)
+        with stage(_logger, trace_id, "transcript_term_review") as metrics:
+            review = await run_in_threadpool(GatewayTermVerificationFlow(gateway).verify, "transcript", redacted.text, trace_id)
+            metrics.update(status=review.status, candidates=len(review.occurrences))
     except Exception as exc:
         raise HTTPException(status_code=503, detail="term review is unavailable") from exc
     if review.status != "ok":

@@ -162,6 +162,25 @@ class ChatDraftAdapterTests(unittest.TestCase):
         self.assertEqual(final["messages"][-1]["content"], FINAL_TURN_INSTRUCTION)
         self.assertEqual(final["messages"][3]["tool_call_id"], "call-1")
 
+    def test_tool_phase_is_capped_by_tool_rounds(self):
+        """도구를 계속 요청해도 도구 단계는 ``max_tool_rounds``번이고, 이어서 구조화 출력 호출 한 번으로 끝난다."""
+        call = lambda index: SimpleNamespace(id=f"call-{index}", function=SimpleNamespace(name="dictionary__lookup", arguments='{"term":"x"}'))
+        completions = _Completions(*(_completion(None, [call(index)]) for index in range(5)), _completion(FINAL))
+        completions.responses.insert(2, _completion(FINAL))  # 세 번째 호출(구조화 출력)의 응답이다.
+        gateway = _Gateway()
+        adapter = OpenAiChatDraftGenerationAdapter(_client(completions), "qwen", gateway_client=McpGatewayClient(transport=gateway), max_tool_rounds=2)
+        result = adapter.generate({"transcript": "x"}, sample_form_schema())
+        self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
+        self.assertEqual(len(completions.requests), 3)
+        self.assertEqual(len(gateway.called), 2)
+        self.assertIn("response_format", completions.requests[-1])
+
+    def test_tool_round_settings_reach_the_adapter(self):
+        env = {"N_NOTE_LLM_MAX_TOOL_ROUNDS": "0", "N_NOTE_LLM_MAX_TOOL_CALLS": "3", "OPENAI_API_KEY": "test-key"}
+        with patch.dict(os.environ, env, clear=True):
+            adapter = model_providers.draft_generator(McpGatewayClient(transport=_Gateway()))
+        self.assertEqual((adapter._max_tool_rounds, adapter._max_tool_calls), (0, 3))
+
     def test_server_without_tool_support_falls_back_to_hints_only(self):
         error = Exception("auto tool choice requires --enable-auto-tool-choice")
         error.status_code = 400

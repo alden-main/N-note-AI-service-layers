@@ -6,7 +6,7 @@ import json
 import re
 import sqlite3
 import unicodedata
-from threading import RLock
+from threading import RLock, local
 from collections import OrderedDict
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -74,6 +74,11 @@ class DictionaryRepository:
         if not self._database_path.is_file():
             raise DictionaryConfigurationError("활성 사전 SQLite 파일을 찾을 수 없습니다.")
         self._search_results: OrderedDict[str, SearchResult] = OrderedDict()
+        # 도구 호출은 worker thread에서 동시에 실행되므로 검색 결과 LRU를 보호한다.
+        self._search_results_lock = RLock()
+        # 읽기 전용 연결을 thread마다 하나씩 열어 재사용한다. 문서 분석은 조회를 수천 번 하므로
+        # 조회마다 연결을 열면 분석 시간의 대부분이 연결 생성에 쓰인다.
+        self._thread_connections = local()
         # 분석기는 한글 연속 구간의 모든 문자 위치에서 두 글자 접두어를
         # 확인한다. 활성 스냅샷은 프로세스 수명 중 바뀌지 않으므로 결과를
         # 제한된 LRU로 재사용해 반복 SQLite 연결·질의를 피한다.
@@ -218,10 +223,11 @@ class DictionaryRepository:
             ordered = [hit for hit in ordered if hit.match_type in match_modes]
         ordered = ordered[:limit]
         result = SearchResult(str(uuid4()), self.version, ordered)
-        self._search_results[result.search_result_id] = result
-        self._search_results.move_to_end(result.search_result_id)
-        while len(self._search_results) > 1_000:
-            self._search_results.popitem(last=False)
+        with self._search_results_lock:
+            self._search_results[result.search_result_id] = result
+            self._search_results.move_to_end(result.search_result_id)
+            while len(self._search_results) > 1_000:
+                self._search_results.popitem(last=False)
         return result
 
     def get_search_result(self, search_result_id: str) -> SearchResult | None:
@@ -229,9 +235,10 @@ class DictionaryRepository:
 
         검색 결과는 서버 프로세스 메모리에만 보관하며 원문 검색어는 이력 DB에 저장하지 않는다.
         """
-        result = self._search_results.get(search_result_id)
-        if result is not None:
-            self._search_results.move_to_end(search_result_id)
+        with self._search_results_lock:
+            result = self._search_results.get(search_result_id)
+            if result is not None:
+                self._search_results.move_to_end(search_result_id)
         return result
 
     def _prefix_candidates(self, normalized: str, candidate_limit: int) -> list[DictionaryTerm]:
@@ -259,8 +266,16 @@ class DictionaryRepository:
         return list(unique.values())
 
     def _connect(self) -> sqlite3.Connection:
-        """사전 변경을 차단하는 SQLite 읽기 전용 연결을 생성한다."""
-        return sqlite3.connect(f"file:{self._database_path}?mode=ro", uri=True)
+        """현재 thread의 SQLite 읽기 전용 연결을 반환하고, 없으면 연다.
+
+        ``mode=ro``라 사전을 바꿀 수 없다. 호출부의 ``with`` 블록은 트랜잭션만 끝내고 연결은
+        닫지 않으므로 같은 thread의 다음 조회가 연결을 재사용한다. 연결은 thread가 끝나면 함께 정리된다.
+        """
+        connection = getattr(self._thread_connections, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(f"file:{self._database_path}?mode=ro", uri=True)
+            self._thread_connections.connection = connection
+        return connection
 
 
 def _term_key(term: DictionaryTerm) -> tuple[str, str, str]:

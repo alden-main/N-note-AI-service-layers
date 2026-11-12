@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from time import perf_counter
-from typing import Annotated
+from typing import Annotated, Literal
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
@@ -37,8 +37,11 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     repository = DictionaryRepository(settings.database_path)
     try:
         catalog = RecommendationCatalog.from_path(settings.recommendation_data_path)
+        analyzer = MorphologyAnalyzer()
+        # Kiwi는 첫 분석에서 모델을 읽어 0.5초가량 걸린다. 첫 검토 요청이 이 지연을 떠안지 않게 기동 중에 한 번 분석한다.
+        analyzer.analyze("기동 확인")
         reviewer = TextReviewer(
-            repository, MorphologyAnalyzer(), settings.max_candidates, catalog, max_findings=settings.max_findings
+            repository, analyzer, settings.max_candidates, catalog, max_findings=settings.max_findings
         )
     except Exception:
         reviewer = None
@@ -125,7 +128,11 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         return complete("lookup_standard_dictionary", "ok", {"entries": [entry.as_dict() for entry in entries]}, context, started_at)
 
     @mcp.tool(structured_output=False)
-    async def review_standard_korean_text(text: Annotated[str, "검토할 한국어 문서 텍스트"], context: Context) -> CallToolResult:
+    async def review_standard_korean_text(
+        text: Annotated[str, "검토할 한국어 문서 텍스트"],
+        context: Context,
+        detail: Annotated[Literal["full", "compact"], "full은 후보마다 사전 근거를 포함하고, compact는 위치·상태·교정 후보만 반환한다"] = "full",
+    ) -> CallToolResult:
         """한국어 문서를 사전 근거와 함께 검토하되 자동 교정을 확정하지 않는다.
 
         text는 비어 있지 않아야 하며 구성된 길이 상한(기본 10,000 코드
@@ -133,6 +140,10 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         반환한다. 상한에 도달하면 부분 결과와 warnings의
         findings_truncated를 반환하므로, 호출자는 이를 자동 교정이나 완전한
         문서 판정으로 해석해서는 안 된다.
+
+        detail=compact이면 사전 근거(evidence)를 빼고 matched 결과의 후보를
+        비운다. 이때 상한은 교정 후보가 있는 결과에만 적용한다. 응답 크기가
+        크게 줄어 문서 전체 검토에 적합하다.
         """
         started_at = perf_counter()
         if not isinstance(text, str) or not text.strip():
@@ -143,7 +154,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         if not is_ready:
             return complete("review_standard_korean_text", "upstream_unavailable", error("upstream_unavailable", "분석기 또는 사전 DB를 사용할 수 없습니다.", True), context, started_at, is_error=True)
         try:
-            result = await anyio.to_thread.run_sync(reviewer.review, text, limiter=execution_limiter)
+            result = await anyio.to_thread.run_sync(reviewer.review, text, detail == "compact", limiter=execution_limiter)
         except Exception:
             return complete("review_standard_korean_text", "internal_error", error("internal_error", "텍스트 검토 중 예상하지 못한 오류가 발생했습니다.", True), context, started_at, is_error=True)
         return complete("review_standard_korean_text", "ok", result, context, started_at)
