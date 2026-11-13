@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+class AudioDecodeError(ValueError):
+    """음성 바이트를 디코딩할 수 없다(지원하지 않는 형식, 손상된 파일, 길이 상한 초과)."""
+
+
 @dataclass(frozen=True)
 class AudioInput:
     """전사 제공자에 전달할 음성 파일을 표현한다.

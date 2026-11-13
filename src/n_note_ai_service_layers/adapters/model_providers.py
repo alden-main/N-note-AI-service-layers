@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any
 
 from n_note_ai_service_layers import settings
+from n_note_ai_service_layers.adapters.audio_preprocessing import DEFAULT_HALLUCINATION_PATTERNS, AudioPreprocessingSpeechToText, HallucinationFilter, VadConfig
 from n_note_ai_service_layers.adapters.openai_chat_draft_generation import OpenAiChatDraftGenerationAdapter
 from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
@@ -39,14 +40,20 @@ def _cached_client(endpoint: settings.ModelEndpoint, timeout_seconds: float | No
     return OpenAI(api_key=endpoint.api_key, **options) if endpoint.api_key else OpenAI(**options)
 
 
-def speech_to_text_provider() -> OpenAiSpeechToTextAdapter:
+def speech_to_text_provider() -> AudioPreprocessingSpeechToText:
+    """STT 어댑터를 전처리(WAV 변환·VAD·환각 필터)로 감싸 만든다."""
     config = settings.get()
     endpoint = config.stt_endpoint
     if config.require_local_stt and not endpoint.base_url:
         # 비식별화는 전사 이후이므로, 원본 음성이 외부 SaaS로 나가는 구성을 막는다.
         raise LocalSttRequired("N_NOTE_REQUIRE_LOCAL_STT requires N_NOTE_STT_BASE_URL")
     client = openai_client(endpoint, config.stt_timeout_seconds, config.model_max_retries)
-    return OpenAiSpeechToTextAdapter(client, model=endpoint.model, prompt=config.stt_prompt, provider=endpoint.provider)
+    adapter = OpenAiSpeechToTextAdapter(client, model=endpoint.model, prompt=config.stt_prompt, provider=endpoint.provider)
+    vad = VadConfig(
+        config.stt_vad_min_speech_seconds, config.stt_vad_min_dbfs, config.stt_vad_margin_db, config.stt_vad_padding_seconds,
+    ) if config.stt_vad_enabled else None
+    hallucination_filter = HallucinationFilter((*DEFAULT_HALLUCINATION_PATTERNS, *config.stt_hallucination_patterns)) if config.stt_hallucination_filter else None
+    return AudioPreprocessingSpeechToText(adapter, config.stt_normalizes_audio, vad, hallucination_filter, config.stt_max_audio_seconds)
 
 
 def draft_generator(gateway: McpGatewayClient | None) -> OpenAiDraftGenerationAdapter:

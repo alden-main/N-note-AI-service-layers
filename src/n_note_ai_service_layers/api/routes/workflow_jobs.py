@@ -43,6 +43,7 @@ _SSE_KEEPALIVE_SECONDS = 15.0
 # 실패 단계별 오류 코드다. 본문·예외 메시지는 노출하지 않는다.
 _logger = get_logger("workflow_jobs")
 _STAGE_FAILURES = {
+    "audio_decode": ("audio_undecodable", "audio could not be decoded; send a supported, undamaged audio file"),
     "stt": ("stt_unavailable", "speech transcription is unavailable"),
     "redaction": ("redaction_failed", "transcript de-identification failed; nothing was sent to external services"),
     "draft_generation": ("draft_generation_unavailable", "draft generation is unavailable"),

@@ -21,7 +21,7 @@ from n_note_ai_service_layers.api.schemas import (
 )
 from n_note_ai_service_layers.api.state import get_services
 from n_note_ai_service_layers.contracts.ai_provider import SpeechToTextProvider
-from n_note_ai_service_layers.contracts.audio import AudioInput, PreTranscribedAudio
+from n_note_ai_service_layers.contracts.audio import AudioDecodeError, AudioInput, PreTranscribedAudio
 from n_note_ai_service_layers.observability import get_logger, stage
 from n_note_ai_service_layers.services.context_flow import ClinicalContextFlow
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
@@ -114,6 +114,8 @@ async def add_recording_chunk(
         with stage(_logger, session.trace_id, "stt_chunk", sequence=sequence, audio_bytes=len(content)):
             try:
                 return provider.transcribe(source)
+            except AudioDecodeError as exc:
+                raise HTTPException(status_code=415, detail="audio could not be decoded") from exc
             except Exception as exc:
                 raise HTTPException(status_code=503, detail="speech transcription is unavailable") from exc
 

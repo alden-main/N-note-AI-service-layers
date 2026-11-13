@@ -10,7 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from n_note_ai_service_layers.api.deps import get_speech_to_text_provider, get_transcript_redactor, read_validated_audio
 from n_note_ai_service_layers.api.schemas import TranscriptionResponse
 from n_note_ai_service_layers.contracts.ai_provider import SpeechToTextProvider
-from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
+from n_note_ai_service_layers.contracts.audio import AudioDecodeError, AudioInput, Transcript
 from n_note_ai_service_layers.observability import get_logger, stage
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
 
@@ -34,6 +34,8 @@ async def transcribe_audio(
         # STT SDK는 동기 호출이다. 이벤트 루프를 막지 않도록 스레드에서 실행한다.
         with stage(_logger, trace_id, "stt", audio_bytes=len(content)):
             transcript: Transcript = await run_in_threadpool(provider.transcribe, audio_input)
+    except AudioDecodeError as exc:
+        raise HTTPException(status_code=415, detail="audio could not be decoded") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="speech transcription is unavailable") from exc
     redacted = redactor.redact(transcript.text)

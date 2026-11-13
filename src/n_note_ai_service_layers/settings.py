@@ -60,6 +60,7 @@ def _json_object(value: Any) -> Any:
 
 Names = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_split_names)]
 JsonObject = Annotated[dict[str, Any], NoDecode, BeforeValidator(_json_object)]
+JsonList = Annotated[list[str], NoDecode, BeforeValidator(_json_object)]
 
 
 def _env(*names: str) -> AliasChoices:
@@ -109,6 +110,21 @@ class Settings(BaseSettings):
     # 비교 평가 결과에 남길 모델 프로필 이름이다(``deploy/models/<profile>.env``).
     model_profile: str | None = None
 
+    # STT 전에 음성을 16kHz mono WAV로 바꾼다. ``auto``는 로컬 STT(``N_NOTE_STT_BASE_URL``)일 때만 켠다.
+    # OpenAI API는 원본 압축 형식을 그대로 받고 25MB 업로드 상한이 있어, WAV로 키우지 않는다.
+    stt_audio_normalize: Literal["auto", "on", "off"] = "auto"
+    # 말소리가 없는 음성(무음·일정한 잡음)은 STT에 보내지 않는다(Whisper 무음 환각 방지).
+    stt_vad_enabled: bool = True
+    stt_vad_min_speech_seconds: NonNegativeFloat = 0.3
+    stt_vad_min_dbfs: float = -50.0
+    stt_vad_margin_db: NonNegativeFloat = 8.0
+    stt_vad_padding_seconds: NonNegativeFloat = 0.5
+    # 전사문에서 알려진 환각 문장(방송 자막 문구)과 반복 루프를 지운다.
+    stt_hallucination_filter: bool = True
+    # 기본 환각 패턴에 더할 정규식 목록(JSON 배열)이다. 공백·문장부호를 지운 문장 전체와 비교한다.
+    stt_hallucination_patterns: JsonList = []
+    # 디코딩할 음성 길이 상한(초)이다. 압축 음성은 작은 파일도 길 수 있어 메모리 사용을 막는다.
+    stt_max_audio_seconds: PositiveFloat = 3600.0
     # STT 요청 한 번의 제한 시간이다. SDK 기본값(600초)은 요청을 수십 분 붙잡는다.
     stt_timeout_seconds: PositiveFloat = 60.0
     # 초안 생성 LLM 요청 한 번의 제한 시간이다(도구 호출 왕복마다 적용).
@@ -201,6 +217,10 @@ class Settings(BaseSettings):
     @property
     def stt_endpoint(self) -> ModelEndpoint:
         return ModelEndpoint(self.stt_model, self.stt_base_url, self.stt_api_key)
+
+    @property
+    def stt_normalizes_audio(self) -> bool:
+        return self.stt_audio_normalize == "on" or (self.stt_audio_normalize == "auto" and bool(self.stt_base_url))
 
     @property
     def llm_endpoint(self) -> ModelEndpoint:

@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from n_note_ai_service_layers.contracts.ai_provider import DraftGenerationProvider, SpeechToTextProvider
-from n_note_ai_service_layers.contracts.audio import AudioInput, PreTranscribedAudio, Transcript
+from n_note_ai_service_layers.contracts.audio import AudioDecodeError, AudioInput, PreTranscribedAudio, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
@@ -179,6 +179,8 @@ class NursingNoteWorkflow:
             with stage(_logger, trace_id, "stt", audio_bytes=len(audio.content)):
                 try:
                     transcript = self.stt.transcribe(audio)
+                except AudioDecodeError as exc:
+                    raise WorkflowStageError("audio_decode") from exc
                 except Exception as exc:
                     raise WorkflowStageError("stt") from exc
         notify("redaction")

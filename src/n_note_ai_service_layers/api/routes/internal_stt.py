@@ -15,7 +15,7 @@ from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.openai_chat_draft_generation import _json_text, _message
 from n_note_ai_service_layers.api.deps import get_gateway_client, get_speech_to_text_provider, get_transcript_redactor
-from n_note_ai_service_layers.contracts.audio import AudioInput
+from n_note_ai_service_layers.contracts.audio import AudioDecodeError, AudioInput
 from n_note_ai_service_layers.observability import get_logger, stage
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
@@ -226,6 +226,8 @@ async def internal_transcription(request: Request, provider=Depends(get_speech_t
     trace_id = str(uuid4())
     try:
         transcript = await run_in_threadpool(provider.transcribe, AudioInput(content, file.filename or "audio", file.content_type or "application/octet-stream", trace_id, "ko"))
+    except AudioDecodeError as exc:
+        raise HTTPException(status_code=415, detail="audio could not be decoded") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="speech transcription is unavailable") from exc
     try:

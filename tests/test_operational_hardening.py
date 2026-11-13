@@ -370,7 +370,7 @@ class ModelProviderPolicyTests(unittest.TestCase):
             with self.assertRaises(model_providers.LocalSttRequired):
                 model_providers.speech_to_text_provider()
         with patch.dict(os.environ, {"N_NOTE_REQUIRE_LOCAL_STT": "true", "N_NOTE_STT_BASE_URL": "http://local-stt:8000/v1"}):
-            self.assertEqual(model_providers.speech_to_text_provider()._provider, "openai-compatible")
+            self.assertEqual(model_providers.speech_to_text_provider().provider, "openai-compatible")
 
     def test_model_clients_have_bounded_timeouts(self) -> None:
         with patch.dict(os.environ, {"N_NOTE_LLM_BASE_URL": "http://local-llm:8000/v1", "N_NOTE_LLM_TIMEOUT_SECONDS": "42", "N_NOTE_MODEL_MAX_RETRIES": "0"}):

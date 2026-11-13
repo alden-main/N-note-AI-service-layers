@@ -25,6 +25,14 @@ class OpenAiSpeechToTextAdapter:
         # OpenAI 또는 OpenAI 호환 로컬 서버(vLLM Whisper 등)를 구분해 전사 결과에 남긴다.
         self._provider = provider
 
+    @property
+    def provider(self) -> str:
+        return self._provider
+
+    @property
+    def model(self) -> str:
+        return self._model
+
     def transcribe(self, audio: AudioInput) -> Transcript:
         """음성 바이트를 전사하여 도메인 전사 결과로 반환한다.
 

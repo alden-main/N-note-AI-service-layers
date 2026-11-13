@@ -87,7 +87,8 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertIsNone(generator._gateway_client)
         self.assertEqual(str(generator._client.base_url), "http://local-llm:8000/v1/")
         # LLM만 로컬이고 STT는 OpenAI인 혼합 구성이다.
-        self.assertEqual(stt._provider, "openai")
+        self.assertEqual(stt.provider, "openai")
+        self.assertFalse(stt.normalize)
 
     def test_factory_keeps_responses_adapter_for_openai(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):

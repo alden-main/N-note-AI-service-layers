@@ -8,10 +8,12 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "av>=14",
     "fastapi>=0.115.0",
     "files-to-prompt>=0.6",
     "httpx2>=2.13",
     "jsonschema>=4.23",
+    "numpy>=2.0",
     "openai>=2.0.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.6",
