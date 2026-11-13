@@ -229,3 +229,6 @@ model-cache/
 mcp_servers/main-mcp-server-kodict/koreandict_xlsx/
 mcp_servers/main-mcp-server-medicaldict/data/*.sqlite
 mcp_servers/main-mcp-server-medicaldict/data/dictionary-snapshots/snapshots/
+
+# 스모크 테스트 보고서(scripts/smoke-test.sh)
+eval/smoke/
