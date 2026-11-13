@@ -10,6 +10,8 @@ class AudioInput:
     """전사 제공자에 전달할 음성 파일을 표현한다.
 
     입력: 음성 바이트, 파일명, MIME 형식, 추적 ID와 선택 언어 힌트이다.
+    ``preceding_text``는 녹음 세션에서 바로 앞 청크까지 전사된 문장의 끝부분이다. STT가 청크 경계에서
+    문맥을 이어 받도록 프롬프트 뒤에 붙인다(원본 전사문이므로 로컬 STT 경계 밖으로 보내지 않는다).
     출력: 전사 서비스가 소비하는 불변 입력 객체이다.
     """
     content: bytes
@@ -17,6 +19,7 @@ class AudioInput:
     mime_type: str
     trace_id: str
     language_hint: str | None = None
+    preceding_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -45,3 +48,14 @@ class Transcript:
     model: str
     language: str | None = None
     segments: tuple[TranscriptSegment, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreTranscribedAudio:
+    """이미 전사된 음성이다(녹음 세션에서 청크별로 전사해 이어 붙인 전사문).
+
+    입력: 비식별화 전 원본 전사 결과와 추적 ID이다.
+    출력: 초안 생성 흐름이 STT를 다시 하지 않고 비식별화부터 시작하도록 하는 입력이다.
+    """
+    transcript: Transcript
+    trace_id: str

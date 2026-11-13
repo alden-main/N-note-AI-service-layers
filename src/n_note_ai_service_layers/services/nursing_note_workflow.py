@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from n_note_ai_service_layers.contracts.ai_provider import DraftGenerationProvider, SpeechToTextProvider
-from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
+from n_note_ai_service_layers.contracts.audio import AudioInput, PreTranscribedAudio, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
@@ -107,7 +107,7 @@ class NursingNoteWorkflow:
         self.hint_budget_seconds = hint_budget_seconds
 
     def generate(
-        self, snapshot, audio: AudioInput, schema: FormSchema, known_identifiers: Iterable[str] = (),
+        self, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
         progress: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
         """``progress``는 각 단계(stt, redaction, transcript_term_review, draft_generation, draft_review)를 시작할 때 호출된다."""
@@ -120,7 +120,7 @@ class NursingNoteWorkflow:
 
     def generate_many(
         self,
-        audio: AudioInput,
+        audio: AudioInput | PreTranscribedAudio,
         forms: Sequence[tuple[FormSchema, Any]],
         known_identifiers: Iterable[str] = (),
         progress: Callable[[str], None] | None = None,
@@ -163,18 +163,24 @@ class NursingNoteWorkflow:
         finally:
             prepared.close()
 
-    def prepare(self, audio: AudioInput, known_identifiers: Iterable[str], notify: Callable[[str], None]) -> PreparedTranscript:
+    def prepare(
+        self, audio: AudioInput | PreTranscribedAudio, known_identifiers: Iterable[str], notify: Callable[[str], None],
+    ) -> PreparedTranscript:
         """양식과 무관한 공통 단계다: STT → 비식별화 → 전사문 용어 검토 시작(힌트 대기 상한까지 기다림).
 
+        ``PreTranscribedAudio``(녹음 세션에서 이미 전사한 음성)면 STT를 다시 하지 않고 비식별화부터 시작한다.
         반환값의 ``close()``를 호출해 검토 스레드를 정리한다. 검토가 아직 진행 중이면 결과는 ``review``로 받는다.
         """
         trace_id = audio.trace_id
-        notify("stt")
-        with stage(_logger, trace_id, "stt", audio_bytes=len(audio.content)):
-            try:
-                transcript = self.stt.transcribe(audio)
-            except Exception as exc:
-                raise WorkflowStageError("stt") from exc
+        if isinstance(audio, PreTranscribedAudio):
+            transcript = audio.transcript
+        else:
+            notify("stt")
+            with stage(_logger, trace_id, "stt", audio_bytes=len(audio.content)):
+                try:
+                    transcript = self.stt.transcribe(audio)
+                except Exception as exc:
+                    raise WorkflowStageError("stt") from exc
         notify("redaction")
         with stage(_logger, trace_id, "redaction") as metrics:
             try:

@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from n_note_ai_service_layers.api.routes import bridge, internal_stt, nursing_notes, templates, transcription, workflow_jobs
+from n_note_ai_service_layers.api.routes import bridge, internal_stt, nursing_notes, recording_sessions, templates, transcription, workflow_jobs
 from n_note_ai_service_layers.api.state import get_services
 
 
@@ -32,6 +32,7 @@ def create_app() -> FastAPI:
     app.include_router(transcription.router)
     app.include_router(internal_stt.router)
     app.include_router(workflow_jobs.router)
+    app.include_router(recording_sessions.router)
     app.include_router(nursing_notes.router)
     app.include_router(bridge.router)
     return app

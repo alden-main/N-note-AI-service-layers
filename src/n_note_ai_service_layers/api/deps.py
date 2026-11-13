@@ -29,9 +29,14 @@ ALLOWED_AUDIO_TYPES = frozenset({"audio/wav", "audio/x-wav", "audio/mpeg", "audi
 _logger = get_logger("api")
 
 
+def audio_media_type(content_type: str | None) -> str:
+    """``audio/webm;codecs=opus``처럼 매개변수가 붙은 MIME(브라우저 MediaRecorder 기본값)에서 형식만 꺼낸다."""
+    return (content_type or "").split(";", 1)[0].strip().lower()
+
+
 async def read_validated_audio(audio: UploadFile) -> bytes:
     """MIME 형식과 크기(25 MiB)를 확인하고 음성 바이트를 반환한다."""
-    if audio.content_type not in ALLOWED_AUDIO_TYPES:
+    if audio_media_type(audio.content_type) not in ALLOWED_AUDIO_TYPES:
         raise HTTPException(status_code=415, detail="unsupported audio content type")
     content = await audio.read(MAX_AUDIO_BYTES + 1)
     if not content:

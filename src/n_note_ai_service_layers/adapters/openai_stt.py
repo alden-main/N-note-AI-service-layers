@@ -36,8 +36,10 @@ class OpenAiSpeechToTextAdapter:
         request: dict[str, Any] = {"model": self._model, "file": audio_file}
         if audio.language_hint:
             request["language"] = audio.language_hint
-        if self._prompt:
-            request["prompt"] = self._prompt
+        prompt = " ".join(part for part in (self._prompt, audio.preceding_text) if part)
+        if prompt:
+            # Whisper는 프롬프트를 앞 구간 전사문으로 보고 이어 쓴다. 앞 청크의 끝문장을 뒤에 두어 경계 문맥을 잇는다.
+            request["prompt"] = prompt
         response = self._client.audio.transcriptions.create(**request)
         languages = getattr(response, "languages", None) or []
         language = languages[0].code if languages and hasattr(languages[0], "code") else None

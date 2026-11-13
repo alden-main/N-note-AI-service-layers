@@ -13,6 +13,7 @@ import asyncio
 import json
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -26,7 +27,7 @@ from n_note_ai_service_layers.api import mappers
 from n_note_ai_service_layers.api.deps import get_nursing_note_workflow, get_workflow_context_flow, read_validated_audio
 from n_note_ai_service_layers.api.schemas import WorkflowJob
 from n_note_ai_service_layers.api.state import get_services
-from n_note_ai_service_layers.contracts.audio import AudioInput
+from n_note_ai_service_layers.contracts.audio import AudioInput, PreTranscribedAudio
 from n_note_ai_service_layers.contracts.clinical_context import ClinicalContextQuery
 from n_note_ai_service_layers.contracts.form_schema import FormSchema, SchemaStatus
 from n_note_ai_service_layers.services.context_flow import ClinicalContextFlow
@@ -101,7 +102,7 @@ def _save_draft(result: NursingNoteWorkflowResult, schema: FormSchema, trace_id:
 
 
 def _workflow_job(
-    workflow: NursingNoteWorkflow, snapshot, audio: AudioInput, schema: FormSchema, patient_id: str, encounter_id: str,
+    workflow: NursingNoteWorkflow, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, patient_id: str, encounter_id: str,
 ):
     """작업 스레드에서 실행할 함수다: 초안 생성 → 초안 검토 레코드 저장 → 결과 사전."""
     def work(progress: Progress) -> dict[str, Any]:
@@ -116,7 +117,7 @@ def _workflow_job(
 
 
 def _multi_form_workflow_job(
-    workflow: NursingNoteWorkflow, forms: list[tuple[FormSchema, Any]], audio: AudioInput, patient_id: str, encounter_id: str, job_id: str,
+    workflow: NursingNoteWorkflow, forms: list[tuple[FormSchema, Any]], audio: AudioInput | PreTranscribedAudio, patient_id: str, encounter_id: str, job_id: str,
 ):
     """여러 양식 작업이다: 공통 단계 한 번 → 양식별 초안을 병렬 생성하고 끝나는 대로 저장해 ``forms``에 알린다."""
     jobs = get_services().jobs
@@ -201,84 +202,88 @@ async def create_nursing_note_workflow(
     workflow: NursingNoteWorkflow = Depends(get_nursing_note_workflow),
 ) -> dict[str, Any]:
     """음성을 검증하고 초안 생성 작업을 접수한다. 처리는 백그라운드에서 진행되며 즉시 202를 반환한다."""
-    services = get_services()
+    if schema_ids and (schema_id or schema_version):
+        raise HTTPException(status_code=422, detail="use either schema_id/schema_version or schema_ids")
+    content = await read_validated_audio(audio)
+    plan = await prepare_workflow_forms(patient_id, encounter_id, purpose, schema_id, schema_ids, schema_version, x_trace_id, context_flow)
+    source = AudioInput(content, audio.filename or "audio", audio.content_type, plan.trace_id, language_hint)
+    job = await run_in_threadpool(submit_workflow_job, plan, source, workflow, idempotency_key)
+    response.headers["Location"] = f"/v1/nursing-note-jobs/{job['job_id']}"
+    return job_response(job)
+
+
+@dataclass(frozen=True)
+class WorkflowPlan:
+    """접수 전에 확인한 양식·임상 문맥이다. ``multi``면 여러 양식 작업(``forms``가 양식별 진행을 가진다)이다."""
+
+    trace_id: str
+    patient_id: str
+    encounter_id: str
+    forms: tuple[tuple[FormSchema, Any], ...]
+    multi: bool
+    purpose: str | None = None
+
+
+async def prepare_workflow_forms(
+    patient_id: str, encounter_id: str, purpose: str | None, schema_id: str | None, schema_ids: list[str] | None,
+    schema_version: str | None, trace_id: str | None, context_flow: ClinicalContextFlow,
+) -> WorkflowPlan:
+    """요청한 양식의 활성 버전과 임상 문맥을 준비한다. 쓸 수 없는 양식은 작업을 만들기 전에 422로 거부한다."""
+    trace_id = trace_id or str(uuid4())
     if schema_ids:
         if schema_id or schema_version:
             raise HTTPException(status_code=422, detail="use either schema_id/schema_version or schema_ids")
-        return await _create_multi_form_workflow(
-            response, audio, patient_id, encounter_id, purpose, requested_form_ids(schema_ids), language_hint,
-            x_trace_id, idempotency_key, context_flow, workflow,
-        )
-    content = await read_validated_audio(audio)
-    schema_id, purpose = resolve_workflow_form(schema_id, purpose)
-    trace_id = x_trace_id or str(uuid4())
-    query = ClinicalContextQuery(patient_id, encounter_id, purpose, datetime.now(timezone.utc), schema_id, trace_id, schema_version)
-    try:
-        snapshot = await run_in_threadpool(context_flow.build, query)
-        selected_schema = context_flow.registry.resolve_active(schema_id, purpose, schema_version)
-    except (PermissionError, LookupError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail="workflow schema or context is not available") from exc
-    try:
-        services.job_runner.ensure_capacity()
-    except JobQueueFull as exc:
-        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": str(QUEUE_FULL_RETRY_SECONDS)}) from exc
-    job, created = await run_in_threadpool(
-        services.jobs.create, JOB_KIND, trace_id,
-        {"schema_id": selected_schema.schema_id, "schema_version": selected_schema.version, "purpose": purpose},
-        idempotency_key,
-    )
-    if created:
-        audio_input = AudioInput(content, audio.filename or "audio", audio.content_type, trace_id, language_hint)
-        try:
-            services.job_runner.submit(job["job_id"], _workflow_job(workflow, snapshot, audio_input, selected_schema, patient_id, encounter_id))
-        except JobQueueFull as exc:
-            services.jobs.update(job["job_id"], status="failed", error={"code": "queue_full", "message": str(exc)})
-            raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": str(QUEUE_FULL_RETRY_SECONDS)}) from exc
-    response.headers["Location"] = f"/v1/nursing-note-jobs/{job['job_id']}"
-    return job_response(job)
-
-
-async def _create_multi_form_workflow(
-    response: Response, audio: UploadFile, patient_id: str, encounter_id: str, purpose: str | None, form_ids: list[str],
-    language_hint: str | None, x_trace_id: str | None, idempotency_key: str | None,
-    context_flow: ClinicalContextFlow, workflow: NursingNoteWorkflow,
-) -> dict[str, Any]:
-    """양식마다 활성 버전과 임상 문맥을 준비한 뒤 여러 양식 작업 하나를 접수한다."""
-    services = get_services()
-    content = await read_validated_audio(audio)
-    trace_id = x_trace_id or str(uuid4())
+        requested = [(form_id, None) for form_id in requested_form_ids(schema_ids)]
+    else:
+        requested = [(schema_id, schema_version)]
     forms: list[tuple[FormSchema, Any]] = []
-    for form_id in form_ids:
+    resolved_purpose = purpose
+    for form_id, version in requested:
         form_id, form_purpose = resolve_workflow_form(form_id, purpose)
-        query = ClinicalContextQuery(patient_id, encounter_id, form_purpose, datetime.now(timezone.utc), form_id, trace_id, None)
+        resolved_purpose = form_purpose
+        query = ClinicalContextQuery(patient_id, encounter_id, form_purpose, datetime.now(timezone.utc), form_id, trace_id, version)
         try:
             snapshot = await run_in_threadpool(context_flow.build, query)
-            selected_schema = context_flow.registry.resolve_active(form_id, form_purpose, None)
+            selected_schema = context_flow.registry.resolve_active(form_id, form_purpose, version)
         except (PermissionError, LookupError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="workflow schema or context is not available") from exc
         forms.append((selected_schema, snapshot))
+    return WorkflowPlan(trace_id, patient_id, encounter_id, tuple(forms), bool(schema_ids), resolved_purpose)
+
+
+def submit_workflow_job(
+    plan: WorkflowPlan, source: AudioInput | PreTranscribedAudio, workflow: NursingNoteWorkflow, idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """준비한 양식으로 초안 생성 작업을 만들고 실행 대기열에 넣는다(작업 스레드에서 호출한다). 대기열이 차면 429다."""
+    services = get_services()
     try:
         services.job_runner.ensure_capacity()
     except JobQueueFull as exc:
         raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": str(QUEUE_FULL_RETRY_SECONDS)}) from exc
-    request = {
-        "schema_ids": [schema.schema_id for schema, _ in forms],
-        "forms": [{"schema_id": schema.schema_id, "schema_version": schema.version, "purpose": schema.purpose} for schema, _ in forms],
-    }
-    initial_forms = [
-        {"schema_id": schema.schema_id, "schema_version": schema.version, "status": "queued", "stage": None, "draft_id": None, "error": None}
-        for schema, _ in forms
-    ]
-    job, created = await run_in_threadpool(services.jobs.create, JOB_KIND, trace_id, request, idempotency_key, {"forms": initial_forms})
+    if plan.multi:
+        forms = list(plan.forms)
+        request = {
+            "schema_ids": [schema.schema_id for schema, _ in forms],
+            "forms": [{"schema_id": schema.schema_id, "schema_version": schema.version, "purpose": schema.purpose} for schema, _ in forms],
+        }
+        initial_forms = [
+            {"schema_id": schema.schema_id, "schema_version": schema.version, "status": "queued", "stage": None, "draft_id": None, "error": None}
+            for schema, _ in forms
+        ]
+        job, created = services.jobs.create(JOB_KIND, plan.trace_id, request, idempotency_key, {"forms": initial_forms})
+        work = lambda: _multi_form_workflow_job(workflow, forms, source, plan.patient_id, plan.encounter_id, job["job_id"])
+    else:
+        schema, snapshot = plan.forms[0]
+        request = {"schema_id": schema.schema_id, "schema_version": schema.version, "purpose": plan.purpose}
+        job, created = services.jobs.create(JOB_KIND, plan.trace_id, request, idempotency_key)
+        work = lambda: _workflow_job(workflow, snapshot, source, schema, plan.patient_id, plan.encounter_id)
     if created:
-        audio_input = AudioInput(content, audio.filename or "audio", audio.content_type, trace_id, language_hint)
         try:
-            services.job_runner.submit(job["job_id"], _multi_form_workflow_job(workflow, forms, audio_input, patient_id, encounter_id, job["job_id"]))
+            services.job_runner.submit(job["job_id"], work())
         except JobQueueFull as exc:
             services.jobs.update(job["job_id"], status="failed", error={"code": "queue_full", "message": str(exc)})
             raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": str(QUEUE_FULL_RETRY_SECONDS)}) from exc
-    response.headers["Location"] = f"/v1/nursing-note-jobs/{job['job_id']}"
-    return job_response(job)
+    return job
 
 
 @router.get("/v1/nursing-note-jobs/{job_id}", response_model=WorkflowJob)

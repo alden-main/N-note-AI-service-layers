@@ -177,6 +177,12 @@ class Settings(BaseSettings):
     job_max_pending: PositiveInt = 32
     # 작업 상태가 이 시간 동안 갱신되지 않으면(서버 중단 등) 실패(``interrupted``)로 본다.
     job_timeout_seconds: PositiveFloat = 600.0
+    # 녹음 세션(청크 단위 실시간 전사)이 마지막 청크 이후 이 시간 동안 활동이 없으면 지운다.
+    recording_session_idle_seconds: PositiveFloat = 1800.0
+    # worker 한 개가 동시에 열어 둘 수 있는 녹음 세션 수다.
+    max_recording_sessions: PositiveInt = 100
+    # 녹음 세션 하나가 받을 수 있는 최대 청크 수다(30초 청크면 240개가 2시간).
+    max_recording_chunks: PositiveInt = 240
     log_level: Annotated[str, AfterValidator(str.upper)] = "INFO"
     # 구술 시각('오후 2시')과 감사 시각을 해석할 병동 시간대다. 컨테이너 기본(UTC)이면 00~09시 구술이 전날이 된다.
     timezone_name: str = Field(DEFAULT_TIMEZONE, validation_alias="N_NOTE_TIMEZONE")

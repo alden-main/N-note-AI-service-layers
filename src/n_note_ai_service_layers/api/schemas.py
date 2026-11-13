@@ -180,3 +180,52 @@ class WorkflowJob(BaseModel):
     finished_at: datetime | None = None
     updated_at: datetime
     links: JobLinks
+
+
+class RecordingSessionCreateRequest(BaseModel):
+    """녹음을 시작할 때 여는 세션이다. 환자·내원 ID는 청크 전사문 비식별화와 초안 생성에 쓴다."""
+
+    patient_id: str = Field(..., min_length=1)
+    encounter_id: str = Field(..., min_length=1)
+    language_hint: str | None = Field(default=None, max_length=16)
+
+
+class RecordingSessionLinks(BaseModel):
+    self: str
+    chunks: str
+    workflows: str
+    job: str | None = None
+
+
+class RecordingSessionResponse(BaseModel):
+    """녹음 세션 상태다. ``transcript``는 지금까지 받은 청크를 비식별화해 이어 붙인 화면용 전사문이다."""
+
+    session_id: str
+    trace_id: str
+    status: Literal["recording", "workflow_started"]
+    next_sequence: int
+    chunk_count: int
+    transcript: str
+    job_id: str | None = None
+    links: RecordingSessionLinks
+
+
+class RecordingChunkResponse(BaseModel):
+    """청크 하나의 전사 결과다. ``duplicate``면 이미 받은 청크를 다시 보낸 것이라 저장한 결과를 돌려준다."""
+
+    session_id: str
+    sequence: int
+    text: str
+    redaction_count: int
+    duplicate: bool
+    next_sequence: int
+    transcript: str
+
+
+class RecordingWorkflowRequest(BaseModel):
+    """녹음을 마치고 모은 전사문으로 만들 양식이다. 형식은 ``POST /v1/nursing-note-workflows``의 양식 필드와 같다."""
+
+    purpose: str | None = Field(default=None, min_length=1)
+    schema_id: str | None = Field(default=None, min_length=1)
+    schema_ids: list[str] | None = None
+    schema_version: str | None = Field(default=None, min_length=1)

@@ -19,6 +19,7 @@ from n_note_ai_service_layers.observability import configure_logging, get_logger
 from n_note_ai_service_layers.services.audit import AuditTrail
 from n_note_ai_service_layers.services.draft_review import DraftReviewStore
 from n_note_ai_service_layers.services.jobs import JobRunner, JobStore
+from n_note_ai_service_layers.services.recording_sessions import RecordingSessionStore
 from n_note_ai_service_layers.services.schema_review import FormSchemaRegistry, SchemaReviewService
 
 
@@ -32,6 +33,8 @@ class AppServices:
     handoff_store: HandoffStore
     jobs: JobStore
     job_runner: JobRunner
+    # 녹음 중 청크 전사 결과다. 원본 전사문을 담으므로 메모리에만 둔다.
+    recording_sessions: RecordingSessionStore
     # 로컬 NER(N_NOTE_NER_MODEL)이다. 없으면 규칙 기반 비식별화만 한다.
     ner: NamedEntityRecognizer | None = None
 
@@ -78,6 +81,7 @@ def build_services() -> AppServices:
         HandoffStore(documents),
         jobs,
         JobRunner(jobs, config.job_concurrency, config.job_max_pending),
+        RecordingSessionStore(config.recording_session_idle_seconds, config.max_recording_sessions, config.max_recording_chunks),
         ner,
     )
 
