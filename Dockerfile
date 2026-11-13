@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     N_NOTE_PDF_FONT_PATH=/usr/share/fonts/truetype/nanum/NanumGothic.ttf \
     N_NOTE_TIMEZONE=Asia/Seoul \
     TZ=Asia/Seoul \
-    N_NOTE_WORKERS=2
+    N_NOTE_WORKERS=1
 
 WORKDIR /app
 
@@ -33,5 +33,7 @@ COPY forms ./forms
 
 EXPOSE 8000
 
-# 초안·핸드오프·양식 상태는 N_NOTE_STATE_DB(SQLite)로 worker 간에 공유되므로 다중 worker로 실행할 수 있다.
+# 기본은 worker 1개다. 녹음 세션(녹음 중 청크 전사)은 원본 전사문을 디스크에 쓰지 않으려고 프로세스 메모리에 두므로,
+# worker가 여럿이면 같은 세션의 청크가 다른 worker로 가 404가 난다. 동시 처리는 worker 안의 스레드풀
+# (N_NOTE_JOB_CONCURRENCY·N_NOTE_FORM_CONCURRENCY)이 맡는다. 2 이상으로 늘릴 때는 세션 단위 sticky 라우팅을 둔다.
 CMD ["sh", "-c", "exec uv run --no-sync uvicorn n_note_ai_service_layers.api:app --host 0.0.0.0 --port 8000 --workers ${N_NOTE_WORKERS}"]

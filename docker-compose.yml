@@ -79,7 +79,8 @@ services:
       # 실환자 운영에서는 true로 둔다: 비식별화 전 원본 음성이 외부 OpenAI로 나가지 않게 로컬 STT만 허용한다.
       N_NOTE_REQUIRE_LOCAL_STT: ${N_NOTE_REQUIRE_LOCAL_STT:-false}
       N_NOTE_TIMEZONE: ${N_NOTE_TIMEZONE:-Asia/Seoul}
-      N_NOTE_WORKERS: ${N_NOTE_WORKERS:-2}
+      # 녹음 세션이 프로세스 메모리에 있으므로 1로 둔다. 늘리려면 세션 단위 sticky 라우팅이 필요하다(Dockerfile 참고).
+      N_NOTE_WORKERS: ${N_NOTE_WORKERS:-1}
       N_NOTE_DRAFT_RETENTION_HOURS: ${N_NOTE_DRAFT_RETENTION_HOURS:-72}
       # 브리지·인증 프록시가 인증한 사용자 ID 헤더다. 운영에서는 필수(true)로 둔다.
       N_NOTE_USER_HEADER: ${N_NOTE_USER_HEADER:-X-Authenticated-User}
