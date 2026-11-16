@@ -26,7 +26,7 @@ def test_internal_stt_multipart_and_output_validation(monkeypatch):
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="고혈압이 있습니다."))
     monkeypatch.setattr(internal_stt, "_extract", lambda transcript, template, hints: {
         "fields": {"history": "고혈압", "choice": {"status": "없음", "detail": "잘못된 상세"}, "allergy": ["약", "허위"]},
-        "relatedSentences": {"history": ["고혈압이 있습니다.", "없는 문장"]},
+        "relatedSentences": {"history": [0, 7]},
     })
     template = {"templateType": "CUSTOM", "templateName": "서식", "schemaDefinition": {"sections": [{"fields": [
         {"field_id": "history", "field_type": "text"},
@@ -58,15 +58,15 @@ def test_redaction_and_term_hints_precede_extraction(monkeypatch):
     setup_review(app, monkeypatch, GatewayTermVerificationResult("transcript", "ok", (occurrence,)))
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="홍길동님 고혈압"))
     seen = {}
-    def extract(transcript, template, hints):
-        seen.update(transcript=transcript, hints=hints)
-        return {"fields": {"history": "고혈압증"}, "relatedSentences": {"history": [transcript, "홍길동님 고혈압"]}}
+    def extract(sentences, template, hints):
+        seen.update(sentences=sentences, hints=hints)
+        return {"fields": {"history": "고혈압증"}, "relatedSentences": {"history": [0, 0]}}
     monkeypatch.setattr(internal_stt, "_extract", extract)
     template = {"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": [{"fields": [{"field_id": "history", "field_type": "text"}]}]}}
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([template])})
     assert response.status_code == 200
     body = response.json()
-    assert "홍길동" not in body["transcript"] and seen["transcript"] == body["transcript"]
+    assert "홍길동" not in body["transcript"] and seen["sentences"] == [body["transcript"]]
     assert seen["hints"][0]["suggestions"] == ["고혈압증"]
     assert body["forms"][0]["relatedSentences"]["history"] == [body["transcript"]]
 
@@ -80,7 +80,7 @@ FORM = {"templateType": "HAND_OVER", "templateName": "인계", "schemaDefinition
 ]}]}}
 VALID = {
     "fields": {"situation": "흑색변으로 입원함", "smoking": {"status": "nonsmoker", "detail": ""}, "age": "성인", "allergy": {"selected": ["약"], "detail": "두드러기"}, "tags": []},
-    "relatedSentences": {"situation": ["흑색변으로 입원했습니다."], "smoking": [], "age": [], "allergy": [], "tags": []},
+    "relatedSentences": {"situation": [0], "smoking": [], "age": [], "allergy": [], "tags": []},
 }
 
 
@@ -97,23 +97,23 @@ def chat_client(monkeypatch, content):
 
 
 def test_output_schema_is_flat_and_matches_response_contract():
-    schema = internal_stt._output_schema(FORM)
+    schema = internal_stt._output_schema(FORM, 1)
     fields = schema["properties"]["fields"]
     assert fields["required"] == ["situation", "smoking", "age", "allergy", "tags"] and fields["additionalProperties"] is False
     assert fields["properties"]["smoking"]["description"] == "흡연력 - 현재"
     assert fields["properties"]["smoking"]["properties"]["status"]["enum"] == ["nonsmoker", "ex-smoker", ""]
     assert fields["properties"]["allergy"]["required"] == ["selected", "detail"]
     assert fields["properties"]["tags"] == {"type": "array", "items": {"type": "string"}}
-    assert schema["properties"]["relatedSentences"]["properties"]["tags"] == {"type": "array", "items": {"type": "string"}}
+    assert schema["properties"]["relatedSentences"]["properties"]["tags"] == {"type": "array", "items": {"type": "integer", "enum": [0]}, "maxItems": 3}
     assert internal_stt.Draft202012Validator(schema).is_valid(VALID)
 
 
 def test_chat_extraction_requests_structured_output_with_correction_rules(monkeypatch):
     calls = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
-    assert internal_stt._extract("전사문", FORM, ()) == VALID
+    assert internal_stt._extract(["전사문"], FORM, ()) == VALID
     request = calls[0]
     assert request["response_format"]["json_schema"]["strict"] is True
-    assert request["response_format"]["json_schema"]["schema"] == internal_stt._output_schema(FORM)
+    assert request["response_format"]["json_schema"]["schema"] == internal_stt._output_schema(FORM, 1)
     assert "standard Korean" in request["messages"][0]["content"] and "JSON schema:" in request["messages"][0]["content"]
 
 
@@ -125,8 +125,8 @@ def test_responses_extraction_requests_structured_output(monkeypatch):
         seen.update(request)
         return SimpleNamespace(output_text=json.dumps(VALID, ensure_ascii=False))
     monkeypatch.setattr(internal_stt.model_providers, "openai_client", lambda *args: SimpleNamespace(responses=SimpleNamespace(create=create)))
-    assert internal_stt._extract("전사문", FORM, ()) == VALID
-    assert seen["text"]["format"]["strict"] is True and seen["text"]["format"]["schema"] == internal_stt._output_schema(FORM)
+    assert internal_stt._extract(["전사문"], FORM, ()) == VALID
+    assert seen["text"]["format"]["strict"] is True and seen["text"]["format"]["schema"] == internal_stt._output_schema(FORM, 1)
 
 
 NESTED = {"fields": {"sbar": VALID["fields"]}, "relatedSentences": VALID["relatedSentences"]}
@@ -139,7 +139,7 @@ def test_extraction_rejects_structure_that_would_silently_empty_fields(monkeypat
     for result in (NESTED, ARRAY, WRAPPED_TEXT, NO_EVIDENCE, []):
         chat_client(monkeypatch, json.dumps(result, ensure_ascii=False))
         try:
-            internal_stt._extract("전사문", FORM, ())
+            internal_stt._extract(["전사문"], FORM, ())
         except ValueError:
             continue
         raise AssertionError(f"accepted {result}")
@@ -148,7 +148,7 @@ def test_extraction_rejects_structure_that_would_silently_empty_fields(monkeypat
 def test_out_of_option_value_stays_a_blank_field_not_a_failed_form(monkeypatch):
     result = {**VALID, "fields": {**VALID["fields"], "age": "노인", "smoking": {"status": "비흡연", "detail": ""}}}
     chat_client(monkeypatch, json.dumps(result, ensure_ascii=False))
-    normalized = internal_stt._normalize(FORM, "전사문", internal_stt._extract("전사문", FORM, ()))
+    normalized = internal_stt._normalize(FORM, ["전사문"], internal_stt._extract(["전사문"], FORM, ()))
     assert normalized["fields"]["age"] == "" and normalized["fields"]["smoking"] == {"status": "", "detail": ""}
     assert normalized["fields"]["situation"] == "흑색변으로 입원함"
 
@@ -163,7 +163,10 @@ def test_malformed_extraction_returns_empty_form_and_logs_failure(monkeypatch):
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
     assert response.status_code == 200
     assert response.json()["forms"] == [{"templateType": "HAND_OVER", "templateName": "인계", "fields": {}, "relatedSentences": {}}]
-    assert logs == [("transcript_term_review", {"status": "ok", "candidates": 0}), ("form_extraction", "ValueError")]
+    assert logs == [
+        ("stt", {"chars": 13}), ("redaction", {"replacements": 0}),
+        ("transcript_term_review", {"status": "ok", "candidates": 0}), ("form_extraction", "ValueError"),
+    ]
 
 
 def test_extraction_metrics_count_filled_fields_only(monkeypatch):
@@ -225,4 +228,85 @@ def test_term_review_status_is_logged_when_it_stops_extraction(monkeypatch):
     monkeypatch.setattr(internal_stt, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
     assert response.status_code == 503 and response.json() == {"detail": "term review is unavailable"}
-    assert logs == [("transcript_term_review", {"status": "unsupported", "candidates": 0})]
+    assert logs == [("stt", {"chars": 3}), ("redaction", {"replacements": 0}), ("transcript_term_review", {"status": "unsupported", "candidates": 0})]
+
+
+def test_forms_are_extracted_concurrently_and_keep_request_order(monkeypatch):
+    import threading
+    app = create_app()
+    setup_review(app, monkeypatch)
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="전사문"))
+    # 두 양식이 동시에 실행 중이어야 barrier를 통과한다. 순차 실행이면 BrokenBarrierError로 빈 서식이 된다.
+    barrier = threading.Barrier(2, timeout=5)
+    def extract(sentences, template, hints):
+        barrier.wait()
+        return {"fields": {"note": template["templateType"]}, "relatedSentences": {}}
+    monkeypatch.setattr(internal_stt, "_extract", extract)
+    templates = [
+        {"templateType": kind, "templateName": kind, "schemaDefinition": {"sections": [{"fields": [{"field_id": "note", "field_type": "text"}]}]}}
+        for kind in ("A", "B")
+    ]
+    response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(templates)})
+    assert response.status_code == 200
+    assert [form["fields"] for form in response.json()["forms"]] == [{"note": "A"}, {"note": "B"}]
+
+
+def test_sentences_split_on_endings_and_long_clauses_and_stay_transcript_substrings():
+    long_run = ", ".join(["혈압 측정함"] * 40)
+    text = f"흑색변으로 입원했습니다. 통증 있나요?\n{long_run}"
+    sentences = internal_stt._sentences(text)
+    assert sentences[:2] == ["흑색변으로 입원했습니다.", "통증 있나요?"]
+    assert all(len(sentence) <= internal_stt._MAX_SENTENCE_CHARS and sentence in text for sentence in sentences)
+    assert internal_stt._sentences("") == []
+
+
+def test_evidence_ids_map_to_sentences_deduplicated_and_capped():
+    template = {"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": [{"fields": [{"field_id": "a", "field_type": "text"}]}]}}
+    sentences = ["s0", "s1", "s2", "s3"]
+    result = {"fields": {"a": "값"}, "relatedSentences": {"a": [2, 2, True, -1, 9, "1", 0, 1, 3]}}
+    assert internal_stt._normalize(template, sentences, result)["relatedSentences"]["a"] == ["s2", "s0", "s1"]
+
+
+def test_extraction_sends_numbered_sentences_instead_of_raw_transcript(monkeypatch):
+    calls = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
+    internal_stt._extract(["첫 문장.", "둘째 문장."], FORM, ())
+    payload = json.loads(calls[0]["messages"][1]["content"])
+    assert payload["transcript_sentences"] == [{"id": 0, "text": "첫 문장."}, {"id": 1, "text": "둘째 문장."}] and "transcript" not in payload
+    assert "transcript_sentences" in calls[0]["messages"][0]["content"]
+
+
+def _slow_review(app, monkeypatch, status):
+    import time
+    def verify(*args):
+        time.sleep(0.3)
+        return GatewayTermVerificationResult("transcript", status)
+    app.dependency_overrides[get_transcript_redactor] = lambda: TranscriptRedactor()
+    app.dependency_overrides[get_gateway_client] = lambda: object()
+    monkeypatch.setattr(internal_stt, "GatewayTermVerificationFlow", lambda gateway: SimpleNamespace(verify=verify))
+    monkeypatch.setenv("N_NOTE_TERM_HINT_BUDGET_SECONDS", "0.05")
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="전사문"))
+    seen = []
+    def extract(sentences, template, hints):
+        seen.append(hints)
+        return {"fields": {"note": "값"}, "relatedSentences": {"note": [0]}}
+    monkeypatch.setattr(internal_stt, "_extract", extract)
+    return seen
+
+
+SIMPLE = [{"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": [{"fields": [{"field_id": "note", "field_type": "text"}]}]}}]
+
+
+def test_late_term_review_starts_extraction_without_hints(monkeypatch):
+    app = create_app()
+    seen = _slow_review(app, monkeypatch, "ok")
+    response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(SIMPLE)})
+    assert response.status_code == 200 and seen == [()]
+    assert response.json()["forms"][0]["relatedSentences"] == {"note": ["전사문"]}
+
+
+def test_late_term_review_failure_still_returns_503_after_extraction(monkeypatch):
+    app = create_app()
+    seen = _slow_review(app, monkeypatch, "unavailable")
+    response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(SIMPLE)})
+    assert response.status_code == 503 and response.json() == {"detail": "term review is unavailable"}
+    assert seen == [()]
