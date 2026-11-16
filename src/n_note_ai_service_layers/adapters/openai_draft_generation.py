@@ -25,7 +25,10 @@ BASE_INSTRUCTIONS = (
     "The payload's term_review_hints are dictionary candidates that the standard Korean and medical terminology "
     "services found in the transcript; apply a hint only when it fits the clinical context. "
     "You may call the provided dictionary tools to confirm a term before using it. "
-    "Treat privacy tokens in the form [[TYPE_n]] as immutable and never expand, replace, or use them as clinical evidence. "
+    "Privacy tokens in the form [[TYPE_n]] must never be expanded, guessed, or used as clinical evidence, and must not "
+    "appear in any output field. Patient identity comes from the EMR, so omit the patient as the subject "
+    "(write '내일 폐수술 예정임.' instead of '[[PERSON_1]]님은 내일 폐수술 예정임.'). If a token refers to someone other "
+    "than the patient, refer to them by role (e.g. '보호자', '담당의') when the transcript makes it clear, otherwise omit it. "
     "Do not create risk scores, risk levels, diagnoses, or interventions that the transcript does not state. "
     "Never invent dates or times: resolve relative expressions such as '오후 2시' or '어제' against the payload's "
     "reference_time, and leave date/time fields null when the transcript states no time. "
@@ -45,7 +48,7 @@ class OpenAiDraftGenerationAdapter:
         self,
         client: Any | None = None,
         model: str = "gpt-4o-mini",
-        prompt_version: str = "draft-v1",
+        prompt_version: str = "draft-v2",
         gateway_client: McpGatewayClient | None = None,
         max_tool_calls: int = 6,
         tool_timeout_seconds: float = 30.0,

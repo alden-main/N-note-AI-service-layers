@@ -18,6 +18,7 @@ from n_note_ai_service_layers.contracts.term_verification import GatewayTermVeri
 from n_note_ai_service_layers.observability import get_logger, stage
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.draft_document import DraftDocument
+from n_note_ai_service_layers.services.draft_token_scrub import scrub_privacy_tokens
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.llm_payload import LlmPayloadProjector
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayError
@@ -226,6 +227,10 @@ class NursingNoteWorkflow:
                 draft = self.generator.generate(payload, schema)
             except Exception as exc:
                 raise WorkflowStageError("draft_generation") from exc
+            # 환자 신원은 EMR이 확정한다. 초안에 남은 보호 토큰은 수치 대조·용어 검토 전에 지운다.
+            scrubbed = scrub_privacy_tokens(draft)
+            metrics.update(privacy_tokens_scrubbed=scrubbed is not draft)
+            draft = scrubbed
             metrics.update(fields=len(draft.proposed_fields), hints=len(hints))
         # 힌트 대기 상한을 넘긴 검토도 화면의 검토 후보로는 필요하다. Gateway timeout 안에 끝난다.
         transcript_gateway = prepared.review.result()
