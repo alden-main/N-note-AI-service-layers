@@ -216,6 +216,9 @@ class GatewayConcurrencyTest(unittest.TestCase):
         self.assertEqual(codes, ["ok", "invalid_params", "not_found", "ok"])
         forwarded = [item[2] for item in transport.calls if item[1]["method"] == "tools/call"]
         self.assertEqual(forwarded, ["batch-request", "batch-request"])
+        # 같은 세션의 동시 요청이 응답을 서로 가로채지 않도록 JSON-RPC id는 요청마다 다르다(MCP 요구 사항).
+        ids = [item[1]["id"] for item in transport.calls if "id" in item[1]]
+        self.assertEqual(len(ids), len(set(ids)))
 
 
 class _KeepAliveUpstream(BaseHTTPRequestHandler):
@@ -281,6 +284,19 @@ class HttpTransportTest(unittest.TestCase):
         self.handler.body = b'event: message\ndata: {"jsonrpc": "2.0", "id": 1, "result": {"sse": true}}\n\n'
         response = self.transport.request_json(f"{self.url}/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call"})
         self.assertEqual(response.body["result"], {"sse": True})
+
+    def test_sse_stream_with_notifications_picks_the_matching_response(self) -> None:
+        self.handler.content_type = "text/event-stream"
+        self.handler.body = (
+            b'event: message\ndata: {"jsonrpc": "2.0", "method": "notifications/progress", "params": {}}\n\n'
+            b'event: message\ndata: {"jsonrpc": "2.0", "id": 7, "result": {"sse": true}}\n\n'
+        )
+        response = self.transport.request_json(f"{self.url}/mcp", {"jsonrpc": "2.0", "id": 7, "method": "tools/call"})
+        self.assertEqual(response.body["result"], {"sse": True})
+
+    def test_response_for_another_request_id_is_rejected(self) -> None:
+        with self.assertRaises(OSError):
+            self.transport.request_json(f"{self.url}/mcp", {"jsonrpc": "2.0", "id": 99, "method": "tools/call"})
 
     def test_http_error_and_unreachable_upstream_raise_os_error(self) -> None:
         self.handler.status = 404

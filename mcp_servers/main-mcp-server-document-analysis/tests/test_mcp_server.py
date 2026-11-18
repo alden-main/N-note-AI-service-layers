@@ -1,13 +1,16 @@
 """Gateway 전용 network MCP 도구와 감사 경계를 확인한다."""
 
-import io
 import json
-import unittest
-
+import socket
 import threading
+import time
+import unittest
 import urllib.request
 
-from main_mcp_server_document_analysis.mcp_server import McpApplication, create_server
+import uvicorn
+from starlette.testclient import TestClient
+
+from main_mcp_server_document_analysis.mcp_server import McpApplication, create_asgi_app
 from main_mcp_server_document_analysis.observability import SafeAuditLog
 
 
@@ -21,6 +24,19 @@ def arguments() -> dict:
             "criteria": [{"criterion_id": "c", "description": "description", "required_elements": []}],
         },
     }
+
+
+ACCEPT = {"Accept": "application/json, text/event-stream"}
+
+
+def rpc(app: McpApplication, payload: dict, headers: dict | None = None):
+    """SDK Streamable HTTP 서버(/mcp)로 JSON-RPC를 보낸다. lifespan(세션 관리자)을 띄우려고 with로 연다."""
+    with TestClient(create_asgi_app(app)) as client:
+        return client.post("/mcp", json=payload, headers={**ACCEPT, **(headers or {})})
+
+
+def tool_call(name: str, arguments: dict, message_id: int = 1) -> dict:
+    return {"jsonrpc": "2.0", "id": message_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
 
 
 class McpApplicationTest(unittest.TestCase):
@@ -47,16 +63,16 @@ class McpApplicationTest(unittest.TestCase):
 
     def test_tools_list_includes_guidance_and_evaluation(self) -> None:
         """MCP discovery는 정책 안내·근거 검색·후보 검증 도구를 모두 노출한다."""
-        response = McpApplication()._handle_rpc({"id": 1, "method": "tools/list"})
-        names = {tool["name"] for tool in response["result"]["tools"]}
+        listed = rpc(McpApplication(), {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
+        names = {tool["name"] for tool in listed}
         self.assertEqual(names, {"get_validation_guidance", "find_evidence_candidates", "evaluate_report_against_standard"})
-        evidence_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == "find_evidence_candidates")
+        evidence_tool = next(tool for tool in listed if tool["name"] == "find_evidence_candidates")
         self.assertIn("1048576 bytes", evidence_tool["description"])
         self.assertEqual(evidence_tool["inputSchema"]["properties"]["report"]["properties"]["text"]["maxLength"], 100_000)
 
     def test_tools_list_exposes_the_nested_arguments_used_by_each_handler(self) -> None:
         """Gateway는 catalog만으로 원본 standard와 검색·후보 인자를 구성할 수 있다."""
-        tools = {tool["name"]: tool["inputSchema"] for tool in McpApplication()._handle_rpc({"id": 1, "method": "tools/list"})["result"]["tools"]}
+        tools = {tool["name"]: tool["inputSchema"] for tool in McpApplication().tools()}
         self.assertEqual(tools["get_validation_guidance"]["required"], ["validation_standard"])
         standard = tools["get_validation_guidance"]["properties"]["validation_standard"]
         self.assertEqual(standard["required"], ["schema_version"])
@@ -71,20 +87,22 @@ class McpApplicationTest(unittest.TestCase):
 
     def test_initialize_advertises_streamable_http_tool_capability(self) -> None:
         """Gateway는 MCP initialize에서 서버와 도구 capability를 발견한다."""
-        response = McpApplication()._handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        params = {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "gateway", "version": "0"}}
+        response = rpc(McpApplication(), {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}).json()
         self.assertEqual(response["result"]["serverInfo"]["name"], "report")
         self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
         self.assertIn("tools", response["result"]["capabilities"])
 
-    def test_initialize_rejects_unsupported_protocol_version(self) -> None:
-        """지원 목록 밖 버전은 안전한 JSON-RPC 오류로 거절한다."""
-        response = McpApplication()._handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-01-01"}})
-        self.assertEqual(response["error"]["code"], -32602)
-        self.assertEqual(response["error"]["message"], "unsupported protocol version")
+    def test_initialize_negotiates_away_from_an_unknown_protocol_version(self) -> None:
+        """모르는 버전을 요청하면 MCP 버전 협상대로 서버가 지원하는 버전으로 답한다(Gateway가 불일치를 거부한다)."""
+        params = {"protocolVersion": "2024-01-01", "capabilities": {}, "clientInfo": {"name": "gateway", "version": "0"}}
+        response = rpc(McpApplication(), {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}).json()
+        self.assertNotEqual(response["result"]["protocolVersion"], "2024-01-01")
 
     def test_initialized_notification_is_accepted_without_response(self) -> None:
-        """MCP notification은 수신하되 JSON-RPC 응답을 만들지 않는다."""
-        self.assertIsNone(McpApplication()._handle_rpc({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        """MCP notification은 수신하되 JSON-RPC 응답을 만들지 않는다(202, 본문 없음)."""
+        response = rpc(McpApplication(), {"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertEqual((response.status_code, response.content), (202, b""))
 
     def test_evidence_search_returns_literal_candidates(self) -> None:
         """도구는 외부 AI 검색어에 맞는 문장과 offset을 반환한다."""
@@ -102,28 +120,18 @@ class McpApplicationTest(unittest.TestCase):
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "get_validation_guidance", "arguments": {"validation_standard": arguments()["validation_standard"]}},
         }
-        captured: list[str] = []
-        body = json.dumps(request).encode()
-        response = app(
-            {"PATH_INFO": "/mcp", "REQUEST_METHOD": "POST", "CONTENT_LENGTH": str(len(body)), "wsgi.input": io.BytesIO(body)},
-            lambda status, _headers: captured.append(status),
-        )
-        body = json.loads(b"".join(response))
-        self.assertEqual(captured, ["200 OK"])
+        response = rpc(app, request)
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(body["result"]["content"][0]["text"]), body["result"]["structuredContent"])
         self.assertIn("assessment_policy", body["result"]["structuredContent"])
         self.assertFalse(body["result"]["isError"])
 
     def test_gateway_prefixed_catalog_name_is_routed_to_the_actual_tool(self) -> None:
         """Gateway가 충돌 방지를 위해 붙인 service prefix도 호출 대상에 사용할 수 있다."""
-        response = McpApplication()._handle_rpc({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {
-                "name": "report__get_validation_guidance",
-                "arguments": {"validation_standard": arguments()["validation_standard"]},
-            },
-        })
-        self.assertFalse(response["result"]["isError"])
-        self.assertIn("assessment_policy", response["result"]["structuredContent"])
+        response = McpApplication().call_tool("report__get_validation_guidance", {"validation_standard": arguments()["validation_standard"]})
+        self.assertFalse(response["isError"])
+        self.assertIn("assessment_policy", response["structuredContent"])
 
     def test_gateway_tools_call_accepts_extended_evidence_query_and_propagates_request_id(self) -> None:
         """확장 aliases/pattern_ids도 Gateway MCP envelope에서 실제 handler까지 전달된다."""
@@ -142,26 +150,24 @@ class McpApplicationTest(unittest.TestCase):
                 },
             },
         }
-        body = json.dumps(request).encode()
-        response = app(
-            {"PATH_INFO": "/mcp", "REQUEST_METHOD": "POST", "CONTENT_LENGTH": str(len(body)), "HTTP_X_REQUEST_ID": "evidence-8", "wsgi.input": io.BytesIO(body)},
-            lambda _status, _headers: None,
-        )
-        result = json.loads(b"".join(response))["result"]
+        result = rpc(app, request, {"X-Request-ID": "evidence-8"}).json()["result"]
         self.assertFalse(result["isError"])
         self.assertEqual({match["match_strategy"] for match in result["structuredContent"]["queries"][0]["matches"]}, {"alias", "registered_pattern"})
         self.assertEqual(app._audit.events[-1].request_id, "evidence-8")
 
     def test_tool_error_uses_tool_result_envelope(self) -> None:
         """잘못된 도구 인자는 Gateway가 해석할 isError tool result로 반환한다."""
-        response = McpApplication()._handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "missing", "arguments": {}}})
-        self.assertTrue(response["result"]["isError"])
-        self.assertEqual(response["result"]["structuredContent"]["error"]["code"], "invalid_input")
+        result = rpc(McpApplication(), tool_call("missing", {})).json()["result"]
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["structuredContent"]["error"]["code"], "invalid_input")
+        # SDK 입력 검증을 끄고 도구가 직접 검증하므로, 계약 위반 인자도 같은 오류 형식으로 돌아온다.
+        result = rpc(McpApplication(), tool_call("evaluate_report_against_standard", {"report": "not an object"})).json()["result"]
+        self.assertEqual((result["isError"], result["structuredContent"]["error"]["code"]), (True, "invalid_input"))
 
     def test_request_id_is_propagated_to_safe_audit_event(self) -> None:
         """Gateway request ID 외에는 감사 이벤트에 원문이 저장되지 않는다."""
         app = McpApplication()
-        app._handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_validation_guidance", "arguments": {"validation_standard": arguments()["validation_standard"]}}}, "gateway-request-7")
+        rpc(app, tool_call("get_validation_guidance", {"validation_standard": arguments()["validation_standard"]}), {"X-Request-ID": "gateway-request-7"})
         event = app._audit.events[-1]
         self.assertEqual(event.request_id, "gateway-request-7")
         self.assertEqual(set(event.__dict__), {"request_id", "service_id", "service_version", "tool_name", "result_code", "standard_version", "duration_ms"})
@@ -170,19 +176,19 @@ class McpApplicationTest(unittest.TestCase):
         """준비되지 않은 필수 설정은 비민감 503 상태로 노출한다."""
         app = McpApplication()
         app._configuration_ready = False
-        captured: list[str] = []
-        response = app({"PATH_INFO": "/healthz", "REQUEST_METHOD": "GET", "wsgi.input": io.BytesIO()}, lambda status, _headers: captured.append(status))
-        self.assertEqual(captured, ["503 Service Unavailable"])
-        self.assertEqual(json.loads(b"".join(response)), {"status": "unavailable"})
+        with TestClient(create_asgi_app(app)) as client:
+            response = client.get("/healthz")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"status": "unavailable"})
 
     def test_not_ready_tool_call_is_retryable_error(self) -> None:
         """준비되지 않은 서비스의 도구 호출은 재시도 가능한 tool result다."""
         app = McpApplication()
         app._configuration_ready = False
-        response = app._handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_validation_guidance", "arguments": {"validation_standard": arguments()["validation_standard"]}}})
-        self.assertTrue(response["result"]["isError"])
-        self.assertEqual(response["result"]["structuredContent"]["error"]["code"], "upstream_unavailable")
-        self.assertTrue(response["result"]["structuredContent"]["error"]["retryable"])
+        response = app.call_tool("get_validation_guidance", {"validation_standard": arguments()["validation_standard"]})
+        self.assertTrue(response["isError"])
+        self.assertEqual(response["structuredContent"]["error"]["code"], "upstream_unavailable")
+        self.assertTrue(response["structuredContent"]["error"]["retryable"])
 
     def test_text_over_limit_is_a_non_retryable_tool_error(self) -> None:
         """보고서 text 제한을 넘으면 retry하지 않는 도구 오류를 반환한다."""
@@ -190,60 +196,63 @@ class McpApplicationTest(unittest.TestCase):
         app._max_text_chars = 3
         request = arguments()
         request["report"]["text"] = "four"
-        response = app._handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "evaluate_report_against_standard", "arguments": request}})
-        error = response["result"]["structuredContent"]["error"]
-        self.assertTrue(response["result"]["isError"])
+        response = app.call_tool("evaluate_report_against_standard", request)
+        error = response["structuredContent"]["error"]
+        self.assertTrue(response["isError"])
         self.assertEqual(error, {"code": "request_too_large", "message": "text input exceeds configured size limit", "retryable": False})
 
     def test_request_over_limit_is_rejected(self) -> None:
         """무제한 입력을 허용하지 않고 표준 오류를 반환한다."""
         app = McpApplication()
         app._max_request_bytes = 4
-        captured: list[str] = []
-        response = app({"PATH_INFO": "/mcp", "REQUEST_METHOD": "POST", "CONTENT_LENGTH": "5", "wsgi.input": io.BytesIO(b"12345")}, lambda status, _headers: captured.append(status))
-        self.assertEqual(captured, ["413 Payload Too Large"])
-        body = json.loads(b"".join(response))
-        self.assertTrue(body["result"]["isError"])
-        self.assertEqual(body["result"]["structuredContent"]["error"]["code"], "request_too_large")
+        with TestClient(create_asgi_app(app)) as client:
+            response = client.post("/mcp", content=b'{"jsonrpc": "2.0"}', headers={**ACCEPT, "Content-Type": "application/json"})
+        self.assertEqual(response.status_code, 413)
 
-    def test_missing_content_length_is_rejected_without_reading_input(self) -> None:
-        """길이 없는 keep-alive 요청을 최대 본문 크기만큼 대기하며 읽지 않는다."""
-        app = McpApplication()
-        captured: list[str] = []
-        response = app(
-            {"PATH_INFO": "/mcp", "REQUEST_METHOD": "POST", "wsgi.input": io.BytesIO(b"")},
-            lambda status, _headers: captured.append(status),
-        )
-        self.assertEqual(captured, ["411 Length Required"])
-        self.assertEqual(json.loads(b"".join(response))["error"]["code"], "invalid_input")
+    def test_unknown_path_and_malformed_json_are_rejected(self) -> None:
+        with TestClient(create_asgi_app(McpApplication())) as client:
+            self.assertEqual(client.get("/other").status_code, 404)
+            response = client.post("/mcp", content=b"{not json", headers={**ACCEPT, "Content-Type": "application/json"})
+            self.assertEqual(response.status_code, 400)
 
 
-class ThreadedServerTest(unittest.TestCase):
-    """긴 요청이 다른 요청을 막지 않는지 실제 HTTP로 확인한다."""
+class UvicornServerTest(unittest.TestCase):
+    """긴 도구 실행이 다른 요청을 막지 않는지 실제 uvicorn 서버로 확인한다."""
 
     def test_requests_are_served_concurrently(self) -> None:
         barrier = threading.Barrier(2, timeout=3)
 
-        def app(environ, start_response):
-            barrier.wait()  # 직렬 서버라면 두 번째 요청이 들어오지 못해 시간 초과가 난다.
-            start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "2")])
-            return [b"ok"]
+        class Blocking(McpApplication):
+            def call_tool(self, name, arguments, request_id=None):
+                barrier.wait()  # 요청을 하나씩 처리한다면 두 번째 요청이 들어오지 못해 시간 초과가 난다.
+                return super().call_tool(name, arguments, request_id)
 
-        server = create_server("127.0.0.1", 0, app)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = uvicorn.Server(uvicorn.Config(create_asgi_app(Blocking()), host="127.0.0.1", port=port, log_level="warning"))
+        thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
         try:
-            url = f"http://127.0.0.1:{server.server_port}/healthz"
-            results: list[bytes] = []
-            clients = [threading.Thread(target=lambda: results.append(urllib.request.urlopen(url, timeout=5).read())) for _ in range(2)]
+            deadline = time.monotonic() + 5
+            while not server.started and time.monotonic() < deadline:
+                time.sleep(0.02)
+            body = json.dumps(tool_call("get_validation_guidance", {"validation_standard": arguments()["validation_standard"]})).encode()
+
+            def call() -> None:
+                request = urllib.request.Request(f"http://127.0.0.1:{port}/mcp", data=body, headers={"Content-Type": "application/json", **ACCEPT})
+                results.append(json.loads(urllib.request.urlopen(request, timeout=5).read())["id"])
+
+            results: list[int] = []
+            clients = [threading.Thread(target=call) for _ in range(2)]
             for client in clients:
                 client.start()
             for client in clients:
                 client.join()
-            self.assertEqual(results, [b"ok", b"ok"])
+            self.assertEqual(results, [1, 1])
         finally:
-            server.shutdown()
-            server.server_close()
+            server.should_exit = True
+            thread.join(timeout=5)
 
 
 class AuditRetentionTest(unittest.TestCase):

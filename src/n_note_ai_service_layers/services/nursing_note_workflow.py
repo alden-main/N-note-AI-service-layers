@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -18,6 +18,7 @@ from n_note_ai_service_layers.contracts.term_verification import GatewayTermVeri
 from n_note_ai_service_layers.observability import get_logger, stage
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.draft_document import DraftDocument
+from n_note_ai_service_layers.services import executors
 from n_note_ai_service_layers.services.draft_token_scrub import scrub_privacy_tokens
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.llm_payload import LlmPayloadProjector
@@ -68,11 +69,9 @@ class PreparedTranscript:
     hints: tuple[dict[str, Any], ...]
     reference_time: datetime
     review: Future[GatewayTermVerificationResult]
-    review_pool: ThreadPoolExecutor
 
     def close(self) -> None:
-        """검토 스레드 풀을 정리한다. 진행 중인 검토는 끝까지 실행되므로 ``review.result()``는 계속 쓸 수 있다."""
-        self.review_pool.shutdown(wait=False)
+        """예전 API와의 호환용이다. 검토는 공유 풀에서 실행되므로 정리할 자원이 없다."""
 
 
 class NursingNoteWorkflow:
@@ -157,12 +156,32 @@ class NursingNoteWorkflow:
             return outcome
 
         try:
-            workers = max(1, min(len(forms), max_parallel))
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="form-draft") as pool:
-                futures = [pool.submit(run, index, schema, snapshot) for index, (schema, snapshot) in enumerate(forms)]
-                return [future.result() for future in futures]
+            return self._run_forms(run, forms, max(1, min(len(forms), max_parallel)))
         finally:
             prepared.close()
+
+    @staticmethod
+    def _run_forms(
+        run: Callable[[int, FormSchema, Any], NursingNoteWorkflowResult | Exception],
+        forms: Sequence[tuple[FormSchema, Any]],
+        max_parallel: int,
+    ) -> list[NursingNoteWorkflowResult | Exception]:
+        """양식 초안을 공유 풀에서 실행하되, 이 작업이 동시에 돌리는 양식은 ``max_parallel``개로 제한한다.
+
+        한도는 풀 안에서 세마포어로 기다리지 않고 제출 시점에 지킨다(기다리는 작업이 공유 스레드를 붙잡지 않게).
+        """
+        pool = executors.shared("form-draft", executors.worker_parallelism())
+        results: list[NursingNoteWorkflowResult | Exception | None] = [None] * len(forms)
+        queued = list(enumerate(forms))
+        running: dict[Future, int] = {}
+        while queued or running:
+            while queued and len(running) < max_parallel:
+                index, (schema, snapshot) = queued.pop(0)
+                running[pool.submit(run, index, schema, snapshot)] = index
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                results[running.pop(future)] = future.result()
+        return results  # type: ignore[return-value]
 
     def prepare(
         self, audio: AudioInput | PreTranscribedAudio, known_identifiers: Iterable[str], notify: Callable[[str], None],
@@ -195,23 +214,20 @@ class NursingNoteWorkflow:
         external_transcript = Transcript(redacted.text, transcript.provider, transcript.model, transcript.language)
         notify("transcript_term_review")
         catalog = self._discover(trace_id)
-        review_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="transcript-review")
-        try:
-            review = self._start_transcript_review(review_pool, external_transcript.text, trace_id, catalog)
-            with stage(_logger, trace_id, "transcript_term_review") as metrics:
-                done, _ = wait([review], timeout=self.hint_budget_seconds)
-                hint_source = review.result() if done else None
-                metrics.update(
-                    status=hint_source.status if hint_source else "pending",
-                    candidates=len(hint_source.occurrences) if hint_source else 0,
-                    hints_deferred=not done,
-                )
-        except BaseException:
-            review_pool.shutdown(wait=False)
-            raise
+        # 작업마다 하나씩이므로 worker의 동시 작업 수만큼이면 충분하다.
+        review_pool = executors.shared("transcript-review", executors.worker_parallelism())
+        review = self._start_transcript_review(review_pool, external_transcript.text, trace_id, catalog)
+        with stage(_logger, trace_id, "transcript_term_review") as metrics:
+            done, _ = wait([review], timeout=self.hint_budget_seconds)
+            hint_source = review.result() if done else None
+            metrics.update(
+                status=hint_source.status if hint_source else "pending",
+                candidates=len(hint_source.occurrences) if hint_source else 0,
+                hints_deferred=not done,
+            )
         return PreparedTranscript(
             trace_id, external_transcript, redacted.replacement_count, catalog,
-            self.hints(hint_source) if hint_source else (), now_local(), review, review_pool,
+            self.hints(hint_source) if hint_source else (), now_local(), review,
         )
 
     def draft(
@@ -265,10 +281,11 @@ class NursingNoteWorkflow:
             return GatewayTermVerificationResult("draft", "unavailable"), validation
         if self.report_validation is None:
             return self.gateway_verification.verify_document("draft", document, trace_id, catalog), ReportValidationResult("skipped")
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="draft-review") as pool:
-            terms = pool.submit(self.gateway_verification.verify_document, "draft", document, trace_id, catalog)
-            report = pool.submit(self.report_validation.validate, schema, document, trace_id, catalog)
-            return terms.result(), report.result()
+        # 양식 초안마다 두 작업이므로 worker의 동시 양식 수의 두 배로 둔다.
+        pool = executors.shared("draft-review", executors.worker_parallelism() * 2)
+        terms = pool.submit(self.gateway_verification.verify_document, "draft", document, trace_id, catalog)
+        report = pool.submit(self.report_validation.validate, schema, document, trace_id, catalog)
+        return terms.result(), report.result()
 
     @staticmethod
     def numeric_sources(transcript: str, payload: dict[str, Any]) -> tuple[str, ...]:

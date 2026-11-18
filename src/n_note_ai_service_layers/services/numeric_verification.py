@@ -22,6 +22,7 @@ from typing import Any, Iterable
 
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
+from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN
 from n_note_ai_service_layers.services.draft_document import format_value
 
 SINO_DIGITS = {"영": 0, "공": 0, "일": 1, "이": 2, "삼": 3, "사": 4, "오": 5, "육": 6, "륙": 6, "칠": 7, "팔": 8, "구": 9}
@@ -30,7 +31,6 @@ SINO_CHARS = "".join(SINO_DIGITS) + "".join(SINO_UNITS) + "만"
 NATIVE_TENS = (("스물", 20), ("스무", 20), ("서른", 30), ("마흔", 40), ("쉰", 50), ("열", 10))
 NATIVE_ONES = (("하나", 1), ("한", 1), ("둘", 2), ("두", 2), ("셋", 3), ("세", 3), ("넷", 4), ("네", 4), ("다섯", 5), ("여섯", 6), ("일곱", 7), ("여덟", 8), ("아홉", 9))
 PM_WORDS = ("오후", "저녁", "밤")
-PRIVACY_TOKEN = re.compile(r"\[\[[A-Z]+(?:_[A-Z]+)*_\d+\]\]")
 ARABIC_NUMBER = re.compile(r"(?<![A-Za-z0-9.])\d+(?:\.\d+)?")
 DATE_VALUE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 WORD = re.compile(r"[^\s,.;:!?()\[\]/]+")

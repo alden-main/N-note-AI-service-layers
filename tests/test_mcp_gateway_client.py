@@ -21,6 +21,8 @@ class _Gateway:
     def __call__(self, url, body, headers, timeout):
         request = json.loads(body)
         self.requests.append((request, dict(headers)))
+        if "id" not in request:  # notifications/initialized
+            return 202, {}, b""
         if request["method"] == "initialize":
             result = {"protocolVersion": "2025-06-18"}
         elif request["method"] == "tools/list":
@@ -32,16 +34,21 @@ class _Gateway:
 
 
 class McpGatewayClientTests(unittest.TestCase):
-    def test_discovery_sends_minimal_json_rpc_headers_and_uses_gateway_catalog(self):
+    def test_discovery_follows_the_streamable_http_handshake(self):
+        """initialize → notifications/initialized → tools/list, 두 응답 형식을 받는 Accept와 프로토콜 버전 헤더."""
         gateway = _Gateway()
         client = McpGatewayClient(transport=gateway)
         catalog = client.discover("trace-1")
         self.assertEqual(catalog, tuple(gateway.tools))
-        self.assertEqual([item[0]["method"] for item in gateway.requests], ["initialize", "tools/list"])
-        self.assertEqual(gateway.requests[0][0]["params"], {"protocolVersion": "2025-06-18"})
+        self.assertEqual([item[0]["method"] for item in gateway.requests], ["initialize", "notifications/initialized", "tools/list"])
+        params = gateway.requests[0][0]["params"]
+        self.assertEqual((params["protocolVersion"], params["capabilities"], params["clientInfo"]["name"]), ("2025-06-18", {}, "n-note-ai-service"))
+        self.assertNotIn("id", gateway.requests[1][0])
         self.assertEqual(gateway.requests[0][1]["Content-Type"], "application/json")
-        self.assertEqual(gateway.requests[0][1]["Accept"], "application/json")
-        self.assertEqual(gateway.requests[1][1]["X-Request-ID"], "trace-1")
+        self.assertEqual(gateway.requests[0][1]["Accept"], "application/json, text/event-stream")
+        self.assertNotIn("MCP-Protocol-Version", gateway.requests[0][1])
+        self.assertEqual(gateway.requests[2][1]["MCP-Protocol-Version"], "2025-06-18")
+        self.assertEqual(gateway.requests[2][1]["X-Request-ID"], "trace-1")
         self.assertEqual(client.model_tools()[0]["name"], "dictionary__lookup")
         self.assertEqual(client.model_tools()[0]["parameters"], gateway.tools[0]["inputSchema"])
 
@@ -53,7 +60,46 @@ class McpGatewayClientTests(unittest.TestCase):
             client.call_tool("unknown", {"term": "x"})
         with self.assertRaises(McpGatewayProtocolError):
             client.call_tool("dictionary__lookup", {"unexpected": "x"})
-        self.assertEqual(len(gateway.requests), 2)
+        self.assertEqual(len(gateway.requests), 3)  # 핸드셰이크 3건뿐, 거부한 호출은 나가지 않는다.
+
+    def test_session_id_is_sent_and_an_expired_session_is_reinitialized_once(self):
+        class Stateful(_Gateway):
+            def __init__(self):
+                super().__init__(); self.sessions = 0; self.expired = False
+            def __call__(self, url, body, headers, timeout):
+                request = json.loads(body)
+                if request.get("method") == "initialize":
+                    self.requests.append((request, dict(headers)))
+                    self.sessions += 1
+                    response = {"jsonrpc": "2.0", "id": request["id"], "result": {"protocolVersion": "2025-06-18"}}
+                    return 200, {"mcp-session-id": f"s-{self.sessions}"}, json.dumps(response).encode()
+                if self.expired and headers.get("Mcp-Session-Id") == "s-1":
+                    self.requests.append((request, dict(headers)))
+                    return 404, {}, b""
+                return super().__call__(url, body, headers, timeout)
+
+        gateway = Stateful()
+        client = McpGatewayClient(transport=gateway)
+        client.discover()
+        self.assertTrue(all(headers.get("Mcp-Session-Id") == "s-1" for _request, headers in gateway.requests[1:]))
+        gateway.expired = True
+        client.call_tool("dictionary__lookup", {"term": "x"})
+        self.assertEqual(gateway.sessions, 2)
+        self.assertEqual(gateway.requests[-1][1]["Mcp-Session-Id"], "s-2")
+        self.assertEqual(gateway.requests[-1][0]["method"], "tools/call")
+
+    def test_sse_response_picks_the_message_for_the_request(self):
+        class Sse(_Gateway):
+            def __call__(self, url, body, headers, timeout):
+                status, response_headers, raw = super().__call__(url, body, headers, timeout)
+                if status != 200:
+                    return status, response_headers, raw
+                notice = json.dumps({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
+                stream = f"event: message\ndata: {notice}\n\nevent: message\ndata: {raw.decode()}\n\n".encode()
+                return 200, {**response_headers, "Content-Type": "text/event-stream"}, stream
+
+        client = McpGatewayClient(transport=Sse())
+        self.assertEqual(client.discover()[0]["name"], "dictionary__lookup")
 
     def test_tool_result_error_is_not_treated_as_success(self):
         gateway = _Gateway()

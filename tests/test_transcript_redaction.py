@@ -11,6 +11,25 @@ from n_note_ai_service_layers.services.transcript_redaction import TranscriptRed
 
 
 class TranscriptRedactionTests(unittest.TestCase):
+    def test_every_generated_token_matches_the_shared_privacy_pattern(self) -> None:
+        """비식별화가 만드는 모든 토큰 종류를 토큰 제거·수치 대조·용어 검토가 같은 패턴으로 알아본다."""
+        import re
+
+        from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN
+        from n_note_ai_service_layers.services.draft_token_scrub import scrub_text
+
+        text = (
+            "MRN-0001 환자, 주민번호 900101-1234567, 메일 a@b.co, 010-1234-5678, 공일공 일이삼사 오육칠팔, "
+            "환자번호: AB1234, 환자명: 홍길동, 생년월일: 1990-01-01, 이름은 김영희, 박철수님 방문"
+        )
+        redacted = TranscriptRedactor().redact(text, ("MRN-0001",)).text
+        tokens = re.findall(r"\[\[[^\]]+\]\]", redacted)
+        kinds = {token.strip("[]").rsplit("_", 1)[0] for token in tokens}
+        self.assertTrue({"KNOWN_ID", "RESIDENT_ID", "EMAIL", "PHONE", "LABELED_ID", "LABELED_PERSON", "DATE_OF_BIRTH", "PERSON"} <= kinds)
+        for token in tokens:
+            self.assertIsNotNone(PRIVACY_TOKEN.fullmatch(token), token)
+            self.assertNotIn(token, scrub_text(f"{token}님은 열이 있음"))
+
     def test_redacts_explicit_identifiers_without_changing_clinical_terms(self) -> None:
         result = TranscriptRedactor().redact("환자명: 홍길동, 연락처 010-1234-5678, HbA1c 검사와 헤모글로빈 확인")
         self.assertEqual(result.text, "환자명: [[LABELED_PERSON_1]], 연락처 [[PHONE_1]], HbA1c 검사와 헤모글로빈 확인")

@@ -22,8 +22,6 @@ from n_note_ai_service_layers.api.routes.workflow_jobs import resolve_workflow_f
 from n_note_ai_service_layers.api.state import get_services
 
 app = create_app()
-# 평가 스크립트(run_model_eval)가 쓰던 이름이다.
-_resolve_workflow_form = resolve_workflow_form
 
 _SERVICE_ATTRIBUTES = {
     "template_registry": "template_registry",

@@ -100,6 +100,36 @@ class GenerateManyTests(unittest.TestCase):
         self.assertEqual(sorted(done), [0, 1, 2])
         self.assertEqual(stages, ["stt", "redaction", "transcript_term_review", "draft_generation"])
 
+    def test_max_parallel_caps_concurrent_forms_and_results_keep_input_order(self) -> None:
+        """공유 풀이 더 커도 작업 하나가 동시에 만드는 양식은 ``max_parallel``개를 넘지 않는다."""
+        lock = threading.Lock()
+        state = {"running": 0, "peak": 0}
+
+        class Generator(_Generator):
+            def generate(self, payload, schema):
+                with lock:
+                    state["running"] += 1
+                    state["peak"] = max(state["peak"], state["running"])
+                time.sleep(0.05)
+                with lock:
+                    state["running"] -= 1
+                return DraftResult({SCORE_FIELD: 2})
+
+        many = {f"form-{index}": replace(BASE, schema_id=f"form-{index}", version=f"form-{index}/v1") for index in range(5)}
+        forms = [(schema, object()) for schema in many.values()]
+        outcomes = _workflow(generator=Generator()).generate_many(AUDIO, forms, max_parallel=2)
+        self.assertEqual(state["peak"], 2)
+        self.assertTrue(all(isinstance(item, NursingNoteWorkflowResult) for item in outcomes), outcomes)
+
+    def test_shared_pools_are_reused_instead_of_created_per_call(self) -> None:
+        from n_note_ai_service_layers.services import executors
+
+        forms = [(schema, object()) for schema in SCHEMAS.values()]
+        _workflow().generate_many(AUDIO, forms, max_parallel=3)
+        pools = {name: executors.shared(name, 1) for name in ("form-draft", "transcript-review")}
+        _workflow().generate_many(AUDIO, forms, max_parallel=3)
+        self.assertTrue(all(executors.shared(name, 1) is pool for name, pool in pools.items()))
+
     def test_one_failed_form_keeps_the_other_drafts(self) -> None:
         forms = [(schema, object()) for schema in SCHEMAS.values()]
         outcomes = _workflow(generator=_Generator(failing=frozenset({"form-b"}))).generate_many(AUDIO, forms, max_parallel=2)
@@ -226,6 +256,8 @@ class GatewayBatchSplitTests(unittest.TestCase):
                 batches.append(len(message["calls"]))
                 results = [{"structuredContent": {"echo": call["arguments"]["text"]}, "isError": False} for call in message["calls"]]
                 return 200, {}, json.dumps({"results": results}).encode()
+            if "id" not in message:  # notifications/initialized
+                return 202, {}, b""
             result = {"protocolVersion": "2025-06-18"} if message["method"] == "initialize" else {"tools": [tool]}
             return 200, {}, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
 

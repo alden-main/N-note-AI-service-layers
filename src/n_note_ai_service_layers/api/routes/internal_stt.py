@@ -15,10 +15,11 @@ from pydantic import BaseModel
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
-from n_note_ai_service_layers.adapters.openai_chat_draft_generation import _json_text, _message
+from n_note_ai_service_layers.adapters.openai_chat_draft_generation import first_message, json_text
 from n_note_ai_service_layers.api.deps import get_gateway_client, get_speech_to_text_provider, get_transcript_redactor
 from n_note_ai_service_layers.contracts.audio import AudioDecodeError, AudioInput
 from n_note_ai_service_layers.observability import get_logger, stage
+from n_note_ai_service_layers.services.draft_token_scrub import scrub_value as _scrub_value
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
 
@@ -61,7 +62,9 @@ _INSTRUCTIONS = (
     f"relatedSentences values are arrays of the ids of the sentences that support the field, at most {_MAX_EVIDENCE} of the most relevant; "
     "use an empty array when there is no evidence. "
     "Term review hints are suggestions, not facts: use them only if supported by context, never introduce a diagnosis the transcript does not state. "
-    "Preserve privacy tokens exactly and do not infer identities."
+    "Privacy tokens in the form [[TYPE_n]] must never be expanded, guessed, or used as clinical evidence, and must not "
+    "appear in field values. Patient identity comes from the EMR, so omit the patient as the subject; refer to someone "
+    "else by role (e.g. '보호자', '담당의') when the transcript makes it clear, otherwise omit them."
 )
 
 
@@ -148,6 +151,8 @@ def _extract(sentences: list[str], template: dict, hints: tuple[dict, ...]) -> d
     schema = _output_schema(template, len(sentences))
     transcript = [{"id": index, "text": sentence} for index, sentence in enumerate(sentences)]
     payload = json.dumps({"transcript_sentences": transcript, "schemaDefinition": template["schemaDefinition"], "term_review_hints": hints}, ensure_ascii=False)
+    # temperature·max_tokens·extra_body는 초안 생성 어댑터와 같은 규칙(GenerationOptions)으로 넣는다.
+    options = model_providers.generation_options()
     if config.llm_api == "chat":
         # 구조화 출력을 강제하지 못하는 서버(MLX, 일부 llama.cpp 등)도 따르도록 프롬프트에도 스키마를 넣는다.
         system = _INSTRUCTIONS + "\nJSON schema:\n" + json.dumps(schema, ensure_ascii=False)
@@ -155,19 +160,18 @@ def _extract(sentences: list[str], template: dict, hints: tuple[dict, ...]) -> d
             "model": endpoint.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": payload}],
             "response_format": {"type": "json_schema", "json_schema": {"name": "form_extraction", "schema": schema, "strict": True}},
+            **options.chat_kwargs(),
         }
-        if config.llm_extra_body:
-            request["extra_body"] = config.llm_extra_body
-        if config.llm_max_tokens is not None:
-            request["max_tokens"] = config.llm_max_tokens
-        if config.llm_temperature is not None:
-            request["temperature"] = config.llm_temperature
-        content = _message(client.chat.completions.create(**request))["content"]
+        content = first_message(client.chat.completions.create(**request))["content"]
     else:
         output_format = {"type": "json_schema", "name": "form_extraction", "schema": schema, "strict": True}
-        response = client.responses.create(model=endpoint.model, instructions=_INSTRUCTIONS, input=payload, text={"format": output_format})
+        # 전사문을 OpenAI 쪽에 보관하지 않는다(초안 생성 어댑터와 같은 정책).
+        response = client.responses.create(
+            model=endpoint.model, instructions=_INSTRUCTIONS, input=payload, text={"format": output_format}, store=False,
+            **options.responses_kwargs(),
+        )
         content = response.output_text
-    result = json.loads(_json_text(content))
+    result = json.loads(json_text(content))
     # 구조가 다르면 빈 서식으로 오인하지 않고 실패로 처리한다. options·문장 번호 범위 밖의 값과 근거 초과분은 _normalize가 정리한다.
     if any(error.validator not in {"enum", "maxItems"} for error in Draft202012Validator(schema).iter_errors(result)):
         raise ValueError("extraction did not follow the form schema")
@@ -200,6 +204,8 @@ def _normalize(template: dict, sentences: list[str], result: dict) -> dict:
             if isinstance(ids, list):
                 valid = (i for i in ids if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(sentences))
                 related[key] = [sentences[i] for i in list(dict.fromkeys(valid))[:_MAX_EVIDENCE]]
+    # 프롬프트로 막아도 남은 보호 토큰은 초안 생성과 같은 규칙으로 지운다. 근거 문장은 전사문 원문 그대로 둔다.
+    fields = {key: _scrub_value(value) for key, value in fields.items()}
     return {"templateType": template["templateType"], "templateName": template["templateName"], "fields": fields, "relatedSentences": related}
 
 

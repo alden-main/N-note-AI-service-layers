@@ -352,16 +352,18 @@ class GatewayCatalogCacheTests(unittest.TestCase):
         def transport(url, body, headers, timeout):
             request = json.loads(body)
             methods.append(request["method"])
+            if "id" not in request:  # notifications/initialized
+                return 202, {}, b""
             result = {"protocolVersion": "2025-06-18"} if request["method"] == "initialize" else {"tools": []}
             return 200, {}, json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}).encode()
 
         client = McpGatewayClient("http://gateway/mcp", 1.0, transport, catalog_ttl_seconds=60)
         client.discover("a")
         client.discover("b")
-        self.assertEqual(methods, ["initialize", "tools/list"])
+        self.assertEqual(methods, ["initialize", "notifications/initialized", "tools/list"])
         client.invalidate_catalog()
         client.discover("c")
-        self.assertEqual(len(methods), 4)
+        self.assertEqual(len(methods), 6)
 
 
 class ModelProviderPolicyTests(unittest.TestCase):

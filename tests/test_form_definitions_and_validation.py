@@ -75,6 +75,8 @@ class _ValidationGateway:
 
     def __call__(self, url, body, headers, timeout):
         message = json.loads(body)
+        if "id" not in message:  # notifications/initialized
+            return 202, {}, b""
         if message["method"] == "initialize":
             result = {"protocolVersion": "2025-06-18"}
         elif message["method"] == "tools/list":

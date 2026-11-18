@@ -8,7 +8,7 @@ from typing import Any
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.audio_preprocessing import DEFAULT_HALLUCINATION_PATTERNS, AudioPreprocessingSpeechToText, HallucinationFilter, VadConfig
 from n_note_ai_service_layers.adapters.openai_chat_draft_generation import OpenAiChatDraftGenerationAdapter
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
+from n_note_ai_service_layers.adapters.openai_draft_generation import GenerationOptions, OpenAiDraftGenerationAdapter
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
@@ -66,19 +66,20 @@ def draft_generator(gateway: McpGatewayClient | None) -> OpenAiDraftGenerationAd
     endpoint = config.llm_endpoint
     client = openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
     tool_gateway = gateway if config.llm_tool_calling_enabled else None
-    if config.llm_api == "chat":
-        return OpenAiChatDraftGenerationAdapter(
-            client,
-            endpoint.model,
-            gateway_client=tool_gateway,
-            allowed_tool_names=config.llm_tool_names,
-            max_tool_rounds=config.llm_max_tool_rounds,
-            max_tool_calls=config.llm_max_tool_calls,
-            extra_body=config.llm_extra_body,
-            max_tokens=config.llm_max_tokens,
-            temperature=config.llm_temperature,
-        )
-    return OpenAiDraftGenerationAdapter(
-        client, endpoint.model, gateway_client=tool_gateway, allowed_tool_names=config.llm_tool_names,
-        max_tool_rounds=config.llm_max_tool_rounds, max_tool_calls=config.llm_max_tool_calls,
+    adapter = OpenAiChatDraftGenerationAdapter if config.llm_api == "chat" else OpenAiDraftGenerationAdapter
+    # temperature·max_tokens·extra_body는 두 API 형식 모두에 적용한다(Responses는 max_output_tokens로 보낸다).
+    return adapter(
+        client,
+        endpoint.model,
+        gateway_client=tool_gateway,
+        allowed_tool_names=config.llm_tool_names,
+        max_tool_rounds=config.llm_max_tool_rounds,
+        max_tool_calls=config.llm_max_tool_calls,
+        options=generation_options(),
     )
+
+
+def generation_options() -> GenerationOptions:
+    """설정의 LLM 요청 공통 옵션이다(초안 생성과 동기 서식 추출이 함께 쓴다)."""
+    config = settings.get()
+    return GenerationOptions(config.llm_max_tokens, config.llm_temperature, dict(config.llm_extra_body))

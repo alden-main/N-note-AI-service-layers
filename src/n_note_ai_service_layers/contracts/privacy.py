@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Protocol
+
+# 비식별화가 만드는 보호 토큰(``[[PERSON_1]]``, ``[[KNOWN_ID_2]]``, ``[[LABELED_PERSON_1]]`` 등)의 유일한 정의다.
+# 비식별화·초안 토큰 제거·수치 대조·용어 검토가 모두 이 패턴을 쓴다.
+PRIVACY_TOKEN = re.compile(r"\[\[[A-Z]+(?:_[A-Z]+)*_\d+\]\]")
+
+
+def privacy_token(kind: str, number: int) -> str:
+    """``kind``(예: ``PERSON``) 종류의 ``number``번째 보호 토큰 문자열이다."""
+    return f"[[{kind}_{number}]]"
 
 
 @dataclass(frozen=True)

@@ -14,6 +14,8 @@ class _Gateway:
     def __call__(self, url, body, headers, timeout):
         import json
         message = json.loads(body)
+        if "id" not in message:  # notifications/initialized
+            return 202, {}, b""
         method = message["method"]
         if method == "initialize": result = {"protocolVersion": "2025-06-18"}
         elif method == "tools/list": result = {"tools": [{"name": "dictionary__lookup", "description": "lookup", "inputSchema": {"type": "object", "properties": {"term": {"type": "string"}}, "required": ["term"], "additionalProperties": False}}]}
@@ -44,7 +46,53 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
         self.assertTrue(result.needs_confirmation)
         self.assertEqual(responses.requests[0]["tools"][0]["name"], "dictionary__lookup")
         self.assertFalse(responses.requests[0]["tools"][0]["strict"])
-        self.assertEqual(responses.requests[1]["input"][0]["type"], "function_call_output")
+        # store=False라 서버에 앞 응답이 없다: 원래 입력 → 모델의 function_call → 그 결과를 매번 이어 보낸다.
+        self.assertTrue(all(request["store"] is False for request in responses.requests))
+        self.assertNotIn("previous_response_id", responses.requests[1])
+        self.assertEqual([item.get("type", item.get("role")) for item in responses.requests[1]["input"]], ["user", "function_call", "function_call_output"])
+        self.assertEqual(responses.requests[1]["input"][1]["call_id"], responses.requests[1]["input"][2]["call_id"])
+        self.assertIn("dictionary tools", responses.requests[0]["instructions"])
+
+    def test_instructions_do_not_mention_tools_when_none_are_offered(self):
+        responses = _Responses()
+        responses.number = 1
+        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), max_tool_rounds=0).generate({"facts": []}, sample_form_schema())
+        self.assertNotIn("dictionary tools", responses.requests[0]["instructions"])
+
+    def test_generation_options_reach_the_responses_request(self):
+        from n_note_ai_service_layers.adapters.openai_draft_generation import GenerationOptions
+
+        responses = _Responses()
+        responses.number = 1
+        options = GenerationOptions(max_tokens=512, temperature=0.0, extra_body={"seed": 1})
+        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), options=options).generate({"facts": []}, sample_form_schema())
+        request = responses.requests[0]
+        self.assertEqual((request["max_output_tokens"], request["temperature"], request["extra_body"]), (512, 0.0, {"seed": 1}))
+
+    def test_tool_not_found_refreshes_catalog_and_survives_gateway_outage(self):
+        """도구가 사라졌는데 재조회까지 실패해도 초안 생성은 계속된다(그 호출만 오류로 답한다)."""
+        class Gateway(_Gateway):
+            def __init__(self):
+                super().__init__(); self.lists = 0; self.down = False
+            def __call__(self, url, body, headers, timeout):
+                if self.down:
+                    raise OSError("down")
+                message = json.loads(body)
+                if message["method"] == "tools/list":
+                    self.lists += 1
+                if message["method"] == "tools/call":
+                    self.down = True
+                    result = {"isError": True, "code": "not_found"}
+                    return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
+                return super().__call__(url, body, headers, timeout)
+
+        gateway = Gateway()
+        responses = _Responses()
+        client = McpGatewayClient(transport=gateway, catalog_ttl_seconds=300)
+        result = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=client).generate({"facts": []}, sample_form_schema())
+        self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
+        outputs = [item["output"] for item in responses.requests[1]["input"] if item.get("type") == "function_call_output"]
+        self.assertEqual(json.loads(outputs[0]), {"error": "not_found", "retryable": False})
 
     def test_only_allowlisted_gateway_tools_are_exposed_or_callable(self):
         gateway = _Gateway()
@@ -86,7 +134,7 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
         responses = Responses()
         adapter = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=SlowGateway()))
         adapter.generate({"facts": []}, sample_form_schema())
-        self.assertEqual([item["call_id"] for item in responses.requests[1]["input"]], ["call-a", "call-b"])
+        self.assertEqual([item["call_id"] for item in responses.requests[1]["input"] if item.get("type") == "function_call_output"], ["call-a", "call-b"])
 
     def test_calls_beyond_the_limit_get_tool_limit_reached(self):
         class Responses(_Responses):
@@ -100,7 +148,7 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
         gateway = _Gateway()
         responses = Responses()
         OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), max_tool_calls=2).generate({"facts": []}, sample_form_schema())
-        outputs = [item["output"] for item in responses.requests[1]["input"]]
+        outputs = [item["output"] for item in responses.requests[1]["input"] if item.get("type") == "function_call_output"]
         self.assertEqual(len(gateway.called), 2)
         self.assertEqual(outputs[2], '{"error": "tool_limit_reached"}')
 

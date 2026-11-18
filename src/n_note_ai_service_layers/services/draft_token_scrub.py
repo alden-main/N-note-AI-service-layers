@@ -11,10 +11,11 @@ from dataclasses import replace
 from typing import Any
 
 from n_note_ai_service_layers.contracts.draft import DraftResult
+from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN
 
 # 토큰 + 선택 호칭(님·씨) + 바로 붙은 조사를 한 덩어리로 지운다. 조사 뒤에 한글이 이어지면(이틀 등) 조사로 보지 않는다.
 _TOKEN_PHRASE = re.compile(
-    r"\[\[[A-Z]+(?:_[A-Z]+)*_\d+\]\]"
+    PRIVACY_TOKEN.pattern +
     r"(?:\s?(?:님|씨))?"
     r"(?:(?:께서는|께서|에게는|에게|한테|께|은|는|이|가|을|를|의|와|과|도)(?![가-힣]))?"
     r"\s*"
@@ -32,15 +33,16 @@ def scrub_text(text: str) -> str:
     return "\n".join(line.strip() for line in scrubbed.split("\n")).strip()
 
 
-def _scrub_value(value: Any) -> Any:
+def scrub_value(value: Any) -> Any:
+    """문자열·목록·사전 안의 문자열에서 보호 토큰 구절을 지운다(구조는 유지)."""
     if isinstance(value, str):
         return scrub_text(value)
     if isinstance(value, list):
-        return [_scrub_value(item) for item in value]
+        return [scrub_value(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(_scrub_value(item) for item in value)
+        return tuple(scrub_value(item) for item in value)
     if isinstance(value, dict):
-        return {key: _scrub_value(item) for key, item in value.items()}
+        return {key: scrub_value(item) for key, item in value.items()}
     return value
 
 
@@ -54,7 +56,7 @@ def scrub_privacy_tokens(draft: DraftResult) -> DraftResult:
     fields: dict[str, Any] = {}
     changed = False
     for field_id, value in draft.proposed_fields.items():
-        scrubbed = _scrub_value(value)
+        scrubbed = scrub_value(value)
         if scrubbed != value:
             changed = True
             if scrubbed == "":

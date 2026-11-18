@@ -47,6 +47,8 @@ class _Gateway:
             self.batch_requests += 1
             results = [self._tool(item["name"], item["arguments"]) for item in message["calls"]]
             return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps({"results": results}, ensure_ascii=False).encode()
+        if "id" not in message:  # notifications/initialized
+            return 202, {}, b""
         if message["method"] == "initialize":
             result = {"protocolVersion": "2025-06-18"}
         elif message["method"] == "tools/list":

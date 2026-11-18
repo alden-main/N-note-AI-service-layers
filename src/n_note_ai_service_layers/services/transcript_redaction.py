@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-from n_note_ai_service_layers.contracts.privacy import NamedEntityRecognizer, RedactedText
+from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN, NamedEntityRecognizer, RedactedText, privacy_token
 
 # 인구 비중이 높은 성씨만 둔다. 드문 성씨(어·은·모 등)는 일반 단어(어머님·모든)와 겹쳐 오탐이 크다.
 _SURNAMES = "김이박최정강조윤장임한오서신권황안송류전홍고문양손배백허유남심노하곽성차주우구민진나지엄채원천방공현함변염여추도소석선설마길연위표명기반왕금옥육인맹제탁국"
@@ -18,7 +18,6 @@ _HONORIFIC_STOPWORDS = frozenset({
 })
 # 한글로 읽은 숫자다(공일공 일이삼사 오육칠팔).
 _SPOKEN_DIGIT = "[공영일이삼사오육칠팔구]"
-_PROTECTED_TOKEN = re.compile(r"\[\[[A-Z_]+_\d+\]\]")
 
 
 class TranscriptRedactor:
@@ -60,7 +59,7 @@ class TranscriptRedactor:
 
         def token(kind: str) -> str:
             counts[kind] = counts.get(kind, 0) + 1
-            return f"[[{kind}_{counts[kind]}]]"
+            return privacy_token(kind, counts[kind])
 
         redacted = text
         # 짧은 값은 일반 수치와 겹치므로 4자 이상인 식별자만 가린다.
@@ -83,7 +82,7 @@ class TranscriptRedactor:
 
     def _redact_entities(self, text: str, token) -> str:
         """NER 범위를 뒤에서부터 치환한다. 보호 토큰과 겹치거나 호칭·직함인 범위는 건너뛴다."""
-        protected = [(match.start(), match.end()) for match in _PROTECTED_TOKEN.finditer(text)]
+        protected = [(match.start(), match.end()) for match in PRIVACY_TOKEN.finditer(text)]
         spans = sorted({(span.start, span.end) for span in self.recognizer.detect(text)}, reverse=True)
         replacements: list[tuple[int, int]] = []
         for start, end in spans:

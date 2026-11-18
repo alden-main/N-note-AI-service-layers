@@ -17,6 +17,18 @@ docker compose up -d --build --no-deps gateway
 
 Gateway endpoint는 Compose 내부의 `http://gateway:8080/mcp`입니다. upstream MCP 서버는 같은 root Compose에서 `mcp-gateway-network`에 연결됩니다.
 
+## 호출 프로토콜
+
+`/mcp`는 MCP Python SDK의 Streamable HTTP 서버(uvicorn)입니다. 표준 MCP 클라이언트(SDK `ClientSession` 등)가 그대로 붙습니다.
+
+- 상태 없는(stateless) JSON 응답 모드입니다. Gateway는 세션을 보관하지 않으므로 `Mcp-Session-Id`를 주지 않고, `initialize` 없이 보낸 `tools/call`도 처리합니다.
+- 요청의 `Accept`에는 `application/json`이 있어야 합니다(없으면 406). 본문이 `GATEWAY_MAX_REQUEST_BODY_BYTES`를 넘으면 413입니다.
+- 모르는 `protocolVersion`으로 `initialize`하면 오류 대신 Gateway가 지원하는 버전으로 답합니다(MCP 버전 협상). 버전이 맞는지는 클라이언트가 확인합니다.
+- `X-Request-ID`를 보내면 upstream 호출과 감사 로그(`gateway_tool ... request_id=`)에 이어지고 응답 헤더로 돌아옵니다. 없으면 Gateway가 만듭니다.
+- `/v1/tools/batch-call`(`{"calls": [{"name", "arguments"}, ...]}` → `{"results": [...]}`)은 MCP 밖의 Gateway 확장 경로입니다. 한 번에 `GATEWAY_BATCH_MAX_CALLS`(기본 32)개까지 받습니다.
+
+upstream에는 요청마다 다른 JSON-RPC id와 `MCP-Protocol-Version` 헤더를 보냅니다. 세션을 쓰는 upstream은 응답을 id로 짝지으므로, 같은 세션에서 동시에 호출해도 응답이 섞이지 않습니다.
+
 ## Upstream 등록
 
 Gateway는 [config/upstreams.yaml](config/upstreams.yaml)에서 upstream을 읽습니다. Compose는 이 파일을 `/app/config/upstreams.yaml`에 read-only bind mount하므로 새 MCP 서버를 추가할 때 이미지를 다시 build할 필요가 없습니다.

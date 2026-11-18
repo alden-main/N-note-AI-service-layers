@@ -8,8 +8,9 @@ import time
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from openai import BadRequestError
 
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter, _value
+from n_note_ai_service_layers.adapters.openai_draft_generation import GenerationOptions, OpenAiDraftGenerationAdapter, _value
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 
@@ -46,18 +47,17 @@ class OpenAiChatDraftGenerationAdapter(OpenAiDraftGenerationAdapter):
         temperature: float | None = None,
         **kwargs: Any,
     ) -> None:
+        if "options" not in kwargs:
+            kwargs["options"] = GenerationOptions(max_tokens, temperature, dict(extra_body or {}))
         super().__init__(client, model, *args, **kwargs)
-        self._extra_body = dict(extra_body or {})
-        self._max_tokens = max_tokens
-        self._temperature = temperature
 
     def generate(self, payload: dict, schema: FormSchema) -> DraftResult:
         output_format = self._output_format(schema)
+        tools = [_chat_tool(tool) for tool in self._model_tools()]
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._chat_instructions(schema, output_format["schema"])},
+            {"role": "system", "content": self._chat_instructions(schema, output_format["schema"], bool(tools))},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
-        tools = [_chat_tool(tool) for tool in self._model_tools()]
         if tools:
             messages, draft = self._run_tool_phase(messages, tools, schema, output_format["schema"])
             if draft is not None:
@@ -69,22 +69,15 @@ class OpenAiChatDraftGenerationAdapter(OpenAiDraftGenerationAdapter):
                 "json_schema": {"name": output_format["name"], "schema": output_format["schema"], "strict": True},
             },
         )
-        return self._draft_result(_json_text(_message(response).get("content")), schema)
+        return self._draft_result(json_text(first_message(response).get("content")), schema)
 
-    def _chat_instructions(self, schema: FormSchema, output_schema: dict[str, Any]) -> str:
+    def _chat_instructions(self, schema: FormSchema, output_schema: dict[str, Any], tools_enabled: bool = False) -> str:
         """작성 지침과 출력 schema다. schema를 프롬프트에도 넣어 구조화 출력을 강제하지 못하는 서버(MLX, 일부
         llama.cpp 등)와 도구 단계의 답에서도 같은 구조를 따르게 한다."""
-        return self._instructions(schema) + "\n\n" + FINAL_OUTPUT_INSTRUCTION + "\nJSON schema:\n" + json.dumps(output_schema, ensure_ascii=False)
+        return self._instructions(schema, tools_enabled) + "\n\n" + FINAL_OUTPUT_INSTRUCTION + "\nJSON schema:\n" + json.dumps(output_schema, ensure_ascii=False)
 
     def _request(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        request: dict[str, Any] = {"model": self._model, "messages": messages}
-        if self._max_tokens is not None:
-            request["max_tokens"] = self._max_tokens
-        if self._temperature is not None:
-            request["temperature"] = self._temperature
-        if self._extra_body:
-            request["extra_body"] = self._extra_body
-        return request
+        return {"model": self._model, "messages": messages, **self._options.chat_kwargs()}
 
     def _run_tool_phase(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], schema: FormSchema, output_schema: dict[str, Any],
@@ -102,12 +95,10 @@ class OpenAiChatDraftGenerationAdapter(OpenAiDraftGenerationAdapter):
             rounds += 1
             try:
                 response = self._client.chat.completions.create(**self._request(history), tools=tools, tool_choice="auto")
-            except Exception as exc:
+            except BadRequestError:
                 # 서버가 --enable-auto-tool-choice 없이 떠 있으면 400을 반환한다. 도구 없이 진행한다.
-                if getattr(exc, "status_code", None) == 400:
-                    return history, None
-                raise
-            message = _message(response)
+                return history, None
+            message = first_message(response)
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
                 return history, self._unconstrained_draft(message.get("content"), schema, output_schema)
@@ -131,7 +122,7 @@ class OpenAiChatDraftGenerationAdapter(OpenAiDraftGenerationAdapter):
         생략된 필드는 null로 본다(strict 출력에서도 null 필드는 초안에 남지 않는다).
         """
         try:
-            parsed = json.loads(_json_text(content))
+            parsed = json.loads(json_text(content))
         except (TypeError, json.JSONDecodeError):
             return None
         if not isinstance(parsed, dict) or not isinstance(parsed.get("proposed_fields"), dict):
@@ -165,7 +156,7 @@ def _chat_tool(tool: dict[str, Any]) -> dict[str, Any]:
     return {"type": "function", "function": {"name": tool["name"], "description": tool.get("description", ""), "parameters": tool["parameters"]}}
 
 
-def _message(response: Any) -> dict[str, Any]:
+def first_message(response: Any) -> dict[str, Any]:
     """SDK 객체나 fixture 사전에서 첫 번째 응답 메시지를 읽는다."""
     choices = _value(response, "choices") or []
     if not choices:
@@ -174,7 +165,7 @@ def _message(response: Any) -> dict[str, Any]:
     return {"content": _value(message, "content"), "tool_calls": _value(message, "tool_calls")}
 
 
-def _json_text(content: Any) -> Any:
+def json_text(content: Any) -> Any:
     """구조화 출력을 강제하지 못하는 서버를 위해 thinking 블록과 코드 펜스를 걷어낸다."""
     if not isinstance(content, str):
         return content

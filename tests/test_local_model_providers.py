@@ -43,6 +43,8 @@ class _Gateway:
 
     def __call__(self, url, body, headers, timeout):
         message = json.loads(body)
+        if "id" not in message:  # notifications/initialized
+            return 202, {}, b""
         method = message["method"]
         if method == "initialize":
             result = {"protocolVersion": "2025-06-18"}
@@ -183,8 +185,11 @@ class ChatDraftAdapterTests(unittest.TestCase):
         self.assertEqual((adapter._max_tool_rounds, adapter._max_tool_calls), (0, 3))
 
     def test_server_without_tool_support_falls_back_to_hints_only(self):
-        error = Exception("auto tool choice requires --enable-auto-tool-choice")
-        error.status_code = 400
+        import httpx2 as httpx
+        from openai import BadRequestError
+
+        response = httpx.Response(400, request=httpx.Request("POST", "http://local-llm/v1/chat/completions"))
+        error = BadRequestError("auto tool choice requires --enable-auto-tool-choice", response=response, body=None)
         completions = _Completions(error, _completion(FINAL))
         adapter = OpenAiChatDraftGenerationAdapter(_client(completions), "gemma", gateway_client=McpGatewayClient(transport=_Gateway()))
         result = adapter.generate({"transcript": "x"}, sample_form_schema())

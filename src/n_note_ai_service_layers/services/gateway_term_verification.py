@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any
 
 from n_note_ai_service_layers import settings
+from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN
 from n_note_ai_service_layers.contracts.term_verification import (
     GatewaySuggestion,
     GatewayTermOccurrence,
@@ -30,7 +31,6 @@ class GatewayTermVerificationFlow:
 
     MAX_CANDIDATES = 200
     MAX_SUGGESTIONS = 10
-    _PROTECTED_TOKEN = re.compile(r"\[\[[A-Z_]+_\d+\]\]")
 
     def __init__(
         self, gateway: McpGatewayClient, tool_names: tuple[str, ...] | None = None, chunk_chars: int | None = None, max_concurrency: int | None = None,
@@ -70,7 +70,7 @@ class GatewayTermVerificationFlow:
             known_words.extend((start + offset, end + offset) for start, end in self._known_word_spans(result, chunk))
         occurrences = [
             item for item in occurrences
-            if not self._PROTECTED_TOKEN.search(item.input_text) and not self._ordinary_word_guess(item, known_words)
+            if not PRIVACY_TOKEN.search(item.input_text) and not self._ordinary_word_guess(item, known_words)
         ]
         occurrences.sort(key=lambda item: (item.start_offset, item.end_offset, item.tool_name))
         tool_names = tuple(tool["name"] for tool in tools)

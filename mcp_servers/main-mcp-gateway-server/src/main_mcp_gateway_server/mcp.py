@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 import json
+import uuid
 import logging
 from threading import Lock
 from time import monotonic
@@ -68,13 +69,18 @@ class HttpTransport:
             headers["X-Request-ID"] = request_id
         if session_id:
             headers["Mcp-Session-Id"] = session_id
+        if payload.get("method") != "initialize":
+            # initialize 뒤의 모든 요청에는 합의한 프로토콜 버전을 붙인다(MCP 2025-06-18).
+            headers["MCP-Protocol-Version"] = PROTOCOL_VERSION
         response = self._send("POST", url, json.dumps(payload).encode("utf-8"), headers)
         if response.status_code >= 400:
             raise OSError(f"upstream MCP가 HTTP {response.status_code}를 반환했습니다")
         try:
-            parsed = _decode_mcp_response(response.content.decode("utf-8"))
+            parsed = _decode_mcp_response(response.content.decode("utf-8"), payload.get("id"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise OSError("upstream MCP 응답 형식이 올바르지 않습니다") from error
+        if "id" in payload and parsed.get("id") != payload["id"]:
+            raise OSError("upstream MCP 응답 id가 요청과 다릅니다")
         return McpResponse(parsed, response.headers.get("mcp-session-id"))
 
     def send_notification(self, url: str, payload: dict[str, Any], session_id: str | None = None) -> None:
@@ -82,7 +88,7 @@ class HttpTransport:
 
         Streamable HTTP 서버는 notification에 빈 202 응답을 반환할 수 있으므로 본문을 JSON으로 해석하지 않는다.
         """
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": PROTOCOL_VERSION}
         if session_id:
             headers["Mcp-Session-Id"] = session_id
         if self._send("POST", url, json.dumps(payload).encode("utf-8"), headers).status_code >= 400:
@@ -292,7 +298,12 @@ class GatewayCatalog:
 
 
 def _request(method: str, params: dict[str, Any]) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": "gateway-discovery", "method": method, "params": params}
+    """JSON-RPC 요청이다. id는 요청마다 새로 만든다.
+
+    MCP는 세션 안에서 요청 id가 겹치지 않아야 한다. 세션을 쓰는(stateful) upstream은 응답을 id로 짝지으므로,
+    같은 id로 동시에 호출하면 한 응답을 잃고 다른 요청은 timeout까지 기다린다.
+    """
+    return {"jsonrpc": "2.0", "id": f"gateway-{uuid.uuid4()}", "method": method, "params": params}
 
 
 def _initialize_params() -> dict[str, Any]:
@@ -309,15 +320,22 @@ def _notification(method: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "method": method, "params": {}}
 
 
-def _decode_mcp_response(raw: str) -> dict[str, Any]:
-    """JSON 응답 또는 한 개의 SSE JSON-RPC event에서 객체를 추출한다."""
+def _decode_mcp_response(raw: str, message_id: Any = None) -> dict[str, Any]:
+    """JSON 응답 또는 SSE 스트림에서 JSON-RPC 객체를 꺼낸다.
+
+    SSE에는 응답 전에 서버 알림(진행 상황 등)이 여러 event로 섞일 수 있으므로, ``message_id``가 맞는 event를 고른다.
+    """
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        data_lines = [line.removeprefix("data:").lstrip() for line in raw.splitlines() if line.startswith("data:")]
-        if not data_lines:
+        events = []
+        for block in raw.replace("\r\n", "\n").split("\n\n"):
+            data = "\n".join(line.removeprefix("data:").lstrip() for line in block.split("\n") if line.startswith("data:"))
+            if data:
+                events.append(json.loads(data))
+        if not events:
             raise
-        parsed = json.loads("\n".join(data_lines))
+        parsed = next((event for event in events if isinstance(event, dict) and event.get("id") == message_id), events[-1])
     if not isinstance(parsed, dict):
         raise OSError("upstream MCP 응답이 객체가 아닙니다")
     return parsed

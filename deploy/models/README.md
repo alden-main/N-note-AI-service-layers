@@ -23,6 +23,32 @@ uv run n-note-model-eval compare                            # 프로필별 결�
 | `qwen3.5-9b` | Qwen/Qwen3.5-9B | bf16, 약 19GB | ✅ | Apache 2.0, 다국어. 여유 있는 기준 모델 |
 | `qwen3.5-27b` | Qwen/Qwen3.5-27B-GPTQ-Int4 | 공식 int4, 약 15GB | ✅ | Apache 2.0. 27B급 중 40GB에서 가장 안정적 |
 | `gemma-4-26b-a4b` | google/gemma-4-26B-A4B-it | FP8 weight-only, 약 26GB | ❌(설정 시 가능) | Apache 2.0, MoE라 빠름. **A100 동작 실측 필요(실험)** |
+| `gemma-4-12b` | google/gemma-4-12B-it | bf16, 약 24GB | ❌ | Apache 2.0, dense 12B(2026.06). 이미지·오디오 입력은 막아 둠. **실측 필요** |
+| `whisper-large-v3-turbo` | openai/whisper-large-v3-turbo (STT 전용) | fp16, 약 1.6GB | — | LLM 서버 없이 로컬 STT만 띄움. LLM은 `OPENAI_API_KEY`가 있으면 OpenAI |
+
+### A100에서 프로필 동작 확인 (스모크 테스트)
+
+```bash
+scripts/download_models.sh gemma-4-12b                   # 인터넷 되는 곳에서 가중치 받기(폐쇄망이면 캐시 반입)
+scripts/smoke-test.sh gemma-4-12b                        # 띄우기 → healthy 대기 → GPU·적재 로그 → 스모크 테스트
+scripts/smoke-test.sh whisper-large-v3-turbo --stt-only  # STT만 확인
+```
+
+`smoke-test.sh`가 하는 일은 다음과 같습니다.
+
+1. 프로필로 서비스를 띄우고, 모든 서비스(`ai-service`, `local-stt`, `local-llm`)가 healthy가 될 때까지 기다립니다. 기본 최대 30분이고 `N_NOTE_SMOKE_WAIT_SECONDS`로 바꿀 수 있습니다. 실패하면 해당 서비스의 최근 로그를 보여 줍니다.
+2. `nvidia-smi` 메모리 사용량과 vLLM 적재 로그(KV cache 크기, 최대 동시 처리 수, OOM 여부)를 보여 줍니다.
+3. 실행 중인 `ai-service` 안에서 `n-note-smoke`로 실제 API를 호출합니다. 동봉된 사례 음성(`eval/cases/stt-admission-tts`)을 씁니다.
+
+| 단계 | 확인 내용 |
+|---|---|
+| `api_health` | API 기동 |
+| `stt_server` / `llm_server` | 모델 서버 `/v1/models` 응답과 서빙 모델 이름 |
+| `transcription` | 음성 파일 한 번 전사의 지연 시간, 참조 전사문 대비 CER |
+| `recording_chunks` | 20초 청크(`--chunk-seconds`)로 녹음 세션에 보낸 청크별 지연 시간, 누적 전사문 CER |
+| `draft_workflow` | 녹음 세션 종료 후 초안 생성 작업의 단계, 채운 필드 수, 용어 검토·양식 검증 상태 (`--stt-only`면 생략) |
+
+보고서는 `eval/smoke/<profile>/<시각>.json`에 남고, 필수 단계가 실패하면 종료 코드 1입니다. 다른 음성은 `--audio <파일>`로 넣습니다. 이때 전사문 내용은 보고서에 남기지 않습니다(`--include-text`로 켬). 모델 품질 비교는 이어서 `n-note-model-eval run`으로 합니다.
 
 공통: STT는 `openai/whisper-large-v3-turbo`(GPU 메모리 10%)를 같은 GPU에서 함께 띄웁니다. LLM은 GPU 메모리 80~85%를 씁니다.
 
@@ -78,3 +104,4 @@ printf 'N_NOTE_MODEL_CACHE=/opt/n-note/model-cache\nHF_HUB_OFFLINE=1\n' >> .env
 
 - vLLM 이미지는 `v0.31.0-cu129`(CUDA 12.9)로 고정했습니다. A100 서버의 NVIDIA 드라이버가 CUDA 12.9를 지원하는지 확인하세요. 버전은 `N_NOTE_VLLM_IMAGE`와 `N_NOTE_VLLM_VERSION`으로 바꿉니다.
 - MCP Gateway와 MCP 서버 이미지도 같은 번들에 들어 있습니다.
+- `local-stt`와 `local-llm`은 internal 네트워크(`ai-gateway-network`)에 있어 인터넷이 되는 서버에서도 컨테이너가 모델을 내려받지 못합니다. `scripts/download_models.sh`로 미리 받아 둡니다(`HF_HUB_OFFLINE` 기본값은 `1`입니다).

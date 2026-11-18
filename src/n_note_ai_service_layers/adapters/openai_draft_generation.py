@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Any
 
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema
+from n_note_ai_service_layers.services import executors
 from n_note_ai_service_layers.services.mcp_gateway_client import (
     McpGatewayClient,
     McpGatewayError,
@@ -22,9 +23,8 @@ BASE_INSTRUCTIONS = (
     "Rewrite spoken language, dialect, fillers, and misrecognized words into standard Korean (표준어) and write "
     "text fields in concise Korean nursing-record style (for example sentences ending in '~함', '~임', '~호소함'). "
     "Use standard medical terminology; keep widely used clinical abbreviations (e.g. V/S, NPO, I/O) as spoken. "
-    "The payload's term_review_hints are dictionary candidates that the standard Korean and medical terminology "
-    "services found in the transcript; apply a hint only when it fits the clinical context. "
-    "You may call the provided dictionary tools to confirm a term before using it. "
+    "The payload's term_review_hints, when present, are dictionary candidates that the standard Korean and medical "
+    "terminology services found in the transcript; apply a hint only when it fits the clinical context. "
     "Privacy tokens in the form [[TYPE_n]] must never be expanded, guessed, or used as clinical evidence, and must not "
     "appear in any output field. Patient identity comes from the EMR, so omit the patient as the subject "
     "(write '내일 폐수술 예정임.' instead of '[[PERSON_1]]님은 내일 폐수술 예정임.'). If a token refers to someone other "
@@ -36,6 +36,38 @@ BASE_INSTRUCTIONS = (
     "'fact:<fact_id>'; do not add items for null fields. "
     "Set needs_confirmation to true when any statement is uncertain."
 )
+# 응답 하나에서 동시에 Gateway로 보내는 도구 호출 수다. 넘는 호출은 이어서 순차로 보낸다.
+MAX_PARALLEL_TOOL_CALLS = 4
+# 도구를 줄 때만 붙인다. 도구 없는 요청에 도구 안내가 있으면 일부 로컬 모델이 텍스트로 가짜 tool call을 낸다.
+TOOL_INSTRUCTION = " You may call the provided dictionary tools to confirm a term before using it."
+
+
+@dataclass(frozen=True)
+class GenerationOptions:
+    """LLM 요청 공통 옵션이다(``N_NOTE_LLM_MAX_TOKENS``·``N_NOTE_LLM_TEMPERATURE``·``N_NOTE_LLM_EXTRA_BODY``).
+
+    Responses·Chat 초안 어댑터와 동기 서식 추출(internal_stt)이 같은 규칙으로 요청에 넣는다.
+    """
+
+    max_tokens: int | None = None
+    temperature: float | None = None
+    extra_body: dict[str, Any] = field(default_factory=dict)
+
+    def chat_kwargs(self) -> dict[str, Any]:
+        return self._kwargs("max_tokens")
+
+    def responses_kwargs(self) -> dict[str, Any]:
+        return self._kwargs("max_output_tokens")
+
+    def _kwargs(self, max_tokens_key: str) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if self.max_tokens is not None:
+            kwargs[max_tokens_key] = self.max_tokens
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.extra_body:
+            kwargs["extra_body"] = dict(self.extra_body)
+        return kwargs
 
 
 class OpenAiDraftGenerationAdapter:
@@ -55,11 +87,13 @@ class OpenAiDraftGenerationAdapter:
         max_tool_rounds: int = 2,
         max_gateway_retries: int = 1,
         allowed_tool_names: tuple[str, ...] | None = None,
+        options: GenerationOptions | None = None,
     ) -> None:
         if client is None:
             from openai import OpenAI
             client = OpenAI()
         self._client = client
+        self._options = options or GenerationOptions()
         self._model = model
         self._prompt_version = prompt_version
         self._gateway_client = gateway_client
@@ -76,13 +110,16 @@ class OpenAiDraftGenerationAdapter:
         입력: ``payload``는 전사문과 사용 가능한 사실이고, ``schema``는 허용 필드를 정한다.
         출력: 검증된 구조화 응답을 변환한 ``DraftResult``이며, 잘못된 응답은 ``ValueError``를 발생시킨다.
         """
-        request = {
-            "model": self._model,
-            "instructions": self._instructions(schema),
-            "input": json.dumps(payload, ensure_ascii=False),
-            "text": {"format": self._output_format(schema)},
-        }
         tools = self._model_tools()
+        request: dict[str, Any] = {
+            "model": self._model,
+            "instructions": self._instructions(schema, bool(tools)),
+            "input": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            "text": {"format": self._output_format(schema)},
+            # 전사문·초안을 OpenAI 쪽에 보관하지 않는다. 그래서 도구 왕복은 previous_response_id 대신 입력 이력을 직접 넘긴다.
+            "store": False,
+            **self._options.responses_kwargs(),
+        }
         if tools:
             request["tools"] = tools
         response = self._client.responses.create(**request)
@@ -91,9 +128,9 @@ class OpenAiDraftGenerationAdapter:
         return self._draft_result(getattr(response, "output_text", None), schema)
 
     @staticmethod
-    def _instructions(schema: FormSchema) -> str:
-        """공통 작성 지침에 양식 제목과 양식별 지침을 덧붙인다."""
-        instructions = BASE_INSTRUCTIONS + f" The form is '{schema.display_title}'."
+    def _instructions(schema: FormSchema, tools_enabled: bool = False) -> str:
+        """공통 작성 지침에 (도구가 있으면) 도구 안내, 양식 제목과 양식별 지침을 덧붙인다."""
+        instructions = BASE_INSTRUCTIONS + (TOOL_INSTRUCTION if tools_enabled else "") + f" The form is '{schema.display_title}'."
         if schema.instructions:
             instructions += " Form-specific instructions: " + schema.instructions
         return instructions
@@ -148,15 +185,17 @@ class OpenAiDraftGenerationAdapter:
                 return response
             rounds += 1
             results, calls = self._run_tool_calls([(_value(call, "name"), _value(call, "arguments")) for call in function_calls], started, calls)
+            # store=False라 서버가 앞 응답을 기억하지 않는다. 모델이 낸 function_call과 그 결과를 이력에 이어 붙인다.
+            echoed = [
+                {"type": "function_call", "call_id": str(_value(call, "call_id")), "name": _value(call, "name"), "arguments": _value(call, "arguments")}
+                for call in function_calls
+            ]
             outputs = [
                 {"type": "function_call_output", "call_id": str(_value(call, "call_id")), "output": json.dumps(result, ensure_ascii=False)}
                 for call, result in zip(function_calls, results)
             ]
             next_request = dict(request)
-            next_request["input"] = outputs
-            response_id = getattr(response, "id", None)
-            if response_id:
-                next_request["previous_response_id"] = response_id
+            next_request["input"] = [*request["input"], *echoed, *outputs]
             if self._tool_budget_spent(rounds, calls, started):
                 next_request["tool_choice"] = "none"
             request = next_request
@@ -180,8 +219,10 @@ class OpenAiDraftGenerationAdapter:
             used += 1
             permitted.append(index)
         if len(permitted) > 1:
-            with ThreadPoolExecutor(max_workers=min(len(permitted), 4), thread_name_prefix="llm-tool") as pool:
-                outcomes = list(pool.map(lambda index: self._call_gateway(*calls[index]), permitted))
+            # 응답 하나의 도구 호출을 동시에 보낸다. 초안마다 최대 MAX_PARALLEL_TOOL_CALLS개다.
+            pool = executors.shared("llm-tool", executors.worker_parallelism() * MAX_PARALLEL_TOOL_CALLS)
+            outcomes = executors.map_ordered(pool, lambda index: self._call_gateway(*calls[index]), permitted[:MAX_PARALLEL_TOOL_CALLS])
+            outcomes += [self._call_gateway(*calls[index]) for index in permitted[MAX_PARALLEL_TOOL_CALLS:]]
         else:
             outcomes = [self._call_gateway(*calls[index]) for index in permitted]
         for index, outcome in zip(permitted, outcomes):
@@ -199,7 +240,13 @@ class OpenAiDraftGenerationAdapter:
             return model_tool_output(self._gateway_client.call_tool(name, arguments))
         except McpGatewayToolError as exc:
             if exc.code == "not_found":
-                self._gateway_client.discover()
+                # Gateway catalog가 바뀌었을 수 있다. TTL 캐시를 무효화해야 실제로 다시 조회한다.
+                # 재조회 실패(Gateway 장애)는 이 도구 호출의 오류일 뿐이므로 초안 생성을 중단시키지 않는다.
+                self._gateway_client.invalidate_catalog()
+                try:
+                    self._gateway_client.discover()
+                except McpGatewayError:
+                    pass
                 return {"error": exc.code, "retryable": False}
             if exc.retryable:
                 for _ in range(self._max_gateway_retries):

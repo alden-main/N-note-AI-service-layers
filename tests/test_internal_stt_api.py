@@ -127,6 +127,26 @@ def test_responses_extraction_requests_structured_output(monkeypatch):
     monkeypatch.setattr(internal_stt.model_providers, "openai_client", lambda *args: SimpleNamespace(responses=SimpleNamespace(create=create)))
     assert internal_stt._extract(["전사문"], FORM, ()) == VALID
     assert seen["text"]["format"]["strict"] is True and seen["text"]["format"]["schema"] == internal_stt._output_schema(FORM, 1)
+    # 전사문을 OpenAI 쪽에 보관하지 않는다.
+    assert seen["store"] is False
+
+
+def test_extraction_uses_shared_generation_options(monkeypatch):
+    monkeypatch.setenv("N_NOTE_LLM_TEMPERATURE", "0")
+    monkeypatch.setenv("N_NOTE_LLM_MAX_TOKENS", "1024")
+    calls = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
+    internal_stt._extract(["전사문"], FORM, ())
+    assert (calls[0]["temperature"], calls[0]["max_tokens"]) == (0.0, 1024)
+
+
+def test_privacy_tokens_are_scrubbed_from_field_values_but_kept_in_evidence():
+    sentences = ["[[PERSON_1]]님은 흑색변으로 입원함."]
+    result = {**VALID, "fields": {**VALID["fields"], "situation": "[[PERSON_1]]님은 흑색변으로 입원함", "allergy": {"selected": ["약"], "detail": "[[PERSON_2]]가 두드러기"}},
+              "relatedSentences": {**VALID["relatedSentences"], "situation": [0]}}
+    normalized = internal_stt._normalize(FORM, sentences, result)
+    assert normalized["fields"]["situation"] == "흑색변으로 입원함"
+    assert normalized["fields"]["allergy"] == {"selected": ["약"], "detail": "두드러기"}
+    assert normalized["relatedSentences"]["situation"] == sentences
 
 
 NESTED = {"fields": {"sbar": VALID["fields"]}, "relatedSentences": VALID["relatedSentences"]}
@@ -215,9 +235,9 @@ def test_stt_uses_nursing_context_prompt_when_setting_is_blank(monkeypatch):
     monkeypatch.setenv("N_NOTE_STT_PROMPT", "")
     monkeypatch.setenv("N_NOTE_STT_BASE_URL", "http://local-stt/v1")
     monkeypatch.setattr(model_providers, "openai_client", lambda *args: object())
-    assert model_providers.speech_to_text_provider()._prompt == settings.DEFAULT_STT_PROMPT
+    assert model_providers.speech_to_text_provider().inner._prompt == settings.DEFAULT_STT_PROMPT
     monkeypatch.setenv("N_NOTE_STT_PROMPT", "병동 문맥")
-    assert model_providers.speech_to_text_provider()._prompt == "병동 문맥"
+    assert model_providers.speech_to_text_provider().inner._prompt == "병동 문맥"
 
 
 def test_term_review_status_is_logged_when_it_stops_extraction(monkeypatch):

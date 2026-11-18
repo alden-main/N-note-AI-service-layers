@@ -20,7 +20,6 @@ class LlmPayloadProjector:
         snapshot: ClinicalContextSnapshot,
         transcript: str,
         schema: FormSchema,
-        approved_term_corrections: tuple[dict[str, str], ...] = (),
         term_review_hints: tuple[dict, ...] = (),
         reference_time: datetime | None = None,
     ) -> dict:
@@ -45,17 +44,19 @@ class LlmPayloadProjector:
             else:
                 confirmation = True
             facts.append(item)
-        return {
-            "schema_id": schema.schema_id,
-            "schema_version": schema.version,
+        # LLM이 쓰지 않는 식별자(schema_id·version)와 빈 목록은 넣지 않는다. 토큰만 쓰고 모델이 값을 따라 쓸 수 있다.
+        payload: dict = {
             "form_title": schema.display_title,
             # 구술 시점이다. '오후 2시' 같은 상대 표현의 날짜를 해석하는 기준으로만 쓴다.
             "reference_time": (reference_time or now_local()).isoformat(timespec="minutes"),
             "transcript": transcript,
-            # Gateway가 전사문에서 찾은 표준어·의학용어 후보다. 전사문을 대체하지 않는다.
-            "term_review_hints": list(term_review_hints),
-            "facts": facts,
-            "needs_confirmation": confirmation,
-            # This is an explicit review artifact, never a replacement transcript.
-            "approved_term_corrections": list(approved_term_corrections),
         }
+        if term_review_hints:
+            # Gateway가 전사문에서 찾은 표준어·의학용어 후보다. 전사문을 대체하지 않는다.
+            payload["term_review_hints"] = list(term_review_hints)
+        if facts:
+            payload["facts"] = facts
+        if confirmation:
+            # 쓸 수 없는(누락·만료·충돌) 사실이 있다는 표시다. 그 사실로 필드를 채우지 않는다.
+            payload["unavailable_facts_present"] = True
+        return payload

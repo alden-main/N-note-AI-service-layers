@@ -1,15 +1,19 @@
 """Gateway HTTP endpoint의 MCP protocol 및 요청 크기 제한을 검증한다."""
 
 import http.client
-from http.server import ThreadingHTTPServer
 import json
 import os
+import socket
 import threading
+import time
 import unittest
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-from main_mcp_gateway_server.app import GatewayHandler, _upstream_timeout_seconds, configure_logging
+import uvicorn
+
+from main_mcp_gateway_server.app import GatewayService, _upstream_timeout_seconds, configure_logging, create_app
 
 
 class RecordingCatalog:
@@ -23,16 +27,19 @@ class RecordingCatalog:
         self.discovery_calls += 1
 
     def list_tools(self) -> list[dict]:
-        """테스트용 빈 catalog를 반환한다."""
-        return []
+        """테스트용 catalog다."""
+        return [{"name": "a__lookup", "description": "lookup", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}]
 
     def call(self, name: str, arguments: dict, request_id: str | None = None) -> dict:
-        """호출 기록을 남기고 계약에 맞는 성공 tool result를 반환한다."""
+        """호출 기록을 남기고 계약에 맞는 성공 tool result를 반환한다(content 없이 구조화 결과만)."""
         self.calls.append((name, arguments, request_id))
-        return {"structuredContent": {}, "isError": False}
+        return {"structuredContent": {"ok": True}, "isError": False}
 
     def call_many(self, calls: list, request_id: str | None = None) -> list[dict]:
         return [self.call(item["name"], item.get("arguments", {}), request_id) for item in calls]
+
+
+BATCH = "/v1/tools/batch-call"
 
 
 class GatewayHandlerTest(unittest.TestCase):
@@ -40,50 +47,51 @@ class GatewayHandlerTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.catalog = RecordingCatalog()
-        self.previous_catalog = getattr(GatewayHandler, "catalog", None)
-        self.previous_limit = GatewayHandler.max_request_body_bytes
-        GatewayHandler.catalog = self.catalog
-        GatewayHandler.max_request_body_bytes = 256
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), GatewayHandler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.service = GatewayService(self.catalog, max_request_body_bytes=256)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
+        self.server = uvicorn.Server(uvicorn.Config(create_app(self.service), host="127.0.0.1", port=self.port, log_level="warning"))
+        self.thread = threading.Thread(target=self.server.run, daemon=True)
         self.thread.start()
+        deadline = time.monotonic() + 5
+        while not self.server.started and time.monotonic() < deadline:
+            time.sleep(0.02)
 
     def tearDown(self) -> None:
-        self.server.shutdown()
-        self.thread.join()
-        self.server.server_close()
-        if self.previous_catalog is None:
-            del GatewayHandler.catalog
-        else:
-            GatewayHandler.catalog = self.previous_catalog
-        GatewayHandler.max_request_body_bytes = self.previous_limit
+        self.server.should_exit = True
+        self.thread.join(timeout=5)
 
     def _post(self, payload: dict, request_id: str = "test-request") -> tuple[int, dict]:
         """테스트 서버로 JSON-RPC POST를 보내고 HTTP status와 JSON 응답을 반환한다."""
         data = json.dumps(payload).encode("utf-8")
         request = Request(
-            f"http://127.0.0.1:{self.server.server_port}/mcp",
+            f"http://127.0.0.1:{self.port}/mcp",
             data=data,
-            headers={"Content-Type": "application/json", "X-Request-ID": request_id},
+            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "X-Request-ID": request_id},
             method="POST",
         )
-        with urlopen(request) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(request) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            return error.code, {}
 
-    def test_rejects_unsupported_initialize_version(self) -> None:
-        """Gateway MCP server는 지원하지 않는 initialize version을 JSON-RPC 오류로 거부한다."""
-        status, response = self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "old"}})
-        self.assertEqual(status, 200)
-        self.assertEqual(response["error"]["code"], -32602)
+    def test_initialize_negotiates_the_requested_protocol_version(self) -> None:
+        """SDK 서버는 지원하는 버전이면 그대로, 모르는 버전이면 자기 최신 버전으로 답한다(MCP 버전 협상)."""
+        params = {"capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}
+        status, response = self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {**params, "protocolVersion": "2025-06-18"}})
+        self.assertEqual((status, response["result"]["protocolVersion"]), (200, "2025-06-18"))
+        self.assertEqual(response["result"]["serverInfo"]["name"], "mcp-gateway")
+        _, response = self._post({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {**params, "protocolVersion": "old"}})
+        self.assertNotEqual(response["result"]["protocolVersion"], "old")
 
     def test_rejects_large_body_without_catalog_call(self) -> None:
         """본문 한도를 넘는 tools/call은 upstream route 전에 request_too_large가 된다."""
-        status, response = self._post(
+        status, _response = self._post(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "a__lookup", "arguments": {"text": "x" * 1_000}}}
         )
-        self.assertEqual(status, 200)
-        self.assertTrue(response["result"]["isError"])
-        self.assertEqual(response["result"]["structuredContent"]["error"]["code"], "request_too_large")
+        self.assertEqual(status, 413)
         self.assertEqual(self.catalog.calls, [])
 
     def test_forwards_received_request_id_to_catalog(self) -> None:
@@ -94,10 +102,13 @@ class GatewayHandlerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertFalse(response["result"]["isError"])
+        self.assertEqual(response["result"]["structuredContent"], {"ok": True})
+        # 구조화 결과만 준 upstream에도 MCP 필수 필드인 content(같은 JSON 텍스트)를 채운다.
+        self.assertEqual(json.loads(response["result"]["content"][0]["text"]), {"ok": True})
         self.assertEqual(self.catalog.calls, [("a__lookup", {}, "request-from-client")])
 
     def _post_path(self, path: str, payload: dict) -> tuple[int, dict]:
-        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         try:
             connection.request("POST", path, body=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "X-Request-ID": "batch-1"})
             response = connection.getresponse()
@@ -114,27 +125,64 @@ class GatewayHandlerTest(unittest.TestCase):
 
     def test_batch_call_rejects_empty_or_oversized_batches(self) -> None:
         """빈 batch와 상한을 넘는 batch는 upstream 호출 없이 400이다."""
-        previous = GatewayHandler.max_batch_calls
-        GatewayHandler.max_batch_calls = 2
-        try:
-            self.assertEqual(self._post_path("/v1/tools/batch-call", {"calls": []})[0], 400)
-            calls = [{"name": "a__one", "arguments": {}}] * 3
-            self.assertEqual(self._post_path("/v1/tools/batch-call", {"calls": calls})[0], 400)
-        finally:
-            GatewayHandler.max_batch_calls = previous
+        self.service.max_batch_calls = 2
+        self.assertEqual(self._post_path("/v1/tools/batch-call", {"calls": []})[0], 400)
+        calls = [{"name": "a__one", "arguments": {}}] * 3
+        self.assertEqual(self._post_path("/v1/tools/batch-call", {"calls": calls})[0], 400)
         self.assertEqual(self.catalog.calls, [])
 
     def test_keep_alive_serves_multiple_requests_on_one_connection(self) -> None:
         """호출자는 한 연결로 여러 MCP 요청을 보낼 수 있다."""
-        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         try:
             for message_id in (1, 2):
-                connection.request("POST", "/mcp", body=json.dumps({"jsonrpc": "2.0", "id": message_id, "method": "tools/list", "params": {}}).encode(), headers={"Content-Type": "application/json"})
+                connection.request("POST", "/mcp", body=json.dumps({"jsonrpc": "2.0", "id": message_id, "method": "tools/list", "params": {}}).encode(), headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
                 response = connection.getresponse()
                 self.assertEqual(json.loads(response.read())["id"], message_id)
                 self.assertFalse(response.will_close)
         finally:
             connection.close()
+
+    def test_health_unknown_path_and_invalid_json(self) -> None:
+        """`/healthz`는 200, 모르는 경로는 404, 깨진 JSON은 upstream 호출 없이 400이다."""
+        with urlopen(f"http://127.0.0.1:{self.port}/healthz") as response:
+            self.assertEqual((response.status, response.read()), (200, b"ok"))
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            connection.request("POST", "/other", body=b"{}", headers={"Content-Type": "application/json"})
+            self.assertEqual(connection.getresponse().status, 404)
+        finally:
+            connection.close()
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            connection.request("POST", BATCH, body=b"{broken", headers={"Content-Type": "application/json", "X-Request-ID": "bad-1"})
+            response = connection.getresponse()
+            self.assertEqual((response.status, response.getheader("X-Request-ID")), (400, "bad-1"))
+        finally:
+            connection.close()
+        self.assertEqual(self.catalog.calls, [])
+
+    def test_batch_body_over_limit_is_413(self) -> None:
+        status, response = self._post_path("/v1/tools/batch-call", {"calls": [{"name": "a__one", "arguments": {"text": "x" * 1_000}}]})
+        self.assertEqual((status, response), (413, {"error": "request_too_large"}))
+        self.assertEqual(self.catalog.calls, [])
+
+    def test_official_sdk_client_can_list_and_call_tools(self) -> None:
+        """표준 MCP 클라이언트(SDK ClientSession)가 Gateway에 그대로 붙는다."""
+        import anyio
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        async def run() -> tuple[list[str], dict]:
+            async with streamable_http_client(f"http://127.0.0.1:{self.port}/mcp") as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = await session.list_tools()
+                    result = await session.call_tool("a__lookup", {"text": "x"})
+                    return [tool.name for tool in tools.tools], result.structuredContent
+
+        names, structured = anyio.run(run)
+        self.assertEqual((names, structured), (["a__lookup"], {"ok": True}))
 
     def test_tools_list_refreshes_upstreams(self) -> None:
         """Gateway보다 늦게 준비된 upstream도 다음 tools/list에서 발견한다."""
