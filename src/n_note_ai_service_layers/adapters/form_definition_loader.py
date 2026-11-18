@@ -2,83 +2,28 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, BeforeValidator, StrictInt, StringConstraints, ValidationError, model_validator
+from pydantic import BaseModel, ValidationError
 
 from n_note_ai_service_layers.contracts.codec import from_json_dict
-from n_note_ai_service_layers.contracts.form_schema import FormSchema, SchemaStatus
-from n_note_ai_service_layers.services.schema_validation import SchemaValidationError, validate_schema_structure
+from n_note_ai_service_layers.contracts.form_schema import FormSchema, PdfPlacement, SchemaStatus
+
+# 파일에 있어도 무시하고 배포 사실로 정하는 키다(``pdf``는 위에서 따로 읽는다).
+_DEPLOYMENT_KEYS = frozenset({"pdf", "status", "approved_by", "approved_at", "pdf_template", "pdf_meta"})
 
 FORM_DEFINITION_FILE = "form.json"
-FieldType = Literal["string", "text", "integer", "number", "boolean", "array", "date", "datetime", "enum"]
 MetaKey = Literal["form_title", "patient_id", "encounter_id", "finalized_by", "finalized_at", "note_id"]
-Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-
-
-class _Placement(BaseModel):
-    """AcroForm 필드명 또는 쪽·좌표·크기로 지정한 PDF 배치 정보다."""
-
-    field_name: str | None = None
-    page: int | None = None
-    x: float | None = None
-    y: float | None = None
-    width: float | None = None
-    height: float | None = None
-    font_size: float = 10.0
-
-    @model_validator(mode="after")
-    def _located(self) -> _Placement:
-        if not self.field_name and None in (self.page, self.x, self.y, self.width, self.height):
-            raise ValueError("pdf placement requires field_name or page/x/y/width/height")
-        return self
-
-
-class _Field(BaseModel):
-    field_id: Text
-    type: FieldType = "text"
-    required: bool = False
-    llm_allowed: bool = True
-    fact_id: Text | None = None
-    conditional_required_when: Text | None = None
-    label: Text | None = None
-    display_order: StrictInt | None = None
-    description: Text | None = None
-    options: list[Annotated[str, BeforeValidator(str)]] = []
-    pdf: _Placement | None = None
-
-    @model_validator(mode="after")
-    def _enum_has_options(self) -> _Field:
-        if self.type == "enum" and not self.options:
-            raise ValueError("enum field requires options")
-        return self
-
-
-class _Section(BaseModel):
-    section_id: Text
-    fields: list[_Field]
-    label: Text | None = None
-    display_order: StrictInt | None = None
 
 
 class _PdfConfig(BaseModel):
+    """``form.json``의 ``pdf`` 블록이다. 나머지 키는 ``FormSchema`` 계약을 그대로 따른다."""
+
     template: str | None = None
-    meta: dict[MetaKey, _Placement] | None = None
-
-
-class _FormDefinition(BaseModel):
-    """``form.json``의 계약이다."""
-
-    schema_id: Text
-    version: Text
-    purpose: Text
-    sections: list[_Section]
-    title: Text | None = None
-    instructions: Text | None = None
-    pdf: _PdfConfig | None = None
-    validation_criteria: list[dict[str, Any]] = []
+    meta: dict[MetaKey, PdfPlacement] | None = None
 
 
 class FormDefinitionError(ValueError):
@@ -119,28 +64,34 @@ class FormDefinitionLoader:
     def load(self, path: Path) -> FormSchema:
         """양식 정의 파일 하나를 검증해 활성 스키마로 변환한다."""
         try:
-            definition = _FormDefinition.model_validate_json(path.read_bytes())
+            raw = json.loads(path.read_bytes())
         except OSError as exc:
             raise FormDefinitionError(f"cannot read form definition: {path}") from exc
+        except json.JSONDecodeError as exc:
+            raise FormDefinitionError(f"invalid form definition {path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise FormDefinitionError(f"invalid form definition {path}: top level must be an object")
+        try:
+            pdf = _PdfConfig.model_validate(raw.get("pdf") or {})
+            pdf_template = self._pdf_template(path, pdf.template)
+            # 승인·활성 상태는 파일이 아니라 배포 사실(양식 디렉터리)로 정한다.
+            return from_json_dict(FormSchema, {
+                **{key: value for key, value in raw.items() if key not in _DEPLOYMENT_KEYS},
+                "status": SchemaStatus.ACTIVE,
+                "approved_by": f"form-definition:{path.parent.name}",
+                "approved_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc),
+                "pdf_template": pdf_template,
+                "pdf_meta": [(key, placement) for key, placement in (pdf.meta or {}).items()],
+            })
         except ValidationError as exc:
             raise FormDefinitionError(f"invalid form definition {path}: {exc}") from exc
-        pdf = definition.pdf or _PdfConfig()
-        pdf_template = None
-        if pdf.template:
-            template_path = (path.parent / pdf.template).resolve()
-            if path.parent.resolve() not in template_path.parents or not template_path.is_file():
-                raise FormDefinitionError(f"PDF template must be an existing file in the form directory: {path}")
-            pdf_template = str(template_path)
-        schema = from_json_dict(FormSchema, {
-            **definition.model_dump(exclude={"pdf"}),
-            "status": SchemaStatus.ACTIVE,
-            "approved_by": f"form-definition:{path.parent.name}",
-            "approved_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc),
-            "pdf_template": pdf_template,
-            "pdf_meta": [(key, placement.model_dump()) for key, placement in (pdf.meta or {}).items()],
-        })
-        try:
-            validate_schema_structure(schema)
-        except SchemaValidationError as exc:
-            raise FormDefinitionError(f"{path}: {exc}") from exc
-        return schema
+
+    @staticmethod
+    def _pdf_template(path: Path, template: str | None) -> str | None:
+        """PDF 양식 파일 경로다. 양식 디렉터리 밖이거나 없는 파일은 거부한다."""
+        if not template:
+            return None
+        template_path = (path.parent / template).resolve()
+        if path.parent.resolve() not in template_path.parents or not template_path.is_file():
+            raise FormDefinitionError(f"PDF template must be an existing file in the form directory: {path}")
+        return str(template_path)

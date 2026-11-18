@@ -1,10 +1,10 @@
-"""양식 필수 항목을 보고서 검증 MCP 기준으로 변환해 초안 완결성을 검증한다."""
+"""초안의 양식 완결성을 검증한다: 필수 필드는 로컬에서, 양식별 추가 기준은 보고서 검증 MCP로."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from n_note_ai_service_layers import settings
+from n_note_ai_service_layers.settings import DEFAULT_REPORT_VALIDATION_TOOL
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.report_validation import (
     ReportValidationCriterion,
@@ -21,27 +21,69 @@ _STATUSES = {"satisfied", "missing", "insufficient", "uncertain"}
 
 
 class FormReportValidationFlow:
-    """Gateway의 report 도구로 섹션별 필수 항목 작성 여부를 검증한다.
+    """양식 완결성을 검증한다.
 
-    입력: Gateway client와 사용할 도구 이름이다.
-    출력: 섹션·추가 기준별 ``satisfied/missing/insufficient/uncertain`` 결과이며 초안을 수정하지 않는다.
+    - 섹션별 필수 필드: 초안 값이 있는지 로컬에서 판정한다. 결과는 초안 문서만으로 정해지므로 MCP를 거치지 않는다
+      (Gateway 장애와 무관하게 항상 결과가 있다).
+    - 양식별 추가 기준(``validation_criteria``): 필드만으로 판정할 수 없으므로 Gateway의 report 도구에 맡긴다.
+
+    출력: 기준별 ``satisfied/missing/insufficient/uncertain``이며 초안을 수정하지 않는다.
     """
 
-    def __init__(self, gateway: McpGatewayClient, tool_name: str | None = None) -> None:
+    def __init__(self, gateway: McpGatewayClient, tool_name: str | None = DEFAULT_REPORT_VALIDATION_TOOL) -> None:
+        """``tool_name``이 ``None``이면 양식별 추가 기준 검증을 생략한다(필수 항목 판정은 계속)."""
         self.gateway = gateway
-        self.tool_name = tool_name if tool_name is not None else settings.get().report_validation_tool_name
+        self.tool_name = tool_name
 
-    def validate(self, schema: FormSchema, document: DraftDocument, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> ReportValidationResult:
-        standard = self.standard_for(schema)
-        if not self.tool_name or not standard["criteria"]:
-            return ReportValidationResult("skipped")
+    def validate(
+        self, schema: FormSchema, document: DraftDocument, request_id: str | None = None,
+        catalog: tuple[dict[str, Any], ...] | None = None, gateway_available: bool = True,
+    ) -> ReportValidationResult:
+        """``gateway_available=False``(workflow가 catalog 조회에 실패)면 추가 기준은 ``unavailable``로 둔다."""
+        local = self.completeness(schema, document)
+        extra = [dict(item) for item in schema.validation_criteria]
+        if not extra:
+            return ReportValidationResult("ok", local, _summary(local)) if local else ReportValidationResult("skipped")
+        status, remote = self._remote(extra, schema, document, request_id, catalog, gateway_available)
+        criteria = (*local, *remote)
+        return ReportValidationResult(status, criteria, _summary(criteria), self.tool_name)
+
+    @staticmethod
+    def completeness(schema: FormSchema, document: DraftDocument) -> tuple[ReportValidationCriterion, ...]:
+        """섹션마다 필수 필드가 모두 채워졌는지다(모두 ``satisfied``, 일부 ``insufficient``, 전혀 없으면 ``missing``)."""
+        criteria: list[ReportValidationCriterion] = []
+        for section in ordered_sections(schema):
+            required = [field for field in ordered_fields(section) if field.required]
+            if not required:
+                continue
+            elements = tuple(
+                ReportValidationElement(field.field_id, "satisfied" if _filled(document, field.field_id) else "missing", field.field_id)
+                for field in required
+            )
+            filled = sum(element.status == "satisfied" for element in elements)
+            status = "satisfied" if filled == len(elements) else "insufficient" if filled else "missing"
+            criteria.append(ReportValidationCriterion(
+                f"section:{section.section_id}", f"{section.label or section.section_id}의 필수 항목이 작성되어야 한다.", status, elements,
+            ))
+        return tuple(criteria)
+
+    def _remote(
+        self, criteria: list[dict[str, Any]], schema: FormSchema, document: DraftDocument, request_id: str | None,
+        catalog: tuple[dict[str, Any], ...] | None, gateway_available: bool,
+    ) -> tuple[str, tuple[ReportValidationCriterion, ...]]:
+        """양식별 추가 기준을 report 도구로 검증한다. 반환: (상태, 기준 결과)."""
+        if not self.tool_name:
+            return "skipped", ()
+        if not gateway_available:
+            return "unavailable", ()
         if catalog is None:
             try:
                 catalog = self.gateway.discover(request_id)
             except McpGatewayError:
-                return ReportValidationResult("unavailable", tool_name=self.tool_name)
+                return "unavailable", ()
         if not any(tool.get("name") == self.tool_name for tool in catalog):
-            return ReportValidationResult("unsupported", tool_name=self.tool_name)
+            return "unsupported", ()
+        standard = self.standard_for(schema, criteria)
         arguments = {
             "report": {"text": document.text},
             "validation_standard": standard,
@@ -50,27 +92,13 @@ class FormReportValidationFlow:
         try:
             result = self.gateway.call_tool(self.tool_name, arguments, request_id)
         except McpGatewayError:
-            return ReportValidationResult("unavailable", tool_name=self.tool_name)
-        return self._parse(result.get("structuredContent"), standard)
+            return "unavailable", ()
+        parsed = self._parse(result.get("structuredContent"), standard)
+        return ("ok", parsed) if parsed is not None else ("unsupported", ())
 
     @staticmethod
-    def standard_for(schema: FormSchema) -> dict[str, Any]:
-        """양식 섹션의 필수 필드와 양식별 추가 기준을 검증 기준 JSON으로 만든다."""
-        criteria: list[dict[str, Any]] = []
-        for section in ordered_sections(schema):
-            required = [field for field in ordered_fields(section) if field.required]
-            if not required:
-                continue
-            criteria.append({
-                "criterion_id": f"section:{section.section_id}",
-                "description": f"{section.label or section.section_id}의 필수 항목이 작성되어야 한다.",
-                "category": "form_completeness",
-                "required_elements": [
-                    {"element_id": field.field_id, "description": field.label or field.field_id, "field_id": field.field_id}
-                    for field in required
-                ],
-            })
-        criteria.extend(dict(item) for item in schema.validation_criteria)
+    def standard_for(schema: FormSchema, criteria: list[dict[str, Any]]) -> dict[str, Any]:
+        """report 도구에 보낼 검증 기준 JSON이다(양식별 추가 기준만 담는다)."""
         return {
             "schema_version": STANDARD_SCHEMA_VERSION,
             "standard_id": f"n-note-form:{schema.schema_id}",
@@ -115,9 +143,11 @@ class FormReportValidationFlow:
             assessed.append(entry)
         return {"criteria": assessed}
 
-    def _parse(self, payload: Any, standard: dict[str, Any]) -> ReportValidationResult:
+    @staticmethod
+    def _parse(payload: Any, standard: dict[str, Any]) -> tuple[ReportValidationCriterion, ...] | None:
+        """report 도구 응답을 기준 결과로 바꾼다. 형식이 다르면 ``None``이다."""
         if not isinstance(payload, dict) or not isinstance(payload.get("criteria"), list):
-            return ReportValidationResult("unsupported", tool_name=self.tool_name)
+            return None
         field_ids = {
             element["element_id"]: element.get("field_id")
             for criterion in standard["criteria"]
@@ -128,11 +158,11 @@ class FormReportValidationFlow:
         for item in payload["criteria"]:
             finding = item.get("finding") if isinstance(item, dict) else None
             if not isinstance(finding, dict) or finding.get("status") not in _STATUSES or not isinstance(item.get("elements"), list):
-                return ReportValidationResult("unsupported", tool_name=self.tool_name)
+                return None
             elements: list[ReportValidationElement] = []
             for element in item["elements"]:
                 if not isinstance(element, dict) or element.get("status") not in _STATUSES or not isinstance(element.get("id"), str):
-                    return ReportValidationResult("unsupported", tool_name=self.tool_name)
+                    return None
                 elements.append(ReportValidationElement(element["id"], element["status"], field_ids.get(element["id"]), tuple(str(w) for w in element.get("warnings", []))))
             criteria.append(ReportValidationCriterion(
                 str(item.get("criterion_id")),
@@ -141,5 +171,19 @@ class FormReportValidationFlow:
                 tuple(elements),
                 tuple(str(w) for w in finding.get("warnings", [])),
             ))
-        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else None
-        return ReportValidationResult("ok", tuple(criteria), summary, self.tool_name)
+        return tuple(criteria)
+
+
+def _filled(document: DraftDocument, field_id: str) -> bool:
+    span = document.span_for(field_id)
+    return span is not None and bool(document.text[span.start:span.end].strip())
+
+
+def _summary(criteria: tuple[ReportValidationCriterion, ...]) -> dict[str, int]:
+    """상태별 개수다(기준과 그 요소를 함께 센다). report MCP의 summary와 같은 형식이다."""
+    counts = {status: 0 for status in ("satisfied", "missing", "insufficient", "uncertain")}
+    for criterion in criteria:
+        counts[criterion.status] += 1
+        for element in criterion.elements:
+            counts[element.status] += 1
+    return counts

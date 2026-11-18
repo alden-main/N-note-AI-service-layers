@@ -10,12 +10,12 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, VersionConflict
 from n_note_ai_service_layers.observability import get_logger, log_event
+from n_note_ai_service_layers.services.clock import now_utc
 
 JOB_COLLECTION = "workflow_jobs"
 IDEMPOTENCY_COLLECTION = "workflow_job_keys"
@@ -39,7 +39,15 @@ class JobFailure(RuntimeError):
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc().isoformat()
+
+
+def _with_current_stage(job: dict[str, Any]) -> list[str]:
+    """진행 중이던 단계까지 넣은 완료 단계 목록이다."""
+    completed = list(job.get("completed_stages", []))
+    if job.get("stage") and job["stage"] not in completed:
+        completed.append(job["stage"])
+    return completed
 
 
 class JobStore:
@@ -104,11 +112,7 @@ class JobStore:
 
     def stage(self, job_id: str, stage: str) -> None:
         stored = self.store.get(JOB_COLLECTION, job_id)
-        current = stored.payload if stored else {}
-        completed = list(current.get("completed_stages", []))
-        if current.get("stage") and current["stage"] not in completed:
-            completed.append(current["stage"])
-        self.update(job_id, stage=stage, completed_stages=completed)
+        self.update(job_id, stage=stage, completed_stages=_with_current_stage(stored.payload if stored else {}))
 
 
 class JobRunner:
@@ -158,10 +162,7 @@ class JobRunner:
             self.jobs.update(job_id, status="failed", finished_at=_now(), error={"code": "internal_error", "message": "nursing note workflow failed"})
             log_event(_logger, "job_failed", job_id=job_id, code="internal_error", error=type(exc).__name__)
             return
-        current = self.jobs.get(job_id) or {}
-        completed = list(current.get("completed_stages", []))
-        if current.get("stage") and current["stage"] not in completed:
-            completed.append(current["stage"])
+        completed = _with_current_stage(self.jobs.get(job_id) or {})
         self.jobs.update(job_id, status="succeeded", stage=None, completed_stages=completed, finished_at=_now(), result=result)
         log_event(_logger, "job_succeeded", job_id=job_id, seconds=round(time.perf_counter() - started, 3))
 

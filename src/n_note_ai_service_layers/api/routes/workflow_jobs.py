@@ -14,7 +14,6 @@ import json
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -22,6 +21,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
+from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.api import mappers
 from n_note_ai_service_layers.api.deps import get_nursing_note_workflow, get_workflow_context_flow, read_validated_audio
@@ -48,6 +48,13 @@ _STAGE_FAILURES = {
     "redaction": ("redaction_failed", "transcript de-identification failed; nothing was sent to external services"),
     "draft_generation": ("draft_generation_unavailable", "draft generation is unavailable"),
 }
+
+
+def stage_failure(error: Exception) -> tuple[str, str]:
+    """실패를 작업 상태의 (code, message)로 바꾼다. ``WorkflowStageError``는 단계별 코드, 그 밖의 예외는 ``internal_error``다."""
+    if isinstance(error, WorkflowStageError):
+        return _STAGE_FAILURES.get(error.stage, ("workflow_failed", "nursing note workflow failed"))
+    return "internal_error", "form draft failed"
 
 
 def resolve_workflow_form(schema_id: str | None, purpose: str | None) -> tuple[str, str]:
@@ -110,8 +117,7 @@ def _workflow_job(
         try:
             result = workflow.generate(snapshot, audio, schema, known_identifiers=(patient_id, encounter_id), progress=progress)
         except WorkflowStageError as exc:
-            code, message = _STAGE_FAILURES.get(exc.stage, ("workflow_failed", "nursing note workflow failed"))
-            raise JobFailure(code, message) from exc
+            raise JobFailure(*stage_failure(exc)) from exc
         progress("saving_draft")
         return _save_draft(result, schema, audio.trace_id, patient_id, encounter_id)
     return work
@@ -150,10 +156,7 @@ def _multi_form_workflow_job(
                     return
                 except Exception as exc:
                     outcome = exc
-            if isinstance(outcome, WorkflowStageError):
-                code, message = _STAGE_FAILURES.get(outcome.stage, ("workflow_failed", "nursing note workflow failed"))
-            else:
-                code, message = "internal_error", "form draft failed"
+            code, message = stage_failure(outcome)
             log_event(_logger, "form_draft_failed", trace_id=audio.trace_id, schema_id=schema.schema_id, code=code, error=type(outcome).__name__)
             update_form(index, status="failed", stage=None, error={"code": code, "message": message})
 
@@ -163,8 +166,7 @@ def _multi_form_workflow_job(
                 on_form_stage=on_stage, on_form_done=on_done, max_parallel=settings.get().form_concurrency,
             )
         except WorkflowStageError as exc:
-            code, message = _STAGE_FAILURES.get(exc.stage, ("workflow_failed", "nursing note workflow failed"))
-            raise JobFailure(code, message) from exc
+            raise JobFailure(*stage_failure(exc)) from exc
         if not any(responses):
             raise JobFailure("all_forms_failed", "every selected form failed; see forms[].error")
         with lock:
@@ -242,7 +244,7 @@ async def prepare_workflow_forms(
     for form_id, version in requested:
         form_id, form_purpose = resolve_workflow_form(form_id, purpose)
         resolved_purpose = form_purpose
-        query = ClinicalContextQuery(patient_id, encounter_id, form_purpose, datetime.now(timezone.utc), form_id, trace_id, version)
+        query = ClinicalContextQuery(patient_id, encounter_id, form_purpose, now_utc(), form_id, trace_id, version)
         try:
             snapshot = await run_in_threadpool(context_flow.build, query)
             selected_schema = context_flow.registry.resolve_active(form_id, form_purpose, version)

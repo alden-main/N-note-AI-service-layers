@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from uuid import uuid4
 
+from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers.adapters.document_store import DocumentStore
 from n_note_ai_service_layers.api.schemas import BridgeHandoffRequest, HandoffEnvelope
 
@@ -26,7 +26,7 @@ class HandoffStore:
             **handoff.model_dump(),
             handoff_id=str(uuid4()),
             delivery_status="pending",
-            created_at=datetime.now(timezone.utc),
+            created_at=now_utc(),
         )
         self.store.put(HANDOFF_COLLECTION, envelope.handoff_id, envelope.model_dump(mode="json"), expected_version=0)
         return envelope

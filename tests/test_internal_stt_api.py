@@ -10,20 +10,27 @@ from n_note_ai_service_layers.api.app import create_app
 from n_note_ai_service_layers.api.deps import get_gateway_client, get_speech_to_text_provider, get_transcript_redactor
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermOccurrence, GatewaySuggestion, GatewayTermVerificationResult
+from n_note_ai_service_layers.api import deps
 from n_note_ai_service_layers.api.routes import internal_stt
+from n_note_ai_service_layers.contracts.audio import Transcript
+from n_note_ai_service_layers.services import nursing_note_workflow
+
+
+def fake_review(verify):
+    """Gateway 용어 검토 흐름 대역이다(catalog 조회는 항상 성공)."""
+    return lambda gateway: SimpleNamespace(gateway=SimpleNamespace(discover=lambda request_id=None: ()), verify=verify)
 
 
 def setup_review(app, monkeypatch, result=None):
     app.dependency_overrides[get_transcript_redactor] = lambda: TranscriptRedactor()
     app.dependency_overrides[get_gateway_client] = lambda: object()
-    monkeypatch.setattr(internal_stt, "GatewayTermVerificationFlow", lambda gateway: SimpleNamespace(
-        verify=lambda *args: result or GatewayTermVerificationResult("transcript", "ok")))
+    monkeypatch.setattr(deps, "get_term_verification", fake_review(lambda *args: result or GatewayTermVerificationResult("transcript", "ok")))
 
 
 def test_internal_stt_multipart_and_output_validation(monkeypatch):
     app = create_app()
     setup_review(app, monkeypatch)
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="고혈압이 있습니다."))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("고혈압이 있습니다.", "fake", "fake-stt"))
     monkeypatch.setattr(internal_stt, "_extract", lambda transcript, template, hints: {
         "fields": {"history": "고혈압", "choice": {"status": "없음", "detail": "잘못된 상세"}, "allergy": ["약", "허위"]},
         "relatedSentences": {"history": [0, 7]},
@@ -42,7 +49,7 @@ def test_internal_stt_multipart_and_output_validation(monkeypatch):
 def test_internal_stt_extraction_failure_preserves_transcript(monkeypatch):
     app = create_app()
     setup_review(app, monkeypatch)
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="전사문"))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("전사문", "fake", "fake-stt"))
     def fail(*args):
         raise RuntimeError()
     monkeypatch.setattr(internal_stt, "_extract", fail)
@@ -56,7 +63,7 @@ def test_redaction_and_term_hints_precede_extraction(monkeypatch):
     app = create_app()
     occurrence = GatewayTermOccurrence("transcript", "medical", 0, 3, "고혈압", "고혈압", (GatewaySuggestion("고혈압증"),), category="medical_term")
     setup_review(app, monkeypatch, GatewayTermVerificationResult("transcript", "ok", (occurrence,)))
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="홍길동님 고혈압"))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("홍길동님 고혈압", "fake", "fake-stt"))
     seen = {}
     def extract(sentences, template, hints):
         seen.update(sentences=sentences, hints=hints)
@@ -176,29 +183,35 @@ def test_out_of_option_value_stays_a_blank_field_not_a_failed_form(monkeypatch):
 def test_malformed_extraction_returns_empty_form_and_logs_failure(monkeypatch):
     app = create_app()
     setup_review(app, monkeypatch)
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="흑색변으로 입원했습니다."))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("흑색변으로 입원했습니다.", "fake", "fake-stt"))
     chat_client(monkeypatch, json.dumps(NESTED, ensure_ascii=False))
     logs = []
-    monkeypatch.setattr(internal_stt, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
+    capture_stages(monkeypatch, logs)
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
     assert response.status_code == 200
     assert response.json()["forms"] == [{"templateType": "HAND_OVER", "templateName": "인계", "fields": {}, "relatedSentences": {}}]
     assert logs == [
         ("stt", {"chars": 13}), ("redaction", {"replacements": 0}),
-        ("transcript_term_review", {"status": "ok", "candidates": 0}), ("form_extraction", "ValueError"),
+        ("transcript_term_review", {"status": "ok", "candidates": 0, "hints_deferred": False}), ("form_extraction", "ValueError"),
     ]
 
 
 def test_extraction_metrics_count_filled_fields_only(monkeypatch):
     app = create_app()
     setup_review(app, monkeypatch)
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="흑색변으로 입원했습니다."))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("흑색변으로 입원했습니다.", "fake", "fake-stt"))
     chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
     logs = []
-    monkeypatch.setattr(internal_stt, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
+    capture_stages(monkeypatch, logs)
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
     assert response.status_code == 200
     assert logs[-1] == ("form_extraction", {"fields": 5, "filled": 4, "with_evidence": 1})
+
+
+def capture_stages(monkeypatch, logs):
+    """공통 단계(TranscriptPreparation)와 서식 추출(internal_stt)의 단계 로그를 함께 모은다."""
+    for module in (nursing_note_workflow, internal_stt):
+        monkeypatch.setattr(module, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
 
 
 @contextmanager
@@ -215,7 +228,7 @@ def observed_stage(logs, logger, trace_id, name, **fields):
 def test_redaction_or_gateway_failure_stops_extraction(monkeypatch):
     app = create_app()
     setup_review(app, monkeypatch, GatewayTermVerificationResult("transcript", "unavailable"))
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="홍길동님"))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("홍길동님", "fake", "fake-stt"))
     def fail(*args):
         raise AssertionError("extraction must not run")
     monkeypatch.setattr(internal_stt, "_extract", fail)
@@ -243,19 +256,20 @@ def test_stt_uses_nursing_context_prompt_when_setting_is_blank(monkeypatch):
 def test_term_review_status_is_logged_when_it_stops_extraction(monkeypatch):
     app = create_app()
     setup_review(app, monkeypatch, GatewayTermVerificationResult("transcript", "unsupported"))
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="전사문"))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("전사문", "fake", "fake-stt"))
     logs = []
-    monkeypatch.setattr(internal_stt, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
+    # 공통 단계(STT·비식별화·검토) 로그는 TranscriptPreparation이 남긴다.
+    monkeypatch.setattr(nursing_note_workflow, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
     assert response.status_code == 503 and response.json() == {"detail": "term review is unavailable"}
-    assert logs == [("stt", {"chars": 3}), ("redaction", {"replacements": 0}), ("transcript_term_review", {"status": "unsupported", "candidates": 0})]
+    assert logs == [("stt", {"chars": 3}), ("redaction", {"replacements": 0}), ("transcript_term_review", {"status": "unsupported", "candidates": 0, "hints_deferred": False})]
 
 
 def test_forms_are_extracted_concurrently_and_keep_request_order(monkeypatch):
     import threading
     app = create_app()
     setup_review(app, monkeypatch)
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="전사문"))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("전사문", "fake", "fake-stt"))
     # 두 양식이 동시에 실행 중이어야 barrier를 통과한다. 순차 실행이면 BrokenBarrierError로 빈 서식이 된다.
     barrier = threading.Barrier(2, timeout=5)
     def extract(sentences, template, hints):
@@ -302,9 +316,9 @@ def _slow_review(app, monkeypatch, status):
         return GatewayTermVerificationResult("transcript", status)
     app.dependency_overrides[get_transcript_redactor] = lambda: TranscriptRedactor()
     app.dependency_overrides[get_gateway_client] = lambda: object()
-    monkeypatch.setattr(internal_stt, "GatewayTermVerificationFlow", lambda gateway: SimpleNamespace(verify=verify))
+    monkeypatch.setattr(deps, "get_term_verification", fake_review(verify))
     monkeypatch.setenv("N_NOTE_TERM_HINT_BUDGET_SECONDS", "0.05")
-    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: SimpleNamespace(text="전사문"))
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("전사문", "fake", "fake-stt"))
     seen = []
     def extract(sentences, template, hints):
         seen.append(hints)

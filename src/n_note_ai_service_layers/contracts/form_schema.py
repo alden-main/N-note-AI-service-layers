@@ -1,13 +1,27 @@
-"""간호 양식 스키마의 구조, 검토 이력 및 브리지 전달 계약을 정의한다."""
+"""간호 양식 스키마의 구조, 검토 이력 및 브리지 전달 계약을 정의한다.
+
+양식 구조의 유일한 정의다. 배포 양식 파일(``form.json``), 양식 등록 API, 저장소 복원이 모두 이 계약으로 검증한다.
+pydantic dataclass라 생성·``dataclasses.replace`` 때마다 구조 규칙(필드 ID 중복, 조건·매핑 참조, enum 선택지,
+PDF 배치 위치)을 검사하고, 어기면 ``pydantic.ValidationError``(``ValueError``)다.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import BeforeValidator, Field, StrictInt, StringConstraints, model_validator
+from pydantic.dataclasses import dataclass
 
 from n_note_ai_service_layers.contracts.codec import IsoDatetime
+
+# 초안 출력 스키마(LLM)·PDF·검토 화면이 처리하는 필드 자료형이다.
+FieldType = Literal["string", "text", "integer", "number", "boolean", "array", "date", "datetime", "enum"]
+# 앞뒤 공백을 지우고 빈 문자열을 허용하지 않는 식별자·표시 문자열이다.
+Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+DisplayOrder = Annotated[StrictInt, Field(ge=0)]
 
 
 class SchemaStatus(StrEnum):
@@ -38,6 +52,12 @@ class PdfPlacement:
     height: float | None = None
     font_size: float = 10.0
 
+    @model_validator(mode="after")
+    def _located(self) -> PdfPlacement:
+        if not self.field_name and not self.has_box:
+            raise ValueError("pdf placement requires field_name or page/x/y/width/height")
+        return self
+
     @property
     def has_box(self) -> bool:
         return None not in (self.page, self.x, self.y, self.width, self.height)
@@ -50,17 +70,23 @@ class FormField:
     입력: 필드 ID·자료형, 필수 여부, AI 허용 여부, 연결 사실 ID와 작성 지침·선택지·PDF 배치이다.
     출력: 섹션과 스키마를 구성하는 불변 필드 정의이다.
     """
-    field_id: str
-    type: str
+    field_id: Text
+    type: FieldType = "text"
     required: bool = False
     llm_allowed: bool = True
-    fact_id: str | None = None
-    conditional_required_when: str | None = None
-    label: str | None = None
-    display_order: int | None = None
-    description: str | None = None
-    options: tuple[str, ...] = ()
+    fact_id: Text | None = None
+    conditional_required_when: Text | None = None
+    label: Text | None = None
+    display_order: DisplayOrder | None = None
+    description: Text | None = None
+    options: tuple[Annotated[str, BeforeValidator(str)], ...] = ()
     pdf: PdfPlacement | None = None
+
+    @model_validator(mode="after")
+    def _enum_has_options(self) -> FormField:
+        if self.type == "enum" and not self.options:
+            raise ValueError("enum field requires options")
+        return self
 
 
 @dataclass(frozen=True)
@@ -70,10 +96,10 @@ class FormSection:
     입력: 섹션 ID와 ``FormField`` 튜플이다.
     출력: ``FormSchema``에 포함되는 불변 섹션 정의이다.
     """
-    section_id: str
-    fields: tuple[FormField, ...]
-    label: str | None = None
-    display_order: int | None = None
+    section_id: Text
+    fields: Annotated[tuple[FormField, ...], Field(min_length=1)]
+    label: Text | None = None
+    display_order: DisplayOrder | None = None
 
 
 @dataclass(frozen=True)
@@ -83,8 +109,8 @@ class BridgeMapping:
     입력: 스키마 필드 ID와 외부 출력 키이다.
     출력: 핸드오프 투영에 사용하는 불변 매핑 정의이다.
     """
-    field_id: str
-    output_key: str
+    field_id: Text
+    output_key: Text
 
 
 @dataclass(frozen=True)
@@ -94,9 +120,9 @@ class FormSchema:
     입력: 식별자·버전·목적, 섹션, 검증 규칙, 브리지 매핑 및 승인 메타데이터이다.
     출력: 사실 조회, LLM 투영, 검증과 핸드오프의 기준이 되는 불변 스키마이다.
     """
-    schema_id: str
-    version: str
-    purpose: str
+    schema_id: Text
+    version: Text
+    purpose: Text
     sections: tuple[FormSection, ...]
     validation_rule_ids: tuple[str, ...] = ()
     bridge_mapping: tuple[BridgeMapping, ...] = ()
@@ -104,13 +130,26 @@ class FormSchema:
     approved_by: str | None = None
     approved_at: IsoDatetime | None = None
     freshness_windows_minutes: dict[str, int] = field(default_factory=dict)
-    title: str | None = None
-    instructions: str | None = None
+    title: Text | None = None
+    instructions: Text | None = None
     pdf_template: str | None = None
     # 양식 PDF 위에 환자 ID·확정자 등 확정 메타데이터를 그릴 위치다.
     pdf_meta: tuple[tuple[str, PdfPlacement], ...] = ()
     # report MCP의 report-validation-standard/v1 criteria에 추가할 양식별 기준이다.
     validation_criteria: tuple[dict[str, Any], ...] = ()
+
+    @model_validator(mode="after")
+    def _consistent(self) -> FormSchema:
+        """필드 ID는 양식 전체에서 유일하고, 조건부 필수·브리지 매핑은 있는 필드만 가리킨다."""
+        field_ids = [item.field_id for item in self.fields]
+        if len(field_ids) != len(set(field_ids)):
+            raise ValueError("field IDs must be unique")
+        known = set(field_ids)
+        if any(item.conditional_required_when and item.conditional_required_when not in known for item in self.fields):
+            raise ValueError("conditional rule references an unknown field")
+        if any(mapping.field_id not in known for mapping in self.bridge_mapping):
+            raise ValueError("bridge mapping must reference a schema field")
+        return self
 
     @property
     def display_title(self) -> str:

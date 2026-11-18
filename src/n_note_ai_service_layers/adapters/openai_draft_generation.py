@@ -1,20 +1,29 @@
-"""OpenAI 구조화 출력으로 간호 기록 초안을 생성하는 어댑터이다."""
+"""구조화 출력으로 간호기록 초안을 생성하는 어댑터다.
+
+LLM 호출(API 형식·도구 왕복)은 ``llm_completion``이 맡고, 여기에는 초안에만 해당하는 지침·출력 스키마·결과 검증만 있다.
+``OpenAiDraftGenerationAdapter``(Responses API)와 ``OpenAiChatDraftGenerationAdapter``(Chat Completions)는 어떤 API로
+보낼지만 다르다.
+"""
 
 from __future__ import annotations
 
 import json
-import time
-from dataclasses import dataclass, field
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
+from n_note_ai_service_layers.adapters.llm_completion import (
+    ChatCompletion,
+    GenerationOptions,
+    ResponsesCompletion,
+    StructuredCompletion,
+    StructuredOutput,
+    ToolExecutor,
+    json_text,
+)
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema
-from n_note_ai_service_layers.services import executors
-from n_note_ai_service_layers.services.mcp_gateway_client import (
-    McpGatewayClient,
-    McpGatewayError,
-    McpGatewayToolError,
-)
+from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
 BASE_INSTRUCTIONS = (
     "You write Korean nursing records. Fill the requested nursing form only from the supplied payload "
@@ -42,95 +51,33 @@ MAX_PARALLEL_TOOL_CALLS = 4
 TOOL_INSTRUCTION = " You may call the provided dictionary tools to confirm a term before using it."
 
 
-@dataclass(frozen=True)
-class GenerationOptions:
-    """LLM 요청 공통 옵션이다(``N_NOTE_LLM_MAX_TOKENS``·``N_NOTE_LLM_TEMPERATURE``·``N_NOTE_LLM_EXTRA_BODY``).
+class DraftGenerationAdapter:
+    """양식 허용 필드만 담은 ``DraftResult``를 만든다.
 
-    Responses·Chat 초안 어댑터와 동기 서식 추출(internal_stt)이 같은 규칙으로 요청에 넣는다.
+    입력: 구조화 출력 요청기(``completion``), 결과에 남길 모델명, 사전 도구 실행기(없으면 도구 없이)다.
     """
 
-    max_tokens: int | None = None
-    temperature: float | None = None
-    extra_body: dict[str, Any] = field(default_factory=dict)
-
-    def chat_kwargs(self) -> dict[str, Any]:
-        return self._kwargs("max_tokens")
-
-    def responses_kwargs(self) -> dict[str, Any]:
-        return self._kwargs("max_output_tokens")
-
-    def _kwargs(self, max_tokens_key: str) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
-        if self.max_tokens is not None:
-            kwargs[max_tokens_key] = self.max_tokens
-        if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
-        if self.extra_body:
-            kwargs["extra_body"] = dict(self.extra_body)
-        return kwargs
-
-
-class OpenAiDraftGenerationAdapter:
-    """OpenAI 구조화 출력을 허용된 초안 필드로 제한해 생성한다.
-
-    입력: OpenAI 클라이언트, 모델명 및 프롬프트 버전이다.
-    출력: 생성 호출 시 허용 필드와 근거 참조만 담은 ``DraftResult``이다.
-    """
     def __init__(
-        self,
-        client: Any | None = None,
-        model: str = "gpt-4o-mini",
-        prompt_version: str = "draft-v2",
-        gateway_client: McpGatewayClient | None = None,
-        max_tool_calls: int = 6,
-        tool_timeout_seconds: float = 30.0,
-        max_tool_rounds: int = 2,
-        max_gateway_retries: int = 1,
-        allowed_tool_names: tuple[str, ...] | None = None,
-        options: GenerationOptions | None = None,
+        self, completion: StructuredCompletion, model_version: str, tools: ToolExecutor | None = None, prompt_version: str = "draft-v2",
     ) -> None:
-        if client is None:
-            from openai import OpenAI
-            client = OpenAI()
-        self._client = client
-        self._options = options or GenerationOptions()
-        self._model = model
+        self.completion = completion
+        self.tools = tools
+        self._model = model_version
         self._prompt_version = prompt_version
-        self._gateway_client = gateway_client
-        self._max_tool_calls = max_tool_calls
-        # 도구 결과를 LLM에 돌려주는 왕복 횟수 상한이다. LLM 호출은 최대 ``1 + max_tool_rounds``번이다. 0이면 도구를 주지 않는다.
-        self._max_tool_rounds = max_tool_rounds
-        self._tool_timeout_seconds = tool_timeout_seconds
-        self._max_gateway_retries = max_gateway_retries
-        self._allowed_tool_names = allowed_tool_names
 
     def generate(self, payload: dict, schema: FormSchema) -> DraftResult:
-        """최소화된 LLM 입력으로 초안을 생성하고 스키마 허용 필드만 반환한다.
-
-        입력: ``payload``는 전사문과 사용 가능한 사실이고, ``schema``는 허용 필드를 정한다.
-        출력: 검증된 구조화 응답을 변환한 ``DraftResult``이며, 잘못된 응답은 ``ValueError``를 발생시킨다.
-        """
-        tools = self._model_tools()
-        request: dict[str, Any] = {
-            "model": self._model,
-            "instructions": self._instructions(schema, bool(tools)),
-            "input": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            "text": {"format": self._output_format(schema)},
-            # 전사문·초안을 OpenAI 쪽에 보관하지 않는다. 그래서 도구 왕복은 previous_response_id 대신 입력 이력을 직접 넘긴다.
-            "store": False,
-            **self._options.responses_kwargs(),
-        }
-        if tools:
-            request["tools"] = tools
-        response = self._client.responses.create(**request)
-        if tools:
-            response = self._run_tool_loop(response, request)
-        return self._draft_result(getattr(response, "output_text", None), schema)
+        """최소화된 LLM 입력으로 초안을 생성하고 스키마 허용 필드만 반환한다. 잘못된 응답은 ``ValueError``다."""
+        output = self._output_format(schema)
+        text = self.completion.complete(
+            self._instructions(schema), json.dumps(payload, ensure_ascii=False), StructuredOutput(output["name"], output["schema"]),
+            self.tools, TOOL_INSTRUCTION, accept_unconstrained=lambda content: self._unconstrained(content, output["schema"]),
+        )
+        return self._draft_result(text, schema)
 
     @staticmethod
-    def _instructions(schema: FormSchema, tools_enabled: bool = False) -> str:
-        """공통 작성 지침에 (도구가 있으면) 도구 안내, 양식 제목과 양식별 지침을 덧붙인다."""
-        instructions = BASE_INSTRUCTIONS + (TOOL_INSTRUCTION if tools_enabled else "") + f" The form is '{schema.display_title}'."
+    def _instructions(schema: FormSchema) -> str:
+        """공통 작성 지침에 양식 제목과 양식별 지침을 덧붙인다(도구 안내는 도구를 줄 때 요청기가 붙인다)."""
+        instructions = BASE_INSTRUCTIONS + f" The form is '{schema.display_title}'."
         if schema.instructions:
             instructions += " Form-specific instructions: " + schema.instructions
         return instructions
@@ -159,106 +106,29 @@ class OpenAiDraftGenerationAdapter:
             prompt_version=self._prompt_version,
         )
 
-    def _model_tools(self) -> list[dict[str, Any]]:
-        """Gateway catalog의 허용 도구만 반환하고, Gateway 장애 시 도구 없이 초안을 만든다."""
-        if self._gateway_client is None or self._max_tool_rounds <= 0:
-            return []
-        try:
-            self._gateway_client.discover()
-        except McpGatewayError:
-            return []
-        return self._gateway_client.model_tools(self._allowed_tool_names)
+    @staticmethod
+    def _unconstrained(content: Any, output_schema: dict[str, Any]) -> str | None:
+        """문법 제약 없이 생성된 답(Chat 도구 단계)이 출력 스키마를 만족할 때만 쓴다. 아니면 ``None``이다.
 
-    def _run_tool_loop(self, response: Any, request: dict[str, Any]) -> Any:
-        """도구 결과를 돌려주며 초안을 받는다. 왕복 수·Gateway 호출 수·경과 시간에 상한을 둔다.
-
-        상한에 닿으면 마지막 요청을 ``tool_choice="none"``으로 보내 모델이 도구를 더 부르지 못하고 초안을 내게 한다.
-        이렇게 하지 않으면 상한 뒤에도 모델이 도구를 계속 요청해 LLM 왕복이 끝없이 늘어날 수 있다.
+        생략된 필드는 null로 본다(strict 출력에서도 null 필드는 초안에 남지 않는다).
         """
-        assert self._gateway_client is not None
-        started = time.monotonic()
-        calls = 0
-        rounds = 0
-        while True:
-            function_calls = [item for item in getattr(response, "output", []) if _value(item, "type") == "function_call"]
-            if not function_calls or request.get("tool_choice") == "none":
-                return response
-            rounds += 1
-            results, calls = self._run_tool_calls([(_value(call, "name"), _value(call, "arguments")) for call in function_calls], started, calls)
-            # store=False라 서버가 앞 응답을 기억하지 않는다. 모델이 낸 function_call과 그 결과를 이력에 이어 붙인다.
-            echoed = [
-                {"type": "function_call", "call_id": str(_value(call, "call_id")), "name": _value(call, "name"), "arguments": _value(call, "arguments")}
-                for call in function_calls
-            ]
-            outputs = [
-                {"type": "function_call_output", "call_id": str(_value(call, "call_id")), "output": json.dumps(result, ensure_ascii=False)}
-                for call, result in zip(function_calls, results)
-            ]
-            next_request = dict(request)
-            next_request["input"] = [*request["input"], *echoed, *outputs]
-            if self._tool_budget_spent(rounds, calls, started):
-                next_request["tool_choice"] = "none"
-            request = next_request
-            response = self._client.responses.create(**next_request)
-
-    def _tool_budget_spent(self, rounds: int, calls: int, started: float) -> bool:
-        """도구 왕복·호출 수 또는 시간 상한에 닿았는지다. 닿으면 다음 LLM 요청이 마지막이다."""
-        return rounds >= self._max_tool_rounds or calls >= self._max_tool_calls or time.monotonic() - started >= self._tool_timeout_seconds
-
-    def _run_tool_calls(self, calls: list[tuple[Any, Any]], started: float, used: int) -> tuple[list[dict[str, Any]], int]:
-        """한 응답의 도구 호출을 상한(횟수·시간) 안에서 동시에 Gateway로 보낸다.
-
-        입력 순서대로 결과를 반환하고, 상한을 넘은 호출에는 ``tool_limit_reached``로 답한다.
-        두 번째 값은 지금까지 사용한 호출 수다.
-        """
-        results: list[dict[str, Any]] = [{"error": "tool_limit_reached"} for _ in calls]
-        permitted: list[int] = []
-        for index in range(len(calls)):
-            if used >= self._max_tool_calls or time.monotonic() - started >= self._tool_timeout_seconds:
-                break
-            used += 1
-            permitted.append(index)
-        if len(permitted) > 1:
-            # 응답 하나의 도구 호출을 동시에 보낸다. 초안마다 최대 MAX_PARALLEL_TOOL_CALLS개다.
-            pool = executors.shared("llm-tool", executors.worker_parallelism() * MAX_PARALLEL_TOOL_CALLS)
-            outcomes = executors.map_ordered(pool, lambda index: self._call_gateway(*calls[index]), permitted[:MAX_PARALLEL_TOOL_CALLS])
-            outcomes += [self._call_gateway(*calls[index]) for index in permitted[MAX_PARALLEL_TOOL_CALLS:]]
-        else:
-            outcomes = [self._call_gateway(*calls[index]) for index in permitted]
-        for index, outcome in zip(permitted, outcomes):
-            results[index] = outcome
-        return results, used
-
-    def _call_gateway(self, name: Any, raw_arguments: Any) -> dict[str, Any]:
-        if not isinstance(name, str) or (self._allowed_tool_names is not None and name not in self._allowed_tool_names):
-            return {"error": "invalid_tool_call"}
         try:
-            arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-        except json.JSONDecodeError:
-            return {"error": "invalid_tool_arguments"}
-        try:
-            return model_tool_output(self._gateway_client.call_tool(name, arguments))
-        except McpGatewayToolError as exc:
-            if exc.code == "not_found":
-                # Gateway catalog가 바뀌었을 수 있다. TTL 캐시를 무효화해야 실제로 다시 조회한다.
-                # 재조회 실패(Gateway 장애)는 이 도구 호출의 오류일 뿐이므로 초안 생성을 중단시키지 않는다.
-                self._gateway_client.invalidate_catalog()
-                try:
-                    self._gateway_client.discover()
-                except McpGatewayError:
-                    pass
-                return {"error": exc.code, "retryable": False}
-            if exc.retryable:
-                for _ in range(self._max_gateway_retries):
-                    try:
-                        return model_tool_output(self._gateway_client.call_tool(name, arguments))
-                    except McpGatewayToolError as retry_error:
-                        exc = retry_error
-                        if not exc.retryable:
-                            break
-            return {"error": exc.code, "retryable": exc.retryable}
-        except McpGatewayError:
-            return {"error": "gateway_unavailable"}
+            parsed = json.loads(json_text(content))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("proposed_fields"), dict):
+            return None
+        for field_id in output_schema["properties"]["proposed_fields"]["properties"]:
+            parsed["proposed_fields"].setdefault(field_id, None)
+        evidence = parsed.get("evidence_refs", [])
+        if isinstance(evidence, dict):
+            # 필드별 객체로 답한 경우도 같은 근거이므로 배열 형식으로 맞춘다.
+            evidence = [{"field_id": key, "refs": value} for key, value in evidence.items()]
+        parsed["evidence_refs"] = evidence
+        parsed.setdefault("needs_confirmation", False)
+        if not Draft202012Validator(output_schema).is_valid(parsed):
+            return None
+        return json.dumps(parsed, ensure_ascii=False)
 
     @staticmethod
     def _output_format(schema: FormSchema) -> dict:
@@ -270,7 +140,7 @@ class OpenAiDraftGenerationAdapter:
         allowed_fields = [field for field in schema.fields if field.llm_allowed]
         allowed = [field.field_id for field in allowed_fields]
         value_schemas = {
-            field.field_id: OpenAiDraftGenerationAdapter._value_schema(field)
+            field.field_id: DraftGenerationAdapter._value_schema(field)
             for field in allowed_fields
         }
         # 채운 필드의 근거만 배열로 받는다. 필드별 객체(모든 필드 필수)는 null 필드마다 빈 배열을 출력하게 해
@@ -307,7 +177,7 @@ class OpenAiDraftGenerationAdapter:
         if field.options:
             value = {"type": "string", "enum": list(field.options)}
         else:
-            value = OpenAiDraftGenerationAdapter._json_type(field.type)
+            value = DraftGenerationAdapter._json_type(field.type)
         schema: dict[str, Any] = {"anyOf": [value, {"type": "null"}]}
         description = " - ".join(item for item in (field.label, field.description) if item)
         if field.type == "date":
@@ -320,18 +190,51 @@ class OpenAiDraftGenerationAdapter:
 
     @staticmethod
     def _json_type(field_type: str) -> dict:
-        """도메인 필드 자료형을 JSON 스키마 자료형으로 변환한다.
-
-        입력: ``field_type``은 양식 필드의 자료형 문자열이다.
-        출력: 대응하는 JSON 스키마 조각이며, 알 수 없는 형식은 문자열로 처리한다.
-        """
-        types = {"integer": "integer", "number": "number", "boolean": "boolean", "array": "array", "object": "object"}
-        kind = types.get(field_type, "string")
-        if kind == "array":
+        """양식 필드 자료형(``FieldType``)을 JSON 스키마 자료형으로 바꾼다. 문자·날짜 계열은 문자열이다."""
+        if field_type == "array":
             return {"type": "array", "items": {"type": "string"}}
-        if kind == "object":
-            return {"type": "object", "properties": {}, "additionalProperties": False}
-        return {"type": kind}
+        if field_type in ("integer", "number", "boolean"):
+            return {"type": field_type}
+        return {"type": "string"}
+
+
+
+class OpenAiDraftGenerationAdapter(DraftGenerationAdapter):
+    """OpenAI Responses API로 초안을 만든다(``store=False``)."""
+
+    completion_class: type = ResponsesCompletion
+
+    def __init__(
+        self,
+        client: Any | None = None,
+        model: str = "gpt-4o-mini",
+        prompt_version: str = "draft-v2",
+        gateway_client: McpGatewayClient | None = None,
+        max_tool_calls: int = 6,
+        tool_timeout_seconds: float = 30.0,
+        max_tool_rounds: int = 2,
+        max_gateway_retries: int = 1,
+        allowed_tool_names: tuple[str, ...] | None = None,
+        options: GenerationOptions | None = None,
+    ) -> None:
+        if client is None:
+            from openai import OpenAI
+            client = OpenAI()
+        tools = ToolExecutor(gateway_client, allowed_tool_names, max_tool_calls, max_tool_rounds, tool_timeout_seconds, max_gateway_retries)
+        super().__init__(self.completion_class(client, model, options), model, tools, prompt_version)
+
+
+class OpenAiChatDraftGenerationAdapter(OpenAiDraftGenerationAdapter):
+    """OpenAI 호환 Chat Completions 서버(vLLM 등 로컬 모델)로 초안을 만든다. 생성자 인자는 Responses와 같다."""
+
+    completion_class = ChatCompletion
+
+    def __init__(
+        self, client: Any | None = None, model: str = "local-llm", *, extra_body: dict[str, Any] | None = None,
+        max_tokens: int | None = None, temperature: float | None = None, **kwargs: Any,
+    ) -> None:
+        kwargs.setdefault("options", GenerationOptions(max_tokens, temperature, dict(extra_body or {})))
+        super().__init__(client, model, **kwargs)
 
 
 def _evidence_by_field(evidence: Any) -> dict[str, tuple[str, ...]]:
@@ -347,63 +250,3 @@ def _evidence_by_field(evidence: Any) -> dict[str, tuple[str, ...]]:
         if isinstance(field_id, str) and isinstance(refs, list):
             merged[field_id] = merged.get(field_id, ()) + tuple(str(item) for item in refs)
     return merged
-
-
-def _value(item: Any, key: str) -> Any:
-    """Read an SDK object or a fixture dictionary without depending on SDK internals."""
-    return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
-
-
-# 사전 뜻풀이는 문맥 판단에 필요한 첫 부분만 준다. 동음이의어가 여럿이면 앞부분만으로 구분된다.
-MAX_DEFINITION_CHARS = 120
-
-
-def model_tool_output(result: dict[str, Any]) -> dict[str, Any]:
-    """Gateway 도구 결과를 LLM에 돌려줄 최소 형태로 줄인다.
-
-    MCP 결과는 같은 내용을 ``content``(JSON 문자열)와 ``structuredContent``에 두 번 담고, 사전 결과에는
-    원본 파일·행·해시 같은 추적 정보와 같은 용어의 코드별 중복 항목이 들어 있다. LLM은 표기 판단에 쓰는
-    표제어·품사·뜻풀이 앞부분, 한글·영문 용어명과 일치 유형만 받는다(입력 토큰과 응답 지연을 줄인다).
-    모르는 구조의 결과는 ``structuredContent``만, 구조화 결과가 없으면 원래 결과를 그대로 준다.
-    """
-    payload = result.get("structuredContent")
-    # FastMCP는 Union 반환 타입의 구조화 결과를 {"result": ...}로 감싼다.
-    if isinstance(payload, dict) and set(payload) == {"result"} and isinstance(payload["result"], dict):
-        payload = payload["result"]
-    if not isinstance(payload, dict):
-        return result
-    if isinstance(payload.get("entries"), list):
-        return {"entries": [_dictionary_entry(item) for item in payload["entries"]]}
-    if isinstance(payload.get("results"), list):
-        return {"results": _medical_terms(payload["results"])}
-    return payload
-
-
-def _dictionary_entry(item: Any) -> Any:
-    """표준국어 사전 항목에서 표제어·품사·뜻풀이 앞부분만 남긴다."""
-    if not isinstance(item, dict) or not isinstance(item.get("evidence"), dict):
-        return item
-    evidence = item["evidence"]
-    definition = " ".join(str(evidence.get("definition") or "").split())
-    return {
-        "surface": item.get("surface"),
-        "part_of_speech": " ".join(str(evidence.get("part_of_speech") or "").split()).strip("「」"),
-        "definition": definition[:MAX_DEFINITION_CHARS],
-    }
-
-
-def _medical_terms(results: list[Any]) -> list[Any]:
-    """의학용어 검색 결과에서 한글·영문 용어명·일치 유형·점수만 남기고, 코드만 다른 같은 용어는 하나로 합친다."""
-    compact: list[Any] = []
-    seen: set[tuple[Any, ...]] = set()
-    for item in results:
-        term = item.get("term") if isinstance(item, dict) else None
-        if not isinstance(term, dict):
-            compact.append(item)
-            continue
-        entry = {"kor_name": term.get("kor_name"), "eng_name": term.get("eng_name"), "match_type": item.get("match_type"), "score": item.get("score")}
-        key = (entry["kor_name"], entry["eng_name"], entry["match_type"])
-        if key not in seen:
-            seen.add(key)
-            compact.append(entry)
-    return compact

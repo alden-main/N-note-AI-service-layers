@@ -15,13 +15,13 @@ from pydantic import BaseModel
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
-from n_note_ai_service_layers.adapters.openai_chat_draft_generation import first_message, json_text
-from n_note_ai_service_layers.api.deps import get_gateway_client, get_speech_to_text_provider, get_transcript_redactor
-from n_note_ai_service_layers.contracts.audio import AudioDecodeError, AudioInput
+from n_note_ai_service_layers.adapters.llm_completion import StructuredOutput, json_text
+from n_note_ai_service_layers.api.deps import get_transcript_preparation, read_audio
+from n_note_ai_service_layers.contracts.audio import AudioInput
 from n_note_ai_service_layers.observability import get_logger, stage
 from n_note_ai_service_layers.services.draft_token_scrub import scrub_value as _scrub_value
-from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
-from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
+from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
+from n_note_ai_service_layers.services.nursing_note_workflow import TranscriptPreparation, WorkflowStageError
 
 class FormResult(BaseModel):
     templateType: str
@@ -39,6 +39,12 @@ router = APIRouter(tags=["internal-stt"])
 _MAX_AUDIO = 50 * 1024 * 1024
 _EXTENSIONS = {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac", ".webm"}
 _logger = get_logger("api.internal_stt")
+# 공통 단계 실패를 이 API의 HTTP 응답으로 바꾼다. 본문·예외 메시지는 노출하지 않는다.
+_PREPARATION_FAILURES = {
+    "audio_decode": (415, "audio could not be decoded"),
+    "stt": (503, "speech transcription is unavailable"),
+    "redaction": (503, "transcript de-identification failed"),
+}
 # 필드 하나에 돌려줄 근거 문장 수 상한이다. LLM은 근거를 문장 번호로만 답해 출력 토큰을 줄인다.
 _MAX_EVIDENCE = 3
 # 문장부호 없이 길게 이어진 전사 구간은 쉼표에서 더 나눠 근거가 전사문 통째가 되지 않게 한다.
@@ -145,32 +151,11 @@ def _output_schema(template: dict, sentence_count: int) -> dict:
 
 
 def _extract(sentences: list[str], template: dict, hints: tuple[dict, ...]) -> dict:
-    config = settings.get()
-    endpoint = config.llm_endpoint
-    client = model_providers.openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
     schema = _output_schema(template, len(sentences))
     transcript = [{"id": index, "text": sentence} for index, sentence in enumerate(sentences)]
     payload = json.dumps({"transcript_sentences": transcript, "schemaDefinition": template["schemaDefinition"], "term_review_hints": hints}, ensure_ascii=False)
-    # temperature·max_tokens·extra_body는 초안 생성 어댑터와 같은 규칙(GenerationOptions)으로 넣는다.
-    options = model_providers.generation_options()
-    if config.llm_api == "chat":
-        # 구조화 출력을 강제하지 못하는 서버(MLX, 일부 llama.cpp 등)도 따르도록 프롬프트에도 스키마를 넣는다.
-        system = _INSTRUCTIONS + "\nJSON schema:\n" + json.dumps(schema, ensure_ascii=False)
-        request = {
-            "model": endpoint.model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": payload}],
-            "response_format": {"type": "json_schema", "json_schema": {"name": "form_extraction", "schema": schema, "strict": True}},
-            **options.chat_kwargs(),
-        }
-        content = first_message(client.chat.completions.create(**request))["content"]
-    else:
-        output_format = {"type": "json_schema", "name": "form_extraction", "schema": schema, "strict": True}
-        # 전사문을 OpenAI 쪽에 보관하지 않는다(초안 생성 어댑터와 같은 정책).
-        response = client.responses.create(
-            model=endpoint.model, instructions=_INSTRUCTIONS, input=payload, text={"format": output_format}, store=False,
-            **options.responses_kwargs(),
-        )
-        content = response.output_text
+    # 초안 생성과 같은 요청기다(API 형식·store=False·temperature 등 옵션·Chat의 스키마 프롬프트를 공유한다).
+    content = model_providers.structured_completion().complete(_INSTRUCTIONS, payload, StructuredOutput("form_extraction", schema))
     result = json.loads(json_text(content))
     # 구조가 다르면 빈 서식으로 오인하지 않고 실패로 처리한다. options·문장 번호 범위 밖의 값과 근거 초과분은 _normalize가 정리한다.
     if any(error.validator not in {"enum", "maxItems"} for error in Draft202012Validator(schema).iter_errors(result)):
@@ -229,7 +214,7 @@ def _is_filled(value: object) -> bool:
         }}}},
     },
 )
-async def internal_transcription(request: Request, provider=Depends(get_speech_to_text_provider), redactor=Depends(get_transcript_redactor), gateway=Depends(get_gateway_client)) -> dict:
+async def internal_transcription(request: Request, preparation: TranscriptPreparation = Depends(get_transcript_preparation)) -> dict:
     form = await request.form()
     parts = form.getlist("templates")
     if len(parts) != 1 or len(form.getlist("file")) != 1:
@@ -249,58 +234,31 @@ async def internal_transcription(request: Request, provider=Depends(get_speech_t
     templates = _templates(raw)
     if Path(file.filename or "").suffix.lower() not in _EXTENSIONS:
         raise HTTPException(status_code=415, detail="unsupported audio file extension")
-    content = await file.read(_MAX_AUDIO + 1)
-    if not content:
-        raise HTTPException(status_code=422, detail="audio file is empty")
-    if len(content) > _MAX_AUDIO:
-        raise HTTPException(status_code=413, detail="audio file exceeds 50 MiB limit")
+    # 백엔드 계약(docs/STT_API.md)은 확장자와 50 MiB 상한이다.
+    content = await read_audio(file, _MAX_AUDIO)
     trace_id = str(uuid4())
+    audio = AudioInput(content, file.filename or "audio", file.content_type or "application/octet-stream", trace_id, "ko")
+    # STT → 비식별화 → 전사문 검토(힌트 대기 상한까지)는 비동기 초안 작업과 같은 공통 단계다.
     try:
-        with stage(_logger, trace_id, "stt", audio_bytes=len(content)) as metrics:
-            transcript = await run_in_threadpool(provider.transcribe, AudioInput(content, file.filename or "audio", file.content_type or "application/octet-stream", trace_id, "ko"))
-            metrics.update(chars=len(transcript.text))
-    except AudioDecodeError as exc:
-        raise HTTPException(status_code=415, detail="audio could not be decoded") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="speech transcription is unavailable") from exc
-    try:
-        with stage(_logger, trace_id, "redaction") as metrics:
-            redacted = await run_in_threadpool(redactor.redact, transcript.text)
-            metrics.update(replacements=redacted.replacement_count)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="transcript de-identification failed") from exc
-    config = settings.get()
-
-    async def review_transcript():
-        with stage(_logger, trace_id, "transcript_term_review") as metrics:
-            result = await run_in_threadpool(GatewayTermVerificationFlow(gateway).verify, "transcript", redacted.text, trace_id)
-            metrics.update(status=result.status, candidates=len(result.occurrences))
-        return result
-
-    # 검토가 대기 상한(N_NOTE_TERM_HINT_BUDGET_SECONDS) 안에 끝나면 힌트로 쓰고, 늦으면 힌트 없이 추출을 먼저 시작한다.
-    # 어느 쪽이든 검토가 실패하면 503이다(늦은 검토는 추출이 끝난 뒤 확인하므로 그 추출 결과는 버린다).
-    review_task = asyncio.create_task(review_transcript())
-    try:
-        done, _ = await asyncio.wait({review_task}, timeout=config.term_hint_budget_seconds)
-        hints = NursingNoteWorkflow.hints(await _accepted_review(review_task)) if done else ()
-        forms = await _extract_forms(templates, redacted.text, hints, trace_id, config.form_concurrency, hints_deferred=not done)
-        if not done:
-            await _accepted_review(review_task)
-    finally:
-        if not review_task.done():
-            review_task.cancel()
-    return {"transcript": redacted.text, "forms": forms}
+        prepared = await run_in_threadpool(preparation.prepare, audio, (), lambda _stage: None)
+    except WorkflowStageError as exc:
+        status_code, detail = _PREPARATION_FAILURES.get(exc.stage, (503, "speech transcription is unavailable"))
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    # 이 API는 검토가 성공해야 결과를 돌려준다(docs/STT_API.md). 상한 안에 끝난 검토는 추출 전에 확인하고,
+    # 늦은 검토는 추출을 먼저 시작한 뒤 확인한다(실패면 그 추출 결과는 버린다).
+    reviewed_in_time = prepared.review.done()
+    if reviewed_in_time:
+        _require_review(prepared.review.result())
+    forms = await _extract_forms(templates, prepared.transcript.text, prepared.hints, trace_id, settings.get().form_concurrency, hints_deferred=not reviewed_in_time)
+    if not reviewed_in_time:
+        _require_review(await asyncio.wrap_future(prepared.review))
+    return {"transcript": prepared.transcript.text, "forms": forms}
 
 
-async def _accepted_review(task: asyncio.Task):
-    """전사문 검토 결과를 받는다. 실패·미지원이면 503이다."""
-    try:
-        review = await task
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="term review is unavailable") from exc
+def _require_review(review: GatewayTermVerificationResult) -> None:
+    """전사문 검토가 성공하지 않았으면(장애·미지원) 503이다."""
     if review.status != "ok":
         raise HTTPException(status_code=503, detail="term review is unavailable")
-    return review
 
 
 async def _extract_forms(templates: list[dict], transcript: str, hints: tuple[dict, ...], trace_id: str, concurrency: int, hints_deferred: bool) -> list[dict]:

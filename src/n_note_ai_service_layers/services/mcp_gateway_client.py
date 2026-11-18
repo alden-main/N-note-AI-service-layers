@@ -20,7 +20,8 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx2
 from jsonschema import Draft202012Validator
 
-from n_note_ai_service_layers import __version__, settings
+from n_note_ai_service_layers import __version__
+from n_note_ai_service_layers.settings import DEFAULT_MCP_GATEWAY_TIMEOUT_SECONDS, DEFAULT_MCP_GATEWAY_URL
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 # Streamable HTTP 서버는 두 형식을 모두 받겠다고 해야 요청을 받는다(아니면 406).
@@ -83,9 +84,8 @@ class McpGatewayClient:
         batch_max_calls: int = DEFAULT_BATCH_MAX_CALLS,
         pool_workers: int = DEFAULT_POOL_WORKERS,
     ) -> None:
-        config = settings.get()
-        self._url = url or config.mcp_gateway_url
-        self._timeout_seconds = timeout_seconds if timeout_seconds is not None else config.mcp_gateway_timeout_seconds
+        self._url = url or DEFAULT_MCP_GATEWAY_URL
+        self._timeout_seconds = timeout_seconds if timeout_seconds is not None else DEFAULT_MCP_GATEWAY_TIMEOUT_SECONDS
         # httpx2 client는 스레드 간에 공유하는 keep-alive 연결 풀이다. Gateway는 내부망이라 프록시 환경 변수를 따르지 않는다.
         self._http = httpx2.Client(trust_env=False) if transport is None else None
         self._transport = transport or self._http_post
@@ -100,8 +100,6 @@ class McpGatewayClient:
         self._negotiated_version: str | None = None
         self._session_lock = threading.Lock()
         self._batch_url = batch_url or _batch_url(self._url)
-        # An older Gateway answers 404 for the batch path; fall back to one tools/call per item.
-        self._batch_supported = True
         self._batch_max_calls = max(1, batch_max_calls)
         # 호출마다 풀을 만들지 않고 클라이언트 수명 동안 재사용한다. 이 풀의 작업은 HTTP 요청만 하고
         # 다른 작업을 기다리지 않으므로, 위 계층(초안 검토 등)이 기다려도 교착이 생기지 않는다.
@@ -181,13 +179,12 @@ class McpGatewayClient:
         return _tool_outcome(self._request("tools/call", {"name": name, "arguments": arguments}, request_id))
 
     def call_tools(
-        self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None = None, max_concurrency: int = 1,
+        self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None = None,
     ) -> list[dict[str, Any] | McpGatewayError]:
-        """Call several tools in one Gateway round trip and return results (or errors) in input order.
+        """Gateway 일괄 호출(``/v1/tools/batch-call``)로 여러 도구를 부르고 입력 순서대로 결과(또는 오류)를 돌려준다.
 
-        Calls that fail local catalog/schema checks never leave the process. The Gateway relays the
-        rest concurrently. Without batch support it falls back to ``call_tool`` with up to
-        ``max_concurrency`` parallel requests.
+        catalog·스키마 검사에 실패한 호출은 프로세스 밖으로 나가지 않는다. 나머지는 Gateway가 동시에 중계한다
+        (동시 실행 수는 Gateway의 ``GATEWAY_BATCH_MAX_CONCURRENCY``가 정한다).
         """
         results: list[dict[str, Any] | McpGatewayError | None] = [None] * len(calls)
         pending: list[int] = []
@@ -199,10 +196,7 @@ class McpGatewayClient:
             else:
                 pending.append(index)
         if pending:
-            selected = [calls[index] for index in pending]
-            outcomes = self._batches(selected, request_id) if self._batch_supported else None
-            if outcomes is None:
-                outcomes = self._each(selected, request_id, max_concurrency)
+            outcomes = self._batches([calls[index] for index in pending], request_id)
             for index, outcome in zip(pending, outcomes):
                 results[index] = outcome
         return results  # type: ignore[return-value]
@@ -214,22 +208,16 @@ class McpGatewayClient:
         if not isinstance(arguments, dict) or not Draft202012Validator(tool["inputSchema"]).is_valid(arguments):
             raise McpGatewayProtocolError("tool arguments do not match the Gateway input schema")
 
-    def _batches(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None) -> list[dict[str, Any] | McpGatewayError] | None:
-        """Gateway 상한(``batch_max_calls``)씩 나눠 일괄 호출한다. ``None``은 Gateway에 일괄 호출 경로가 없다는 뜻이다.
-
-        나눈 묶음은 동시에 보낸다. 각 묶음 안의 호출은 Gateway가 동시에 중계한다.
-        """
+    def _batches(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None) -> list[dict[str, Any] | McpGatewayError]:
+        """Gateway 상한(``batch_max_calls``)씩 나눠 일괄 호출한다. 나눈 묶음은 동시에 보낸다."""
         size = self._batch_max_calls
         groups = [calls[start:start + size] for start in range(0, len(calls), size)]
         if len(groups) == 1:
             return self._batch(groups[0], request_id)
-        results = list(self._pool.map(lambda group: self._batch(group, request_id), groups))
-        if any(result is None for result in results):
-            return None
-        return [outcome for result in results for outcome in result]  # type: ignore[union-attr]
+        return [outcome for result in self._pool.map(lambda group: self._batch(group, request_id), groups) for outcome in result]
 
-    def _batch(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None) -> list[dict[str, Any] | McpGatewayError] | None:
-        """POST the batch; ``None`` means this Gateway has no batch endpoint."""
+    def _batch(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None) -> list[dict[str, Any] | McpGatewayError]:
+        """묶음 하나를 POST한다. 요청 단위 실패(연결·HTTP·형식)는 모든 호출의 오류가 된다."""
         trace_id = request_id or str(uuid.uuid4())
         body = json.dumps({"calls": [{"name": name, "arguments": arguments} for name, arguments in calls]}).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json", "X-Request-ID": trace_id}
@@ -239,9 +227,6 @@ class McpGatewayClient:
             self.invalidate_catalog()
             error = McpGatewayConnectionError("Gateway connection failed")
             return [error for _ in calls]
-        if status == 404:
-            self._batch_supported = False
-            return None
         try:
             if status < 200 or status >= 300:
                 raise McpGatewayProtocolError(f"Gateway returned HTTP {status}")
@@ -264,20 +249,6 @@ class McpGatewayClient:
             except McpGatewayError as error:
                 outcomes.append(error)
         return outcomes
-
-    def _each(self, calls: Sequence[tuple[str, dict[str, Any]]], request_id: str | None, max_concurrency: int) -> list[dict[str, Any] | McpGatewayError]:
-        def call(item: tuple[str, dict[str, Any]]) -> dict[str, Any] | McpGatewayError:
-            try:
-                return self.call_tool(item[0], item[1], request_id)
-            except McpGatewayError as error:
-                return error
-        if len(calls) <= 1 or max_concurrency <= 1:
-            return [call(item) for item in calls]
-        # 이 호출의 동시 요청은 max_concurrency개로 제한한다(묶음 단위로 순서대로 보낸다).
-        results: list[dict[str, Any] | McpGatewayError] = []
-        for start in range(0, len(calls), max_concurrency):
-            results.extend(self._pool.map(call, calls[start:start + max_concurrency]))
-        return results
 
     def _request(self, method: str, params: dict[str, Any], request_id: str | None) -> dict[str, Any]:
         """세션 안에서 요청한다. 세션이 만료됐으면 다시 초기화하고 한 번 재시도한다."""

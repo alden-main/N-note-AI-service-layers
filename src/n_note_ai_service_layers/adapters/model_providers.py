@@ -7,8 +7,8 @@ from typing import Any
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.audio_preprocessing import DEFAULT_HALLUCINATION_PATTERNS, AudioPreprocessingSpeechToText, HallucinationFilter, VadConfig
-from n_note_ai_service_layers.adapters.openai_chat_draft_generation import OpenAiChatDraftGenerationAdapter
-from n_note_ai_service_layers.adapters.openai_draft_generation import GenerationOptions, OpenAiDraftGenerationAdapter
+from n_note_ai_service_layers.adapters.llm_completion import ChatCompletion, GenerationOptions, ResponsesCompletion, create_completion
+from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiChatDraftGenerationAdapter, OpenAiDraftGenerationAdapter
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
@@ -77,6 +77,14 @@ def draft_generator(gateway: McpGatewayClient | None) -> OpenAiDraftGenerationAd
         max_tool_calls=config.llm_max_tool_calls,
         options=generation_options(),
     )
+
+
+def structured_completion() -> ResponsesCompletion | ChatCompletion:
+    """설정한 LLM 서버·API 형식·옵션의 구조화 출력 요청기다(동기 서식 추출이 쓴다)."""
+    config = settings.get()
+    endpoint = config.llm_endpoint
+    client = openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
+    return create_completion(config.llm_api, client, endpoint.model, generation_options())
 
 
 def generation_options() -> GenerationOptions:

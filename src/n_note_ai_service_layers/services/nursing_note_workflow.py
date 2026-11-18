@@ -15,7 +15,7 @@ from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
 from n_note_ai_service_layers.contracts.report_validation import ReportValidationResult
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
-from n_note_ai_service_layers.observability import get_logger, stage
+from n_note_ai_service_layers.observability import get_logger, log_event, stage
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.draft_document import DraftDocument
 from n_note_ai_service_layers.services import executors
@@ -68,120 +68,29 @@ class PreparedTranscript:
     # 힌트 대기 상한 안에 끝난 전사문 검토로 만든 LLM 힌트다. 늦으면 비어 있다.
     hints: tuple[dict[str, Any], ...]
     reference_time: datetime
+    # 전사문 검토다. 힌트 대기 상한을 넘겼으면 아직 진행 중이며, 초안 단계가 결과를 받는다(공유 풀에서 실행).
     review: Future[GatewayTermVerificationResult]
 
-    def close(self) -> None:
-        """예전 API와의 호환용이다. 검토는 공유 풀에서 실행되므로 정리할 자원이 없다."""
 
+class TranscriptPreparation:
+    """양식과 무관한 공통 단계다: STT → 비식별화 → 전사문 용어 검토(힌트 대기 상한까지 기다림).
 
-class NursingNoteWorkflow:
-    """문맥 준비가 완료된 요청만 외부 STT/LLM/Gateway로 전달하는 조립 경계다.
-
-    순서: STT → 비식별화 → 전사문 표준어·의학용어 검토 → 검토 힌트를 포함한 양식 초안 생성 →
-    초안 수치 대조 → (초안 필드별 용어 검토 ∥ 보고서 검증 MCP의 양식 완결성 검증)이다.
-    앞의 세 단계(``prepare``)는 양식과 무관하므로, 여러 양식을 만들 때(``generate_many``)는 한 번만 하고
-    양식별 단계(``draft``)만 병렬로 실행한다.
-    전사문 검토가 ``hint_budget_seconds`` 안에 끝나지 않으면 힌트 없이 초안 생성을 시작하고, 검토 결과는
-    초안 생성 뒤에 받아 응답(검토 후보)에 담는다. Gateway 지연이 LLM 시작을 붙잡지 않게 하기 위해서다.
-    어떤 후보도 자동 적용하지 않는다. STT·초안 생성 실패는 ``WorkflowStageError``이고,
-    Gateway 실패는 ``unavailable`` 상태로 응답에 남긴다.
+    비동기 초안 작업(``NursingNoteWorkflow``)과 동기 서식 추출 API(internal_stt)가 함께 쓴다.
+    STT·비식별화 실패는 ``WorkflowStageError``이고, 검토 실패는 ``unavailable`` 검토 결과로 남는다.
     """
 
     def __init__(
         self,
         stt: SpeechToTextProvider,
-        generator: DraftGenerationProvider,
         gateway_verification: GatewayTermVerificationFlow,
         redactor: TranscriptRedactor | None = None,
-        report_validation: FormReportValidationFlow | None = None,
-        projector: LlmPayloadProjector | None = None,
         hint_budget_seconds: float | None = None,
     ) -> None:
         self.stt = stt
-        self.generator = generator
         self.gateway_verification = gateway_verification
         self.redactor = redactor or TranscriptRedactor()
-        self.report_validation = report_validation
-        self.projector = projector or LlmPayloadProjector()
         # None이면 전사문 검토가 끝날 때까지 기다린다.
         self.hint_budget_seconds = hint_budget_seconds
-
-    def generate(
-        self, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
-        progress: Callable[[str], None] | None = None,
-    ) -> NursingNoteWorkflowResult:
-        """``progress``는 각 단계(stt, redaction, transcript_term_review, draft_generation, draft_review)를 시작할 때 호출된다."""
-        notify = progress or (lambda _: None)
-        prepared = self.prepare(audio, known_identifiers, notify)
-        try:
-            return self.draft(prepared, snapshot, schema, notify)
-        finally:
-            prepared.close()
-
-    def generate_many(
-        self,
-        audio: AudioInput | PreTranscribedAudio,
-        forms: Sequence[tuple[FormSchema, Any]],
-        known_identifiers: Iterable[str] = (),
-        progress: Callable[[str], None] | None = None,
-        on_form_stage: Callable[[int, str], None] | None = None,
-        on_form_done: Callable[[int, NursingNoteWorkflowResult | Exception], None] | None = None,
-        max_parallel: int = 1,
-    ) -> list[NursingNoteWorkflowResult | Exception]:
-        """음성 하나로 여러 양식의 초안을 만든다.
-
-        STT·비식별화·전사문 용어 검토는 한 번만 하고, 양식별 초안 생성·수치 대조·초안 검토는
-        ``max_parallel``개까지 동시에 실행한다. ``forms``는 (양식, 그 양식의 임상 문맥) 목록이다.
-
-        공통 단계가 실패하면 ``WorkflowStageError``를 던진다. 양식 하나의 실패는 다른 양식에 영향을 주지 않고
-        결과 목록의 그 자리에 예외로 남는다(초안 생성 실패는 ``WorkflowStageError``).
-        ``on_form_stage(index, stage)``는 양식별 단계가 바뀔 때, ``on_form_done(index, outcome)``은 양식 하나가
-        끝나는 즉시 작업 스레드에서 호출된다. 먼저 끝난 초안을 바로 저장·표시하기 위해서다.
-        """
-        if not forms:
-            raise ValueError("at least one form is required")
-        notify = progress or (lambda _: None)
-        form_stage = on_form_stage or (lambda _index, _stage: None)
-        form_done = on_form_done or (lambda _index, _outcome: None)
-        prepared = self.prepare(audio, known_identifiers, notify)
-        notify("draft_generation")
-
-        def run(index: int, schema: FormSchema, snapshot: Any) -> NursingNoteWorkflowResult | Exception:
-            outcome: NursingNoteWorkflowResult | Exception
-            try:
-                outcome = self.draft(prepared, snapshot, schema, lambda name: form_stage(index, name))
-            except Exception as exc:  # 한 양식의 실패가 다른 양식의 결과를 버리지 않게 결과로 돌려준다.
-                outcome = exc
-            form_done(index, outcome)
-            return outcome
-
-        try:
-            return self._run_forms(run, forms, max(1, min(len(forms), max_parallel)))
-        finally:
-            prepared.close()
-
-    @staticmethod
-    def _run_forms(
-        run: Callable[[int, FormSchema, Any], NursingNoteWorkflowResult | Exception],
-        forms: Sequence[tuple[FormSchema, Any]],
-        max_parallel: int,
-    ) -> list[NursingNoteWorkflowResult | Exception]:
-        """양식 초안을 공유 풀에서 실행하되, 이 작업이 동시에 돌리는 양식은 ``max_parallel``개로 제한한다.
-
-        한도는 풀 안에서 세마포어로 기다리지 않고 제출 시점에 지킨다(기다리는 작업이 공유 스레드를 붙잡지 않게).
-        """
-        pool = executors.shared("form-draft", executors.worker_parallelism())
-        results: list[NursingNoteWorkflowResult | Exception | None] = [None] * len(forms)
-        queued = list(enumerate(forms))
-        running: dict[Future, int] = {}
-        while queued or running:
-            while queued and len(running) < max_parallel:
-                index, (schema, snapshot) = queued.pop(0)
-                running[pool.submit(run, index, schema, snapshot)] = index
-            done, _ = wait(running, return_when=FIRST_COMPLETED)
-            for future in done:
-                results[running.pop(future)] = future.result()
-        return results  # type: ignore[return-value]
 
     def prepare(
         self, audio: AudioInput | PreTranscribedAudio, known_identifiers: Iterable[str], notify: Callable[[str], None],
@@ -189,20 +98,21 @@ class NursingNoteWorkflow:
         """양식과 무관한 공통 단계다: STT → 비식별화 → 전사문 용어 검토 시작(힌트 대기 상한까지 기다림).
 
         ``PreTranscribedAudio``(녹음 세션에서 이미 전사한 음성)면 STT를 다시 하지 않고 비식별화부터 시작한다.
-        반환값의 ``close()``를 호출해 검토 스레드를 정리한다. 검토가 아직 진행 중이면 결과는 ``review``로 받는다.
+        검토가 아직 진행 중이면 결과는 반환값의 ``review``로 받는다.
         """
         trace_id = audio.trace_id
         if isinstance(audio, PreTranscribedAudio):
             transcript = audio.transcript
         else:
             notify("stt")
-            with stage(_logger, trace_id, "stt", audio_bytes=len(audio.content)):
+            with stage(_logger, trace_id, "stt", audio_bytes=len(audio.content)) as metrics:
                 try:
                     transcript = self.stt.transcribe(audio)
                 except AudioDecodeError as exc:
                     raise WorkflowStageError("audio_decode") from exc
                 except Exception as exc:
                     raise WorkflowStageError("stt") from exc
+                metrics["chars"] = len(transcript.text)
         notify("redaction")
         with stage(_logger, trace_id, "redaction") as metrics:
             try:
@@ -229,6 +139,143 @@ class NursingNoteWorkflow:
             trace_id, external_transcript, redacted.replacement_count, catalog,
             self.hints(hint_source) if hint_source else (), now_local(), review,
         )
+
+    def _start_transcript_review(
+        self, pool: ThreadPoolExecutor, text: str, trace_id: str, catalog: tuple[dict[str, Any], ...] | None,
+    ) -> Future[GatewayTermVerificationResult]:
+        if catalog is None:
+            done: Future[GatewayTermVerificationResult] = Future()
+            done.set_result(GatewayTermVerificationResult("transcript", "unavailable"))
+            return done
+        return pool.submit(self._safe_review, text, trace_id, catalog)
+
+    def _safe_review(self, text: str, trace_id: str, catalog: tuple[dict[str, Any], ...]) -> GatewayTermVerificationResult:
+        """검토가 예외로 끝나도 ``unavailable``로 남긴다(검토 실패가 초안 생성 전체를 멈추지 않게)."""
+        try:
+            return self.gateway_verification.verify("transcript", text, trace_id, catalog)
+        except Exception as exc:
+            log_event(_logger, "transcript_review_failed", trace_id=trace_id, error=type(exc).__name__)
+            return GatewayTermVerificationResult("transcript", "unavailable")
+
+    def _discover(self, request_id: str) -> tuple[dict[str, Any], ...] | None:
+        """workflow 한 번에 Gateway catalog를 한 번만 조회한다(클라이언트 TTL 캐시). 실패하면 ``None``이다."""
+        try:
+            return self.gateway_verification.gateway.discover(request_id)
+        except McpGatewayError:
+            return None
+
+    @staticmethod
+    def hints(result: GatewayTermVerificationResult) -> tuple[dict[str, Any], ...]:
+        """전사문 후보를 LLM이 문맥에 맞을 때만 쓰는 힌트로 축약한다."""
+        return tuple(
+            {
+                "source_text": item.input_text,
+                "category": item.category,
+                "suggestions": [suggestion.text for suggestion in item.suggestions[:3]],
+            }
+            for item in result.occurrences[:MAX_TERM_HINTS]
+        )
+
+
+
+class NursingNoteWorkflow:
+    """문맥 준비가 완료된 요청만 외부 STT/LLM/Gateway로 전달하는 조립 경계다.
+
+    순서: STT → 비식별화 → 전사문 표준어·의학용어 검토 → 검토 힌트를 포함한 양식 초안 생성 →
+    초안 수치 대조 → (초안 필드별 용어 검토 ∥ 보고서 검증 MCP의 양식 완결성 검증)이다.
+    앞의 세 단계(``TranscriptPreparation``)는 양식과 무관하므로, 여러 양식을 만들 때(``generate_many``)는 한 번만 하고
+    양식별 단계(``draft``)만 병렬로 실행한다.
+    전사문 검토가 ``hint_budget_seconds`` 안에 끝나지 않으면 힌트 없이 초안 생성을 시작하고, 검토 결과는
+    초안 생성 뒤에 받아 응답(검토 후보)에 담는다. Gateway 지연이 LLM 시작을 붙잡지 않게 하기 위해서다.
+    어떤 후보도 자동 적용하지 않는다. STT·초안 생성 실패는 ``WorkflowStageError``이고,
+    Gateway 실패는 ``unavailable`` 상태로 응답에 남긴다.
+    """
+
+    def __init__(
+        self,
+        stt: SpeechToTextProvider,
+        generator: DraftGenerationProvider,
+        gateway_verification: GatewayTermVerificationFlow,
+        redactor: TranscriptRedactor | None = None,
+        report_validation: FormReportValidationFlow | None = None,
+        projector: LlmPayloadProjector | None = None,
+        hint_budget_seconds: float | None = None,
+    ) -> None:
+        self.generator = generator
+        self.gateway_verification = gateway_verification
+        self.report_validation = report_validation
+        self.projector = projector or LlmPayloadProjector()
+        self.preparation = TranscriptPreparation(stt, gateway_verification, redactor, hint_budget_seconds)
+
+    def generate(
+        self, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
+        progress: Callable[[str], None] | None = None,
+    ) -> NursingNoteWorkflowResult:
+        """``progress``는 각 단계(stt, redaction, transcript_term_review, draft_generation, draft_review)를 시작할 때 호출된다."""
+        notify = progress or (lambda _: None)
+        return self.draft(self.preparation.prepare(audio, known_identifiers, notify), snapshot, schema, notify)
+
+    def generate_many(
+        self,
+        audio: AudioInput | PreTranscribedAudio,
+        forms: Sequence[tuple[FormSchema, Any]],
+        known_identifiers: Iterable[str] = (),
+        progress: Callable[[str], None] | None = None,
+        on_form_stage: Callable[[int, str], None] | None = None,
+        on_form_done: Callable[[int, NursingNoteWorkflowResult | Exception], None] | None = None,
+        max_parallel: int = 1,
+    ) -> list[NursingNoteWorkflowResult | Exception]:
+        """음성 하나로 여러 양식의 초안을 만든다.
+
+        STT·비식별화·전사문 용어 검토는 한 번만 하고, 양식별 초안 생성·수치 대조·초안 검토는
+        ``max_parallel``개까지 동시에 실행한다. ``forms``는 (양식, 그 양식의 임상 문맥) 목록이다.
+
+        공통 단계가 실패하면 ``WorkflowStageError``를 던진다. 양식 하나의 실패는 다른 양식에 영향을 주지 않고
+        결과 목록의 그 자리에 예외로 남는다(초안 생성 실패는 ``WorkflowStageError``).
+        ``on_form_stage(index, stage)``는 양식별 단계가 바뀔 때, ``on_form_done(index, outcome)``은 양식 하나가
+        끝나는 즉시 작업 스레드에서 호출된다. 먼저 끝난 초안을 바로 저장·표시하기 위해서다.
+        """
+        if not forms:
+            raise ValueError("at least one form is required")
+        notify = progress or (lambda _: None)
+        form_stage = on_form_stage or (lambda _index, _stage: None)
+        form_done = on_form_done or (lambda _index, _outcome: None)
+        prepared = self.preparation.prepare(audio, known_identifiers, notify)
+        notify("draft_generation")
+
+        def run(index: int, schema: FormSchema, snapshot: Any) -> NursingNoteWorkflowResult | Exception:
+            outcome: NursingNoteWorkflowResult | Exception
+            try:
+                outcome = self.draft(prepared, snapshot, schema, lambda name: form_stage(index, name))
+            except Exception as exc:  # 한 양식의 실패가 다른 양식의 결과를 버리지 않게 결과로 돌려준다.
+                outcome = exc
+            form_done(index, outcome)
+            return outcome
+
+        return self._run_forms(run, forms, max(1, min(len(forms), max_parallel)))
+
+    @staticmethod
+    def _run_forms(
+        run: Callable[[int, FormSchema, Any], NursingNoteWorkflowResult | Exception],
+        forms: Sequence[tuple[FormSchema, Any]],
+        max_parallel: int,
+    ) -> list[NursingNoteWorkflowResult | Exception]:
+        """양식 초안을 공유 풀에서 실행하되, 이 작업이 동시에 돌리는 양식은 ``max_parallel``개로 제한한다.
+
+        한도는 풀 안에서 세마포어로 기다리지 않고 제출 시점에 지킨다(기다리는 작업이 공유 스레드를 붙잡지 않게).
+        """
+        pool = executors.shared("form-draft", executors.worker_parallelism())
+        results: list[NursingNoteWorkflowResult | Exception | None] = [None] * len(forms)
+        queued = list(enumerate(forms))
+        running: dict[Future, int] = {}
+        while queued or running:
+            while queued and len(running) < max_parallel:
+                index, (schema, snapshot) = queued.pop(0)
+                running[pool.submit(run, index, schema, snapshot)] = index
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                results[running.pop(future)] = future.result()
+        return results  # type: ignore[return-value]
 
     def draft(
         self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None = None,
@@ -263,21 +310,16 @@ class NursingNoteWorkflow:
             llm_applied_term_hints=self.applied_hints(hints, transcript.text, document.text),
         )
 
-    def _start_transcript_review(
-        self, pool: ThreadPoolExecutor, text: str, trace_id: str, catalog: tuple[dict[str, Any], ...] | None,
-    ) -> Future[GatewayTermVerificationResult]:
-        if catalog is None:
-            done: Future[GatewayTermVerificationResult] = Future()
-            done.set_result(GatewayTermVerificationResult("transcript", "unavailable"))
-            return done
-        return pool.submit(self.gateway_verification.verify, "transcript", text, trace_id, catalog)
-
     def _review_draft(
         self, schema: FormSchema, document: DraftDocument, trace_id: str, catalog: tuple[dict[str, Any], ...] | None,
     ) -> tuple[GatewayTermVerificationResult, ReportValidationResult]:
         """초안 용어 검토와 양식 완결성 검증은 서로 독립이라 동시에 호출한다."""
         if catalog is None:
-            validation = ReportValidationResult("unavailable") if self.report_validation else ReportValidationResult("skipped")
+            # 필수 필드 완결성은 Gateway 없이도 판정한다. Gateway가 필요한 추가 기준만 unavailable이다.
+            validation = (
+                self.report_validation.validate(schema, document, trace_id, gateway_available=False)
+                if self.report_validation else ReportValidationResult("skipped")
+            )
             return GatewayTermVerificationResult("draft", "unavailable"), validation
         if self.report_validation is None:
             return self.gateway_verification.verify_document("draft", document, trace_id, catalog), ReportValidationResult("skipped")
@@ -292,25 +334,6 @@ class NursingNoteWorkflow:
         """수치 대조 출처다: LLM에 준 전사문과 사용 가능한 사실 값이다."""
         facts = tuple(str(item["value"]) for item in payload.get("facts", []) if item.get("value") is not None)
         return (transcript, *facts)
-
-    def _discover(self, request_id: str) -> tuple[dict[str, Any], ...] | None:
-        """workflow 한 번에 Gateway catalog를 한 번만 조회한다(클라이언트 TTL 캐시). 실패하면 ``None``이다."""
-        try:
-            return self.gateway_verification.gateway.discover(request_id)
-        except McpGatewayError:
-            return None
-
-    @staticmethod
-    def hints(result: GatewayTermVerificationResult) -> tuple[dict[str, Any], ...]:
-        """전사문 후보를 LLM이 문맥에 맞을 때만 쓰는 힌트로 축약한다."""
-        return tuple(
-            {
-                "source_text": item.input_text,
-                "category": item.category,
-                "suggestions": [suggestion.text for suggestion in item.suggestions[:3]],
-            }
-            for item in result.occurrences[:MAX_TERM_HINTS]
-        )
 
     @staticmethod
     def applied_hints(hints: tuple[dict[str, Any], ...], transcript: str, draft_text: str) -> tuple[dict[str, str], ...]:

@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from n_note_ai_service_layers.contracts.form_schema import FormSection, Text
+
 
 class BridgeHandoffRequest(BaseModel):
     """브리지 전송을 요청하는 검토 완료 초안의 API 입력 모델이다.
@@ -56,35 +58,18 @@ class TranscriptionResponse(BaseModel):
     redaction_count: int
 
 
-class TemplateFieldRequest(BaseModel):
-    """운영자가 등록할 template 필드의 API 입력 모델이다."""
-
-    field_id: str = Field(min_length=1)
-    type: str = Field(min_length=1)
-    label: str | None = None
-    required: bool = False
-    llm_allowed: bool = True
-    fact_id: str | None = None
-    conditional_required_when: str | None = None
-    display_order: int | None = Field(default=None, ge=0)
-
-
-class TemplateSectionRequest(BaseModel):
-    """운영자가 등록할 template 섹션의 API 입력 모델이다."""
-
-    section_id: str = Field(min_length=1)
-    label: str | None = None
-    display_order: int | None = Field(default=None, ge=0)
-    fields: list[TemplateFieldRequest] = Field(min_length=1)
-
-
 class TemplateRegistrationRequest(BaseModel):
-    """새 양식 template 버전을 초안 상태로 등록하는 API 입력 모델이다."""
+    """새 양식 template 버전을 초안 상태로 등록하는 API 입력 모델이다.
 
-    schema_id: str = Field(min_length=1)
-    version: str = Field(min_length=1)
-    purpose: str = Field(min_length=1)
-    sections: list[TemplateSectionRequest] = Field(min_length=1)
+    섹션·필드 구조는 ``FormSchema`` 계약(``FormSection``)을 그대로 쓴다. 상태는 항상 draft로 등록된다.
+    """
+
+    schema_id: Text
+    version: Text
+    purpose: Text
+    sections: list[FormSection] = Field(min_length=1)
+    title: Text | None = None
+    instructions: Text | None = None
 
 
 class TemplateActionRequest(BaseModel):

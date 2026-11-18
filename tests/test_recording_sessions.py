@@ -7,10 +7,13 @@ import unittest
 from fastapi.testclient import TestClient
 
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
-from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_services, get_speech_to_text_provider, get_workflow_context_flow, store
+from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_services, get_speech_to_text_provider, get_workflow_context_flow
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.services.recording_sessions import RecordingSessionStore
 from test_multi_form_workflow import BASE, _Context, _Stt, _job_result, _workflow
+
+# 테스트가 상태를 직접 확인·초기화하는 저장소다.
+store = get_services().handoff_store
 
 PATIENT_ID = "P12345"
 

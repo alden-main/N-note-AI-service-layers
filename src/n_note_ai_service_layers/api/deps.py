@@ -20,7 +20,7 @@ from n_note_ai_service_layers.services.context_assembler import ClinicalContextA
 from n_note_ai_service_layers.services.context_flow import ClinicalContextFlow
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
-from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
+from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow, TranscriptPreparation
 from n_note_ai_service_layers.services.report_validation import FormReportValidationFlow
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
 
@@ -34,16 +34,21 @@ def audio_media_type(content_type: str | None) -> str:
     return (content_type or "").split(";", 1)[0].strip().lower()
 
 
-async def read_validated_audio(audio: UploadFile) -> bytes:
-    """MIME 형식과 크기(25 MiB)를 확인하고 음성 바이트를 반환한다."""
-    if audio_media_type(audio.content_type) not in ALLOWED_AUDIO_TYPES:
-        raise HTTPException(status_code=415, detail="unsupported audio content type")
-    content = await audio.read(MAX_AUDIO_BYTES + 1)
+async def read_audio(audio: UploadFile, max_bytes: int) -> bytes:
+    """음성 바이트를 ``max_bytes``까지만 읽는다. 비었으면 422, 넘으면 413이다(형식 검사는 호출자가 한다)."""
+    content = await audio.read(max_bytes + 1)
     if not content:
         raise HTTPException(status_code=422, detail="audio file is empty")
-    if len(content) > MAX_AUDIO_BYTES:
-        raise HTTPException(status_code=413, detail="audio file exceeds 25 MiB limit")
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"audio file exceeds {max_bytes // (1024 * 1024)} MiB limit")
     return content
+
+
+async def read_validated_audio(audio: UploadFile) -> bytes:
+    """MIME 형식과 크기(25 MiB, OpenAI 전사 API 상한)를 확인하고 음성 바이트를 반환한다."""
+    if audio_media_type(audio.content_type) not in ALLOWED_AUDIO_TYPES:
+        raise HTTPException(status_code=415, detail="unsupported audio content type")
+    return await read_audio(audio, MAX_AUDIO_BYTES)
 
 
 def get_speech_to_text_provider() -> SpeechToTextProvider:
@@ -79,6 +84,12 @@ def get_gateway_client() -> McpGatewayClient:
     )
 
 
+def get_term_verification(gateway: McpGatewayClient) -> GatewayTermVerificationFlow:
+    """설정한 검토 도구·청크 크기로 Gateway 용어 검토 흐름을 만든다."""
+    config = settings.get()
+    return GatewayTermVerificationFlow(gateway, config.term_review_tool_names, config.term_review_chunk_chars)
+
+
 def get_note_store() -> FileNursingNoteStore:
     """확정 간호기록 JSON·PDF 저장소를 만든다."""
     return FileNursingNoteStore(settings.get().artifact_dir)
@@ -94,6 +105,15 @@ def get_transcript_redactor() -> TranscriptRedactor:
     return TranscriptRedactor(get_services().ner)
 
 
+def get_transcript_preparation(
+    stt: SpeechToTextProvider = Depends(get_speech_to_text_provider),
+    redactor: TranscriptRedactor = Depends(get_transcript_redactor),
+    gateway: McpGatewayClient = Depends(get_gateway_client),
+) -> TranscriptPreparation:
+    """STT → 비식별화 → 전사문 용어 검토 공통 단계다(동기 서식 추출 API가 쓴다)."""
+    return TranscriptPreparation(stt, get_term_verification(gateway), redactor, settings.get().term_hint_budget_seconds)
+
+
 def get_workflow_context_flow() -> ClinicalContextFlow:
     """임상 문맥 흐름을 만든다. 전사문만으로 초안을 만들며, 운영 EMR repository는 별도 adapter로 주입한다."""
     registry = get_services().template_registry
@@ -106,6 +126,7 @@ def get_nursing_note_workflow(
     stt: SpeechToTextProvider = Depends(get_speech_to_text_provider),
 ) -> NursingNoteWorkflow:
     """Gateway를 유일한 외부 MCP 경계로 사용해 초안과 검토 artifact를 조립한다."""
+    config = settings.get()
     gateway = get_gateway_client()
     try:
         generator = model_providers.draft_generator(gateway)
@@ -113,9 +134,9 @@ def get_nursing_note_workflow(
         log_event(_logger, "draft_generation_not_configured", error=type(exc).__name__)
         raise HTTPException(status_code=503, detail="draft generation is not configured") from exc
     return NursingNoteWorkflow(
-        stt, generator, GatewayTermVerificationFlow(gateway),
-        redactor=get_transcript_redactor(), report_validation=FormReportValidationFlow(gateway),
-        hint_budget_seconds=settings.get().term_hint_budget_seconds,
+        stt, generator, get_term_verification(gateway),
+        redactor=get_transcript_redactor(), report_validation=FormReportValidationFlow(gateway, config.report_validation_tool_name),
+        hint_budget_seconds=config.term_hint_budget_seconds,
     )
 
 

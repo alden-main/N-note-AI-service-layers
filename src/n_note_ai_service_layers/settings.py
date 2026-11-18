@@ -1,12 +1,19 @@
 """환경 변수(``N_NOTE_*`` 등)로 지정하는 서비스 설정이다.
 
-``get()``은 호출할 때마다 환경 변수를 다시 읽는다. 잘못된 값(숫자가 아닌 timeout 등)은 기본값으로
+``get()``은 관련 환경 변수(``N_NOTE_*``·``OPENAI_*``·``MCP_*``)가 그대로면 앞서 읽은 설정을 재사용하고, 바뀌면
+다시 읽는다(테스트의 환경 변수 patch도 그대로 반영된다). 잘못된 값(숫자가 아닌 timeout 등)은 기본값으로
 대체하지 않고 ``pydantic.ValidationError``로 알린다. 로컬 ``.env``는 ``dotenv.load_dotenv()``로 불러온다.
+
+설정을 읽는 곳은 조립 지점(``api/state.py``·``api/deps.py``·``adapters/model_providers.py``·진입점 스크립트),
+API 계층, 경계 유틸(``services/clock.py``·``services/executors.py``)뿐이다. 서비스·어댑터 생성자는 값을 인자로
+받고, 기본값은 아래 ``DEFAULT_*`` 상수를 쓴다.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import timedelta, timezone, tzinfo
 import json
 from pathlib import Path
@@ -28,6 +35,8 @@ DEFAULT_TERM_REVIEW_TOOLS = (
     "medic__analyze_document_terms",
 )
 DEFAULT_REPORT_VALIDATION_TOOL = "report__evaluate_report_against_standard"
+DEFAULT_MCP_GATEWAY_URL = "http://gateway:8080/mcp"
+DEFAULT_MCP_GATEWAY_TIMEOUT_SECONDS = 15.0
 # 표준국어 MCP의 기본 text 상한(10,000자)보다 작게 분할한다.
 DEFAULT_TERM_REVIEW_CHUNK_CHARS = 8000
 # Docker(fonts-nanum)와 macOS에서 바로 쓸 수 있는 TrueType 한글 글꼴 후보다.
@@ -137,12 +146,10 @@ class Settings(BaseSettings):
     require_local_stt: bool = False
 
     # AI 서비스가 호출할 수 있는 유일한 MCP endpoint다.
-    mcp_gateway_url: str = Field("http://gateway:8080/mcp", validation_alias="MCP_GATEWAY_URL")
-    mcp_gateway_timeout_seconds: PositiveFloat = Field(15.0, validation_alias="MCP_GATEWAY_TIMEOUT_SECONDS")
+    mcp_gateway_url: str = Field(DEFAULT_MCP_GATEWAY_URL, validation_alias="MCP_GATEWAY_URL")
+    mcp_gateway_timeout_seconds: PositiveFloat = Field(DEFAULT_MCP_GATEWAY_TIMEOUT_SECONDS, validation_alias="MCP_GATEWAY_TIMEOUT_SECONDS")
     # Gateway 도구 catalog를 재사용할 시간이다. 요청마다 initialize·tools/list 왕복을 줄인다.
     mcp_gateway_catalog_ttl_seconds: NonNegativeFloat = Field(300.0, validation_alias="MCP_GATEWAY_CATALOG_TTL_SECONDS")
-    # 용어 검토 도구·청크를 동시에 호출할 최대 개수다. 1이면 순차 호출한다.
-    gateway_max_concurrency: PositiveInt = 4
     # 초안 생성 LLM에 노출할 Gateway 도구 이름 목록이다(쉼표 구분).
     llm_tool_names: Names = Field(DEFAULT_LLM_TOOLS, validation_alias="N_NOTE_LLM_TOOLS")
     # 표준어·의학용어 검토 후보를 만들 Gateway 도구 이름 목록이다.
@@ -247,6 +254,15 @@ class Settings(BaseSettings):
         return next((Path(path) for path in DEFAULT_PDF_FONT_CANDIDATES if Path(path).is_file()), None)
 
 
+# 설정에 영향을 주는 환경 변수 접두사다(``OPENAI_*``·``MCP_*``는 레거시·Gateway 별칭).
+_ENV_PREFIXES = ("N_NOTE_", "OPENAI_", "MCP_")
+
+
 def get() -> Settings:
-    """현재 환경 변수로 설정을 읽는다."""
+    """현재 환경 변수의 설정이다. 관련 환경 변수가 같으면 이미 읽은 값을 돌려준다(요청마다 다시 파싱하지 않는다)."""
+    return _load(tuple(sorted((key, value) for key, value in os.environ.items() if key.startswith(_ENV_PREFIXES))))
+
+
+@lru_cache(maxsize=16)
+def _load(_environment: tuple[tuple[str, str], ...]) -> Settings:
     return Settings()

@@ -82,7 +82,7 @@ def build_database(source_dir: Path, output_dir: Path, dataset_version: str) -> 
         raise ImportValidationError([ImportIssue(str(source_dir), None, "no_source_files", "XLS 파일이 없습니다.")])
     output_dir.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output_dir) as temporary:
-        temp_dir, database = Path(temporary), Path(temporary) / "korean_standard_dictionary.sqlite3"
+        database = Path(temporary) / "korean_standard_dictionary.sqlite3"
         connection = sqlite3.connect(database)
         _create_schema(connection)
         rows = 0

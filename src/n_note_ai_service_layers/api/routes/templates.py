@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status
 
+from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers.api.deps import get_authenticated_user, resolve_actor
 from n_note_ai_service_layers.api.mappers import request_schema, template_response
 from n_note_ai_service_layers.api.schemas import TemplateActionRequest, TemplateRegistrationRequest
@@ -50,7 +50,7 @@ def approve_form_template(
     operator = resolve_actor(request.operator_id, authenticated_user, "operator_id")
     try:
         schema = services.template_registry.get(schema_id, version)
-        approved = services.template_review_service.approve_all(schema, operator, request.occurred_at or datetime.now(timezone.utc))
+        approved = services.template_review_service.approve_all(schema, operator, request.occurred_at or now_utc())
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     services.audit.record(x_trace_id or "-", "template_approved", schema_id, version, actor=operator)

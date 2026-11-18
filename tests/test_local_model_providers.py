@@ -8,9 +8,9 @@ from unittest.mock import patch
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
-from n_note_ai_service_layers.adapters.openai_chat_draft_generation import FINAL_OUTPUT_INSTRUCTION, FINAL_TURN_INSTRUCTION, OpenAiChatDraftGenerationAdapter
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
-from support import sample_form_schema
+from n_note_ai_service_layers.adapters.llm_completion import FINAL_OUTPUT_INSTRUCTION, FINAL_TURN_INSTRUCTION
+from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiChatDraftGenerationAdapter, OpenAiDraftGenerationAdapter
+from support import LOOKUP_TOOL, FakeGateway as _Gateway, sample_form_schema
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
 FINAL = '{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":{"assessment.pain_score":["transcript"]},"needs_confirmation":false}'
@@ -37,26 +37,17 @@ def _client(completions):
     return SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
 
-class _Gateway:
-    def __init__(self):
-        self.called = []
-
-    def __call__(self, url, body, headers, timeout):
-        message = json.loads(body)
-        if "id" not in message:  # notifications/initialized
-            return 202, {}, b""
-        method = message["method"]
-        if method == "initialize":
-            result = {"protocolVersion": "2025-06-18"}
-        elif method == "tools/list":
-            result = {"tools": [{"name": "dictionary__lookup", "description": "lookup", "inputSchema": {"type": "object", "properties": {"term": {"type": "string"}}, "required": ["term"]}}]}
-        else:
-            self.called.append(message["params"])
-            result = {"content": [{"type": "text", "text": "found"}]}
-        return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
-
-
 class ModelSettingsTests(unittest.TestCase):
+    def test_settings_are_reused_until_relevant_environment_changes(self):
+        with patch.dict(os.environ, {"N_NOTE_LLM_MODEL": "a"}):
+            first = settings.get()
+            self.assertIs(settings.get(), first)
+            with patch.dict(os.environ, {"UNRELATED_VARIABLE": "x"}):
+                self.assertIs(settings.get(), first)
+            with patch.dict(os.environ, {"N_NOTE_LLM_MODEL": "b"}):
+                self.assertEqual(settings.get().llm_model, "b")
+            self.assertIs(settings.get(), first)
+
     def test_openai_is_default_and_legacy_variables_still_apply(self):
         with patch.dict(os.environ, {"OPENAI_DRAFT_MODEL": "gpt-legacy", "N_NOTE_LLM_BASE_URL": ""}, clear=True):
             self.assertEqual(settings.get().llm_endpoint, settings.ModelEndpoint("gpt-legacy"))
@@ -86,8 +77,8 @@ class ModelSettingsTests(unittest.TestCase):
             generator = model_providers.draft_generator(McpGatewayClient(transport=_Gateway()))
             stt = model_providers.speech_to_text_provider()
         self.assertIsInstance(generator, OpenAiChatDraftGenerationAdapter)
-        self.assertIsNone(generator._gateway_client)
-        self.assertEqual(str(generator._client.base_url), "http://local-llm:8000/v1/")
+        self.assertIsNone(generator.tools.gateway)
+        self.assertEqual(str(generator.completion.client.base_url), "http://local-llm:8000/v1/")
         # LLM만 로컬이고 STT는 OpenAI인 혼합 구성이다.
         self.assertEqual(stt.provider, "openai")
         self.assertFalse(stt.normalize)
@@ -157,7 +148,7 @@ class ChatDraftAdapterTests(unittest.TestCase):
         self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
         self.assertEqual(gateway.called, [{"name": "dictionary__lookup", "arguments": {"term": "통증"}}])
         first, _, final = completions.requests
-        self.assertEqual(first["tools"][0], {"type": "function", "function": {"name": "dictionary__lookup", "description": "lookup", "parameters": {"type": "object", "properties": {"term": {"type": "string"}}, "required": ["term"]}}})
+        self.assertEqual(first["tools"][0], {"type": "function", "function": {"name": "dictionary__lookup", "description": "lookup", "parameters": LOOKUP_TOOL["inputSchema"]}})
         self.assertNotIn("response_format", first)
         self.assertNotIn("tools", final)
         roles = [message["role"] for message in final["messages"]]
@@ -182,7 +173,7 @@ class ChatDraftAdapterTests(unittest.TestCase):
         env = {"N_NOTE_LLM_MAX_TOOL_ROUNDS": "0", "N_NOTE_LLM_MAX_TOOL_CALLS": "3", "OPENAI_API_KEY": "test-key"}
         with patch.dict(os.environ, env, clear=True):
             adapter = model_providers.draft_generator(McpGatewayClient(transport=_Gateway()))
-        self.assertEqual((adapter._max_tool_rounds, adapter._max_tool_calls), (0, 3))
+        self.assertEqual((adapter.tools.max_tool_rounds, adapter.tools.max_tool_calls), (0, 3))
 
     def test_server_without_tool_support_falls_back_to_hints_only(self):
         import httpx2 as httpx

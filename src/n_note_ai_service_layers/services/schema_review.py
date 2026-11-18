@@ -15,7 +15,7 @@ from n_note_ai_service_layers.observability import get_logger, log_event
 
 TEMPLATE_COLLECTION = "form_templates"
 _logger = get_logger("templates")
-from n_note_ai_service_layers.services.schema_validation import ensure_approvable, validate_schema_structure
+from n_note_ai_service_layers.services.schema_validation import ensure_approvable
 
 
 def _store_key(schema_id: str, version: str) -> str:
@@ -67,7 +67,6 @@ class FormSchemaRegistry:
         """
         if self._store is None:
             return self.add(schema)
-        validate_schema_structure(schema)
         self._sync()
         key = (schema.schema_id, schema.version)
         with self._lock:
@@ -88,7 +87,6 @@ class FormSchemaRegistry:
         입력: ``schema``는 등록할 양식 스키마이다.
         출력: 동일한 ``schema``이며, 기존 버전 또는 활성 버전 충돌 시 ``ValueError``를 발생시킨다.
         """
-        validate_schema_structure(schema)
         self._sync()
         key = (schema.schema_id, schema.version)
         with self._lock:

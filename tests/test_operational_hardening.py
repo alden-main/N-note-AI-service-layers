@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import tempfile
 import threading
@@ -18,7 +17,7 @@ from fastapi.testclient import TestClient
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.document_store import InMemoryDocumentStore, SqliteDocumentStore, VersionConflict
-from n_note_ai_service_layers.api import app, draft_review_store, get_nursing_note_workflow, get_workflow_context_flow, template_registry
+from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_services, get_workflow_context_flow
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
@@ -33,6 +32,11 @@ from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClien
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow, NursingNoteWorkflowResult, WorkflowStageError
 from n_note_ai_service_layers.services.schema_review import FormSchemaRegistry
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
+from support import FakeGateway
+
+# 테스트가 상태를 직접 확인·초기화하는 저장소다.
+draft_review_store = get_services().draft_review_store
+template_registry = get_services().template_registry
 
 SCHEMA = FormSchema(
     "hardening-test", "v1", "HARDENING_TEST",
@@ -164,8 +168,7 @@ class WorkflowApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/nursing-note-jobs/missing/events").status_code, 404)
 
     def test_full_queue_is_rejected_with_retry_after(self) -> None:
-        from n_note_ai_service_layers.api import job_runner
-        with patch.object(job_runner, "max_pending", 0):
+        with patch.object(get_services().job_runner, "max_pending", 0):
             response = self._post(object())
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.headers["Retry-After"], "5")
@@ -347,23 +350,14 @@ class WorkflowHintTrackingTests(unittest.TestCase):
 
 class GatewayCatalogCacheTests(unittest.TestCase):
     def test_catalog_is_reused_within_ttl(self) -> None:
-        methods = []
-
-        def transport(url, body, headers, timeout):
-            request = json.loads(body)
-            methods.append(request["method"])
-            if "id" not in request:  # notifications/initialized
-                return 202, {}, b""
-            result = {"protocolVersion": "2025-06-18"} if request["method"] == "initialize" else {"tools": []}
-            return 200, {}, json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}).encode()
-
-        client = McpGatewayClient("http://gateway/mcp", 1.0, transport, catalog_ttl_seconds=60)
+        gateway = FakeGateway(tools=[])
+        client = McpGatewayClient("http://gateway/mcp", 1.0, gateway, catalog_ttl_seconds=60)
         client.discover("a")
         client.discover("b")
-        self.assertEqual(methods, ["initialize", "notifications/initialized", "tools/list"])
+        self.assertEqual(gateway.methods, ["initialize", "notifications/initialized", "tools/list"])
         client.invalidate_catalog()
         client.discover("c")
-        self.assertEqual(len(methods), 6)
+        self.assertEqual(len(gateway.methods), 6)
 
 
 class ModelProviderPolicyTests(unittest.TestCase):

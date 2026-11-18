@@ -15,13 +15,14 @@ import json
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from dotenv import load_dotenv
 
+from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
@@ -160,7 +161,7 @@ def run_case(case: EvalCase, stt_provider: Any | None = None) -> dict[str, Any]:
     schema_id, purpose = api.resolve_workflow_form(case.schema_id, None)
     trace_id = str(uuid4())
     context_flow = api.get_workflow_context_flow()
-    snapshot = context_flow.build(ClinicalContextQuery("EVAL-PATIENT", "EVAL-ENCOUNTER", purpose, datetime.now(timezone.utc), schema_id, trace_id, None))
+    snapshot = context_flow.build(ClinicalContextQuery("EVAL-PATIENT", "EVAL-ENCOUNTER", purpose, now_utc(), schema_id, trace_id, None))
     schema = context_flow.registry.resolve_active(schema_id, purpose, None)
     if uses_audio:
         audio = AudioInput(case.audio_path.read_bytes(), case.audio_path.name, AUDIO_TYPES[case.audio_path.suffix.lower()], trace_id, case.language_hint)

@@ -6,7 +6,7 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from n_note_ai_service_layers.api import app, draft_review_store, get_nursing_note_workflow, get_workflow_context_flow, template_registry
+from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_services, get_workflow_context_flow
 from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.contracts.codec import to_json_dict
 from n_note_ai_service_layers.contracts.draft import DraftResult
@@ -15,6 +15,10 @@ from n_note_ai_service_layers.contracts.term_verification import GatewayTermVeri
 from n_note_ai_service_layers.services.draft_review import DraftReviewStore, NumericReviewRequired
 from n_note_ai_service_layers.services.numeric_verification import NumericVerifier, source_numbers
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflowResult
+
+# 테스트가 상태를 직접 확인·초기화하는 저장소다.
+draft_review_store = get_services().draft_review_store
+template_registry = get_services().template_registry
 
 REFERENCE = datetime(2026, 10, 28, 16, 44, tzinfo=timezone.utc)
 SCHEMA = FormSchema(

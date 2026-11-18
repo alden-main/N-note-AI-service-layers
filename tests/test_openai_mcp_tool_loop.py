@@ -4,25 +4,10 @@ import json
 from types import SimpleNamespace
 import unittest
 
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter, model_tool_output
-from support import sample_form_schema
+from n_note_ai_service_layers.adapters.llm_completion import model_tool_output
+from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
+from support import FakeGateway as _Gateway, sample_form_schema
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
-
-
-class _Gateway:
-    def __init__(self): self.called = []
-    def __call__(self, url, body, headers, timeout):
-        import json
-        message = json.loads(body)
-        if "id" not in message:  # notifications/initialized
-            return 202, {}, b""
-        method = message["method"]
-        if method == "initialize": result = {"protocolVersion": "2025-06-18"}
-        elif method == "tools/list": result = {"tools": [{"name": "dictionary__lookup", "description": "lookup", "inputSchema": {"type": "object", "properties": {"term": {"type": "string"}}, "required": ["term"], "additionalProperties": False}}]}
-        else:
-            self.called.append(message["params"])
-            result = {"content": [{"type": "text", "text": "found"}]}
-        return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
 
 
 class _Responses:
@@ -60,7 +45,7 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
         self.assertNotIn("dictionary tools", responses.requests[0]["instructions"])
 
     def test_generation_options_reach_the_responses_request(self):
-        from n_note_ai_service_layers.adapters.openai_draft_generation import GenerationOptions
+        from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions
 
         responses = _Responses()
         responses.number = 1

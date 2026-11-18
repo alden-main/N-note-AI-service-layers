@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, InMemoryDocumentStore, VersionConflict
 from n_note_ai_service_layers.contracts.codec import from_json_dict, to_json_dict
 
@@ -97,7 +98,7 @@ class DraftReviewStore:
         """
         self._validate_fields(schema, fields)
         draft_id = str(uuid4())
-        now = datetime.now(timezone.utc)
+        now = now_utc()
         initial = DraftRevision(draft_id, 1, dict(fields), {candidate_id: "pending" for candidate_id in candidate_ids}, "system", now)
         record = DraftReviewRecord(
             draft_id, schema.schema_id, schema.version, transcript, candidate_ids, (initial,), candidates, patient_id, encounter_id,
@@ -183,7 +184,7 @@ class DraftReviewStore:
             candidates = {key: replace(item, stale=True) if item.field_id == field_id and key not in applied_before else item for key, item in candidates.items()}
         fields.update(edited_fields)
 
-        revision = DraftRevision(draft_id, previous.revision + 1, fields, {**previous.candidate_decisions, **decisions}, edited_by, datetime.now(timezone.utc), applied)
+        revision = DraftRevision(draft_id, previous.revision + 1, fields, {**previous.candidate_decisions, **decisions}, edited_by, now_utc(), applied)
         updated = replace(record, revisions=record.revisions + (revision,), candidates=tuple(candidates[item.candidate_id] for item in record.candidates))
         self._save(updated, version)
         self.audit.record(trace_id, "draft_revised", schema.schema_id, schema.version, actor=edited_by, subject_id=draft_id)
@@ -224,7 +225,7 @@ class DraftReviewStore:
         note = FinalizedNursingNote(
             str(uuid4()), draft_id, latest.revision, schema.schema_id, schema.version, schema.display_title,
             record.patient_id, record.encounter_id, dict(latest.fields), dict(latest.candidate_decisions), applied,
-            finalized_by, datetime.now(timezone.utc), trace_id,
+            finalized_by, now_utc(), trace_id,
             tuple(f"{item.field_id}: {item.text}" for item in numeric),
             record.llm_applied_term_hints,
         )

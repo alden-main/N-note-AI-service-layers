@@ -12,10 +12,13 @@ from pathlib import Path
 
 import uvicorn
 
-from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_speech_to_text_provider, get_workflow_context_flow, store
+from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_services, get_speech_to_text_provider, get_workflow_context_flow
 from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.run_smoke_test import main
 from test_multi_form_workflow import BASE, _Context, _workflow
+
+# 테스트가 상태를 직접 확인·초기화하는 저장소다.
+store = get_services().handoff_store
 
 CASE = Path(__file__).resolve().parents[1] / "eval/cases/stt-admission-tts"
 

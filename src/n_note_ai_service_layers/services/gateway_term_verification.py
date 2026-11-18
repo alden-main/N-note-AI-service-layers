@@ -6,7 +6,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from n_note_ai_service_layers import settings
+from n_note_ai_service_layers.settings import DEFAULT_TERM_REVIEW_CHUNK_CHARS, DEFAULT_TERM_REVIEW_TOOLS
 from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN
 from n_note_ai_service_layers.contracts.term_verification import (
     GatewaySuggestion,
@@ -33,13 +33,11 @@ class GatewayTermVerificationFlow:
     MAX_SUGGESTIONS = 10
 
     def __init__(
-        self, gateway: McpGatewayClient, tool_names: tuple[str, ...] | None = None, chunk_chars: int | None = None, max_concurrency: int | None = None,
+        self, gateway: McpGatewayClient, tool_names: tuple[str, ...] = DEFAULT_TERM_REVIEW_TOOLS, chunk_chars: int = DEFAULT_TERM_REVIEW_CHUNK_CHARS,
     ) -> None:
-        config = settings.get()
         self.gateway = gateway
-        self.tool_names = tool_names if tool_names is not None else config.term_review_tool_names
-        self.chunk_chars = chunk_chars or config.term_review_chunk_chars
-        self.max_concurrency = max_concurrency or config.gateway_max_concurrency
+        self.tool_names = tool_names
+        self.chunk_chars = chunk_chars
 
     def verify(self, phase: str, text: str, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> GatewayTermVerificationResult:
         """전사문 같은 단일 텍스트를 검토하고 원문 기준 offset 후보를 반환한다."""
@@ -98,7 +96,7 @@ class GatewayTermVerificationFlow:
     def _call_all(self, tasks: list[tuple[str, int, str]], request_id: str | None, compact_tools: frozenset[str] = frozenset()) -> list[dict[str, Any] | None]:
         """도구·청크 호출을 Gateway 일괄 호출 한 번으로 보내고 입력 순서대로 결과(실패는 ``None``)를 반환한다."""
         calls = [(tool_name, {"text": chunk, **({"detail": "compact"} if tool_name in compact_tools else {})}) for tool_name, _, chunk in tasks]
-        outcomes = self.gateway.call_tools(calls, request_id, self.max_concurrency)
+        outcomes = self.gateway.call_tools(calls, request_id)
         return [None if isinstance(outcome, McpGatewayError) else outcome for outcome in outcomes]
 
     @staticmethod

@@ -10,7 +10,7 @@ from dataclasses import replace
 
 from fastapi.testclient import TestClient
 
-from n_note_ai_service_layers.api import app, draft_review_store, get_nursing_note_workflow, get_workflow_context_flow, store
+from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_services, get_workflow_context_flow
 from n_note_ai_service_layers.api.routes.workflow_jobs import requested_form_ids
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
@@ -19,9 +19,13 @@ from n_note_ai_service_layers.contracts.term_verification import GatewayTermVeri
 from n_note_ai_service_layers.services.llm_payload import LlmPayloadProjector
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow, NursingNoteWorkflowResult, WorkflowStageError
-from support import SCORE_FIELD, sample_form_schema
+from support import SCORE_FIELD, FakeGateway, sample_form_schema
 
 AUDIO = AudioInput(b"a", "a.wav", "audio/wav", "trace")
+
+# 테스트가 상태를 직접 확인·초기화하는 저장소다.
+draft_review_store = get_services().draft_review_store
+store = get_services().handoff_store
 BASE = sample_form_schema(SchemaStatus.ACTIVE)
 SCHEMAS = {name: replace(BASE, schema_id=name, version=f"{name}/v1") for name in ("form-a", "form-b", "form-c")}
 
@@ -129,6 +133,20 @@ class GenerateManyTests(unittest.TestCase):
         pools = {name: executors.shared(name, 1) for name in ("form-draft", "transcript-review")}
         _workflow().generate_many(AUDIO, forms, max_parallel=3)
         self.assertTrue(all(executors.shared(name, 1) is pool for name, pool in pools.items()))
+
+    def test_a_crashing_transcript_review_becomes_unavailable_instead_of_failing_the_job(self) -> None:
+        from n_note_ai_service_layers.services.nursing_note_workflow import TranscriptPreparation
+
+        class Crashing(_Gateway):
+            def verify(self, phase, text, trace_id, catalog=None):
+                raise RuntimeError("bug in review")
+
+        prepared = TranscriptPreparation(_Stt(), Crashing(), hint_budget_seconds=1).prepare(AUDIO, (), lambda _stage: None)
+        self.assertEqual(prepared.review.result().status, "unavailable")
+        self.assertEqual(prepared.hints, ())
+        outcomes = _workflow(gateway=Crashing()).generate_many(AUDIO, [(BASE, object())], max_parallel=1)
+        self.assertIsInstance(outcomes[0], NursingNoteWorkflowResult)
+        self.assertEqual(outcomes[0].transcript_gateway_verification.status, "unavailable")
 
     def test_one_failed_form_keeps_the_other_drafts(self) -> None:
         forms = [(schema, object()) for schema in SCHEMAS.values()]
@@ -247,24 +265,13 @@ class MultiFormWorkflowApiTests(unittest.TestCase):
 
 class GatewayBatchSplitTests(unittest.TestCase):
     def test_calls_above_the_gateway_limit_are_split_and_keep_order(self) -> None:
-        batches: list[int] = []
         tool = {"name": "t", "description": "d", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}
+        gateway = FakeGateway([tool], handler=lambda _name, arguments: {"structuredContent": {"echo": arguments["text"]}, "isError": False})
 
-        def transport(url, body, headers, timeout):
-            message = json.loads(body)
-            if url.endswith("/v1/tools/batch-call"):
-                batches.append(len(message["calls"]))
-                results = [{"structuredContent": {"echo": call["arguments"]["text"]}, "isError": False} for call in message["calls"]]
-                return 200, {}, json.dumps({"results": results}).encode()
-            if "id" not in message:  # notifications/initialized
-                return 202, {}, b""
-            result = {"protocolVersion": "2025-06-18"} if message["method"] == "initialize" else {"tools": [tool]}
-            return 200, {}, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
-
-        client = McpGatewayClient(transport=transport, batch_max_calls=2)
+        client = McpGatewayClient(transport=gateway, batch_max_calls=2)
         client.discover()
         outcomes = client.call_tools([("t", {"text": str(index)}) for index in range(5)])
-        self.assertEqual(sorted(batches), [1, 2, 2])
+        self.assertEqual(sorted(len(batch["calls"]) for batch in gateway.batches), [1, 2, 2])
         self.assertEqual([item["structuredContent"]["echo"] for item in outcomes], ["0", "1", "2", "3", "4"])
 
 

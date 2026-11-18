@@ -10,27 +10,7 @@ from n_note_ai_service_layers.services.mcp_gateway_client import (
     McpGatewayToolError,
     _batch_url,
 )
-
-
-class _Gateway:
-    def __init__(self) -> None:
-        self.requests: list[tuple[dict, dict]] = []
-        self.tools = [{"name": "dictionary__lookup", "description": "lookup", "inputSchema": {"type": "object", "properties": {"term": {"type": "string"}}, "required": ["term"], "additionalProperties": False}}]
-        self.tool_result: dict = {"content": [{"type": "text", "text": "ok"}]}
-
-    def __call__(self, url, body, headers, timeout):
-        request = json.loads(body)
-        self.requests.append((request, dict(headers)))
-        if "id" not in request:  # notifications/initialized
-            return 202, {}, b""
-        if request["method"] == "initialize":
-            result = {"protocolVersion": "2025-06-18"}
-        elif request["method"] == "tools/list":
-            result = {"tools": self.tools}
-        else:
-            result = self.tool_result
-        response = {"jsonrpc": "2.0", "id": request["id"], "result": result}
-        return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps(response).encode()
+from support import FakeGateway as _Gateway
 
 
 class McpGatewayClientTests(unittest.TestCase):
@@ -111,25 +91,12 @@ class McpGatewayClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "not_found")
 
 
-class _BatchGateway(_Gateway):
-    def __init__(self, fail_connection: bool = False) -> None:
-        super().__init__()
-        self.batches: list[dict] = []
-        self.fail_connection = fail_connection
-
-    def __call__(self, url, body, headers, timeout):
-        if not url.endswith("/v1/tools/batch-call"):
-            return super().__call__(url, body, headers, timeout)
-        if self.fail_connection:
-            raise OSError("refused")
-        request = json.loads(body)
-        self.batches.append(request)
-        results = [
-            {"isError": True, "content": [{"type": "text", "text": json.dumps({"error": {"code": "upstream_unavailable", "message": "down", "retryable": True}})}]}
-            if item["arguments"]["term"] == "down" else {"structuredContent": {"term": item["arguments"]["term"]}, "isError": False}
-            for item in request["calls"]
-        ]
-        return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps({"results": results}).encode()
+def _batch_result(_name: str, arguments: dict) -> dict:
+    """``term="down"``이면 upstream 장애 tool result, 아니면 받은 term을 구조화 결과로 돌려준다."""
+    if arguments["term"] == "down":
+        error = {"code": "upstream_unavailable", "message": "down", "retryable": True}
+        return {"isError": True, "content": [{"type": "text", "text": json.dumps({"error": error})}]}
+    return {"structuredContent": {"term": arguments["term"]}, "isError": False}
 
 
 class McpGatewayBatchTests(unittest.TestCase):
@@ -138,7 +105,7 @@ class McpGatewayBatchTests(unittest.TestCase):
         self.assertEqual(_batch_url("https://proxy/gw/mcp/"), "https://proxy/gw/v1/tools/batch-call")
 
     def test_call_tools_sends_valid_calls_once_and_keeps_order(self):
-        gateway = _BatchGateway()
+        gateway = _Gateway(handler=_batch_result)
         client = McpGatewayClient(transport=gateway)
         client.discover()
         results = client.call_tools([("dictionary__lookup", {"term": "a"}), ("missing__tool", {}), ("dictionary__lookup", {"term": "down"})], "trace-9")
@@ -150,7 +117,7 @@ class McpGatewayBatchTests(unittest.TestCase):
         self.assertTrue(results[2].retryable)
 
     def test_batch_connection_failure_marks_every_call_unavailable(self):
-        client = McpGatewayClient(transport=_BatchGateway(fail_connection=True))
+        client = McpGatewayClient(transport=_Gateway(batch_error=OSError("refused")))
         client.discover()
         results = client.call_tools([("dictionary__lookup", {"term": "a"}), ("dictionary__lookup", {"term": "b"})])
         self.assertTrue(all(isinstance(item, McpGatewayConnectionError) for item in results))
