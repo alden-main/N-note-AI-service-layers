@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import AfterValidator, AliasChoices, BeforeValidator, Field, NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from n_note_ai_service_layers import prompts
+
 # LLM 초안 생성 중 호출을 허용하는 Gateway 읽기 전용 도구다. 제출·승인·이력 도구는
 # upstream 상태를 바꾸므로 LLM tool 목록에서 제외한다.
 DEFAULT_LLM_TOOLS = (
@@ -46,11 +48,6 @@ DEFAULT_PDF_FONT_CANDIDATES = (
     "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
 )
 DEFAULT_TIMEZONE = "Asia/Seoul"
-# STT가 간호 구술 어휘로 전사하도록 주는 기본 문맥이다. Whisper 프롬프트 상한(약 224토큰)보다 짧게 유지한다.
-DEFAULT_STT_PROMPT = (
-    "간호기록 구술입니다. V/S, NPO, I/O, POD, 활력징후, 주호소, 현병력, 과거력, 수술력, 가족력, 고혈압, 당뇨, "
-    "간경변증, 흑색변, 어지럼증, 두드러기, 알레르기, 혈색소, 위내시경, 수혈, 금식, 아스피린, 프로프라놀롤"
-)
 # tzdata가 없는 최소 이미지에서도 병동 시각을 잃지 않도록 고정 오프셋을 둔다(서머타임 없는 지역만).
 _FIXED_OFFSET_ZONES = {"Asia/Seoul": timezone(timedelta(hours=9), "KST")}
 # 비우면 '사용하지 않음'을 뜻하는 환경 변수다. 나머지는 빈 값을 미설정(기본값)으로 본다.
@@ -98,12 +95,16 @@ class Settings(BaseSettings):
     stt_base_url: str | None = None
     stt_api_key: str | None = None
     # 병동 약어·의학용어 인식률을 높이는 STT 문맥 힌트다.
-    stt_prompt: str = Field(DEFAULT_STT_PROMPT, validation_alias=_env("N_NOTE_STT_PROMPT", "OPENAI_STT_PROMPT"))
+    # 기본값은 prompts.toml의 [stt] context다.
+    stt_prompt: str = Field(default_factory=lambda: prompts.get().stt.context, validation_alias=_env("N_NOTE_STT_PROMPT", "OPENAI_STT_PROMPT"))
     llm_model: str = Field("gpt-4o-mini", validation_alias=_env("N_NOTE_LLM_MODEL", "OPENAI_DRAFT_MODEL"))
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     # 초안 생성 API 형식이다. 미설정이면 ``base_url``이 있을 때 ``chat``, 없으면 ``responses``다.
     llm_api_override: Literal["responses", "chat"] | None = Field(None, validation_alias="N_NOTE_LLM_API")
+    # LLM 호출 계층이다. ``native``는 OpenAI SDK 직접 호출, ``pydantic_ai``는 Pydantic AI Agent다.
+    # 두 계층은 같은 요청 형식(지침·스키마·도구 상한)을 쓰므로 eval로 비교한 뒤 바꾼다.
+    llm_engine: Literal["native", "pydantic_ai"] = "native"
     # tool call을 지원하지 않는 모델은 끈다.
     llm_tool_calling_enabled: bool = Field(True, validation_alias="N_NOTE_LLM_TOOL_CALLING")
     # 초안 생성 중 사전 도구 결과를 LLM에 돌려주는 왕복 횟수 상한이다. LLM 호출은 최대 ``1 + 이 값``번이다.
@@ -207,6 +208,10 @@ class Settings(BaseSettings):
     # 녹음 세션 하나가 받을 수 있는 최대 청크 수다(30초 청크면 240개가 2시간).
     max_recording_chunks: PositiveInt = 240
     log_level: Annotated[str, AfterValidator(str.upper)] = "INFO"
+    # OpenTelemetry 추적이다. 켜면 OTEL_EXPORTER_OTLP_ENDPOINT(표준 변수)로 OTLP/HTTP 전송한다.
+    otel_enabled: bool = False
+    # span에 프롬프트·LLM 응답·도구 인자 같은 본문을 남긴다. 합성 데이터를 쓰는 개발·평가 환경에서만 켠다.
+    otel_capture_content: bool = False
     # 구술 시각('오후 2시')과 감사 시각을 해석할 병동 시간대다. 컨테이너 기본(UTC)이면 00~09시 구술이 전날이 된다.
     timezone_name: str = Field(DEFAULT_TIMEZONE, validation_alias="N_NOTE_TIMEZONE")
     # PDF에 포함할 한글 TrueType 글꼴 경로다. 설정이 없으면 알려진 위치를 찾는다.

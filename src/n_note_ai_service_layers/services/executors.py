@@ -18,6 +18,8 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypeVar
 
+from n_note_ai_service_layers.observability import ContextThreadPoolExecutor
+
 T = TypeVar("T")
 R = TypeVar("R")
 
@@ -30,7 +32,8 @@ def shared(name: str, max_workers: int) -> ThreadPoolExecutor:
     with _lock:
         executor = _executors.get(name)
         if executor is None:
-            executor = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix=name)
+            # 제출한 쪽의 추적 문맥을 이어받아 양식별 초안·도구 호출 span이 작업 span 아래에 놓인다.
+            executor = ContextThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix=name)
             _executors[name] = executor
         return executor
 

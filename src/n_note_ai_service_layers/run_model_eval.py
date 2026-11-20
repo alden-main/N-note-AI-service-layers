@@ -23,7 +23,7 @@ from uuid import uuid4
 from dotenv import load_dotenv
 
 from n_note_ai_service_layers.services.clock import now_utc
-from n_note_ai_service_layers import settings
+from n_note_ai_service_layers import prompts, settings
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
@@ -182,6 +182,7 @@ def run_case(case: EvalCase, stt_provider: Any | None = None) -> dict[str, Any]:
         "transcript": result.transcript.text,
         "cer": round(character_error_rate(case.reference_transcript, result.transcript.text), 4) if uses_audio and case.reference_transcript else None,
         "model_version": result.draft.model_version,
+        "prompt_version": result.draft.prompt_version,
         "needs_confirmation": result.draft.needs_confirmation,
         "fields": result.draft.proposed_fields,
         "transcript_candidates": len(result.transcript_gateway_verification.occurrences),
@@ -211,6 +212,9 @@ def summarize(profile: str, records: list[dict[str, Any]]) -> dict[str, Any]:
         "stt_model": config.stt_endpoint.model,
         "llm_model": next((item["model_version"] for item in ok), config.llm_endpoint.model),
         "llm_api": config.llm_api,
+        # 같은 사례로 LLM 호출 계층(native·pydantic_ai)과 프롬프트 판을 비교할 수 있게 함께 남긴다.
+        "llm_engine": config.llm_engine,
+        "prompt_version": next((item["prompt_version"] for item in ok if item.get("prompt_version")), prompts.get().draft.version),
         "tool_calling": config.llm_tool_calling_enabled,
         "cases": len(records),
         "ok": len(ok),
@@ -227,7 +231,7 @@ def summarize(profile: str, records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-COLUMNS = ("profile", "llm_model", "ok", "cases", "required_fill_rate", "keyword_recall", "forbidden_cases", "numeric_flag_cases", "mean_cer", "mean_stt_term_recall", "mean_llm_seconds", "mean_total_seconds")
+COLUMNS = ("profile", "llm_model", "llm_engine", "prompt_version", "ok", "cases", "required_fill_rate", "keyword_recall", "forbidden_cases", "numeric_flag_cases", "mean_cer", "mean_stt_term_recall", "mean_llm_seconds", "mean_total_seconds")
 
 
 def compare(results_root: Path) -> list[dict[str, Any]]:

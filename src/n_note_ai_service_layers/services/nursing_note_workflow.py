@@ -15,7 +15,7 @@ from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
 from n_note_ai_service_layers.contracts.report_validation import ReportValidationResult
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
-from n_note_ai_service_layers.observability import get_logger, log_event, stage
+from n_note_ai_service_layers.observability import get_logger, log_event, span, stage
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.draft_document import DraftDocument, is_filled
 from n_note_ai_service_layers.services import executors
@@ -283,6 +283,13 @@ class NursingNoteWorkflow:
         self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
         """양식 하나의 단계다: 검토 힌트를 포함한 초안 생성 → 수치 대조 → (초안 용어 검토 ∥ 양식 완결성 검증)."""
+        # 양식별 span이다. 여러 양식을 동시에 만들 때 추적 화면에서 양식마다 한 갈래로 보인다.
+        with span("form_draft", prepared.trace_id, schema_id=schema.schema_id, schema_version=schema.version):
+            return self._draft(prepared, snapshot, schema, notify)
+
+    def _draft(
+        self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None,
+    ) -> NursingNoteWorkflowResult:
         notify = notify or (lambda _: None)
         trace_id, transcript, hints = prepared.trace_id, prepared.transcript, prepared.hints
         notify("draft_generation")

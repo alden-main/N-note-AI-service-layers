@@ -13,22 +13,18 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from openai import BadRequestError
 
+from n_note_ai_service_layers import prompts
+from n_note_ai_service_layers.observability import current_span, set_attributes, set_content, span
 from n_note_ai_service_layers.services import executors
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient, McpGatewayError, McpGatewayToolError
 
-# Chat: 구조화 출력을 강제하지 못하는 서버(MLX, 일부 llama.cpp 등)도 같은 구조를 따르도록 스키마를 프롬프트에도 넣는다.
-FINAL_OUTPUT_INSTRUCTION = (
-    "When you have the information you need, return only one JSON object that matches "
-    "the JSON schema below, with no other text. Write every text value in Korean."
-)
-# Chat: 도구 대화 뒤 마지막 구조화 출력 요청에 붙이는 user 메시지다.
-FINAL_TURN_INSTRUCTION = "Now return only the final JSON object."
 # 응답 하나에서 동시에 Gateway로 보내는 도구 호출 수다. 넘는 호출은 이어서 순차로 보낸다.
 MAX_PARALLEL_TOOL_CALLS = 4
 # 사전 뜻풀이는 문맥 판단에 필요한 첫 부분만 준다. 동음이의어가 여럿이면 앞부분만으로 구분된다.
@@ -112,6 +108,9 @@ class ToolExecutor:
             return []
         return self.gateway.model_tools(self.allowed_tool_names)
 
+    def exhausted_by_time(self, budget: ToolBudget) -> bool:
+        return time.monotonic() - budget.started >= self.timeout_seconds
+
     def exhausted(self, budget: ToolBudget) -> bool:
         """왕복·호출 수 또는 시간 상한에 닿았는지다. 닿으면 다음 LLM 요청이 마지막이다."""
         return (
@@ -142,6 +141,15 @@ class ToolExecutor:
         return results
 
     def _call(self, name: Any, raw_arguments: Any) -> dict[str, Any]:
+        """도구 호출 하나다. span(``n_note.llm.tool``)에 도구 이름·결과 코드를 남긴다(인자·결과 본문은 본문 기록 시에만)."""
+        with span("llm.tool", **{"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": str(name)}) as current:
+            set_content(current, "gen_ai.tool.call.arguments", raw_arguments)
+            result = self._call_gateway(name, raw_arguments)
+            set_attributes(current, {"llm.tool_error": result.get("error")})
+            set_content(current, "gen_ai.tool.call.result", result)
+            return result
+
+    def _call_gateway(self, name: Any, raw_arguments: Any) -> dict[str, Any]:
         assert self.gateway is not None
         if not isinstance(name, str) or (self.allowed_tool_names is not None and name not in self.allowed_tool_names):
             return {"error": "invalid_tool_call"}
@@ -198,21 +206,40 @@ class ResponsesCompletion:
         accept_unconstrained: Callable[[Any], str | None] | None = None,
     ) -> Any:
         """도구를 주면 상한 안에서 도구 결과를 돌려주며 최종 출력을 받는다. ``accept_unconstrained``는 쓰지 않는다."""
-        model_tools = tools.model_tools() if tools else []
-        request: dict[str, Any] = {
-            "model": self.model,
-            "instructions": instructions + (tool_instruction if model_tools else ""),
-            "input": [{"role": "user", "content": user_content}],
-            "text": {"format": {"type": "json_schema", "name": output.name, "schema": output.schema, "strict": True}},
-            "store": False,
-            **self.options.responses_kwargs(),
-        }
-        if model_tools:
-            request["tools"] = model_tools
-        response = self.client.responses.create(**request)
-        if model_tools and tools is not None:
-            response = self._tool_loop(response, request, tools)
-        return getattr(response, "output_text", None)
+        with completion_span("responses", self.model, output, instructions, user_content) as current:
+            model_tools = tools.model_tools() if tools else []
+            request: dict[str, Any] = {
+                "model": self.model,
+                "instructions": instructions + (tool_instruction if model_tools else ""),
+                "input": [{"role": "user", "content": user_content}],
+                "text": {"format": {"type": "json_schema", "name": output.name, "schema": output.schema, "strict": True}},
+                "store": False,
+                **self.options.responses_kwargs(),
+            }
+            if model_tools:
+                request["tools"] = model_tools
+            set_attributes(current, {"llm.tools_offered": len(model_tools)})
+            response = self._create(request, 0)
+            if model_tools and tools is not None:
+                response = self._tool_loop(response, request, tools)
+            text = getattr(response, "output_text", None)
+            set_content(current, "llm.output", text)
+            return text
+
+    def _create(self, request: dict[str, Any], round_index: int) -> Any:
+        """Responses 요청 한 번이다. span(``n_note.llm.request``)에 왕복 번호·토큰 수·요청한 도구 수를 남긴다."""
+        with request_span(self.model, round_index, request.get("tool_choice")) as current:
+            set_content(current, "llm.request_input", request["input"])
+            response = self.client.responses.create(**request)
+            usage = getattr(response, "usage", None)
+            calls = [item for item in (getattr(response, "output", None) or []) if _value(item, "type") == "function_call"]
+            set_attributes(current, {
+                "gen_ai.usage.input_tokens": getattr(usage, "input_tokens", None),
+                "gen_ai.usage.output_tokens": getattr(usage, "output_tokens", None),
+                "llm.tool_calls_requested": len(calls),
+            })
+            set_content(current, "llm.response_output", [_plain(item) for item in calls] or getattr(response, "output_text", None))
+            return response
 
     def _tool_loop(self, response: Any, request: dict[str, Any], tools: ToolExecutor) -> Any:
         """상한에 닿으면 마지막 요청을 ``tool_choice="none"``으로 보내 모델이 도구 없이 출력을 내게 한다.
@@ -238,7 +265,8 @@ class ResponsesCompletion:
             request = {**request, "input": [*request["input"], *echoed, *outputs]}
             if tools.exhausted(budget):
                 request["tool_choice"] = "none"
-            response = self.client.responses.create(**request)
+            response = self._create(request, budget.rounds)
+            record_budget(budget)
 
 
 class ChatCompletion:
@@ -263,21 +291,45 @@ class ChatCompletion:
         tools: ToolExecutor | None = None, tool_instruction: str = "",
         accept_unconstrained: Callable[[Any], str | None] | None = None,
     ) -> Any:
-        chat_tools = [_chat_tool(tool) for tool in (tools.model_tools() if tools else [])]
-        system = (
-            instructions + (tool_instruction if chat_tools else "")
-            + "\n\n" + FINAL_OUTPUT_INSTRUCTION + "\nJSON schema:\n" + json.dumps(output.schema, ensure_ascii=False)
-        )
-        messages: list[dict[str, Any]] = [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
-        if chat_tools and tools is not None:
-            messages, answer = self._tool_phase(messages, chat_tools, tools, accept_unconstrained)
-            if answer is not None:
-                return answer
-        response = self.client.chat.completions.create(
-            **self._request(_with_final_turn(messages)),
-            response_format={"type": "json_schema", "json_schema": {"name": output.name, "schema": output.schema, "strict": True}},
-        )
-        return json_text(first_message(response).get("content"))
+        with completion_span("chat", self.model, output, instructions, user_content) as current:
+            chat_tools = [_chat_tool(tool) for tool in (tools.model_tools() if tools else [])]
+            system = (
+                instructions + (tool_instruction if chat_tools else "")
+                + "\n\n" + chat_output_instruction(output)
+            )
+            messages: list[dict[str, Any]] = [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
+            set_attributes(current, {"llm.tools_offered": len(chat_tools)})
+            if chat_tools and tools is not None:
+                messages, answer = self._tool_phase(messages, chat_tools, tools, accept_unconstrained)
+                if answer is not None:
+                    set_attributes(current, {"llm.unconstrained_answer_accepted": True})
+                    set_content(current, "llm.output", answer)
+                    return answer
+            final = _with_final_turn(messages)
+            response = self._create(
+                {**self._request(final),
+                 "response_format": {"type": "json_schema", "json_schema": {"name": output.name, "schema": output.schema, "strict": True}}},
+                final, "structured_output",
+            )
+            text = json_text(first_message(response).get("content"))
+            set_content(current, "llm.output", text)
+            return text
+
+    def _create(self, request: dict[str, Any], messages: list[dict[str, Any]], phase: str, round_index: int = 0) -> Any:
+        """Chat 요청 한 번이다. span(``n_note.llm.request``)에 단계(도구·구조화 출력)·토큰 수를 남긴다."""
+        with request_span(self.model, round_index, request.get("tool_choice"), phase=phase) as current:
+            # system 메시지(지침)는 prompts.toml·completion span에 있으므로 요청 span에는 그 뒤 대화만 남긴다.
+            set_content(current, "llm.request_input", messages[1:])
+            response = self.client.chat.completions.create(**request)
+            usage = _value(response, "usage")
+            message = first_message(response)
+            set_attributes(current, {
+                "gen_ai.usage.input_tokens": _value(usage, "prompt_tokens") if usage is not None else None,
+                "gen_ai.usage.output_tokens": _value(usage, "completion_tokens") if usage is not None else None,
+                "llm.tool_calls_requested": len(message.get("tool_calls") or []),
+            })
+            set_content(current, "llm.response_output", {"content": message.get("content"), "tool_calls": [_plain(call) for call in message.get("tool_calls") or []]})
+            return response
 
     def _request(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         return {"model": self.model, "messages": messages, **self.options.chat_kwargs()}
@@ -291,10 +343,12 @@ class ChatCompletion:
         history = list(messages)
         while not tools.exhausted(budget):
             budget.rounds += 1
+            record_budget(budget)
             try:
-                response = self.client.chat.completions.create(**self._request(history), tools=chat_tools, tool_choice="auto")
+                response = self._create({**self._request(history), "tools": chat_tools, "tool_choice": "auto"}, history, "tools", budget.rounds)
             except BadRequestError:
                 # 서버가 --enable-auto-tool-choice 없이 떠 있으면 400을 반환한다. 도구 없이 진행한다.
+                set_attributes(current_span(), {"llm.tool_calling_rejected": True})
                 return history, None
             message = first_message(response)
             tool_calls = message.get("tool_calls") or []
@@ -312,7 +366,45 @@ class ChatCompletion:
             results = tools.run([(_value(function, "name"), _value(function, "arguments")) for function in functions], budget)
             for call, result in zip(tool_calls, results):
                 history.append({"role": "tool", "tool_call_id": str(_value(call, "id")), "content": json.dumps(result, ensure_ascii=False)})
+            record_budget(budget)
         return history, None
+
+
+@contextmanager
+def completion_span(api: str, model: str, output: StructuredOutput, instructions: str, user_content: str, engine: str = "native") -> Iterator[Any]:
+    """구조화 출력 요청 하나(도구 왕복 포함) 전체의 span(``n_note.llm.completion``)이다.
+
+    지침 판(prompt version)은 지침 문장 대신 늘 남긴다. 지침·입력 본문은 본문 기록 시에만 남긴다.
+    """
+    catalog = prompts.get()
+    with span("llm.completion", **{
+        "gen_ai.operation.name": "chat", "gen_ai.request.model": model, "gen_ai.output.type": "json",
+        "llm.engine": engine, "llm.api": api, "llm.output_name": output.name,
+        "prompt.draft_version": catalog.draft.version, "prompt.form_extraction_version": catalog.form_extraction.version,
+    }) as current:
+        set_content(current, "llm.instructions", instructions)
+        set_content(current, "llm.input", user_content)
+        yield current
+
+
+@contextmanager
+def request_span(model: str, round_index: int, tool_choice: Any = None, **fields: Any) -> Iterator[Any]:
+    """모델 요청 한 번의 span(``n_note.llm.request``)이다. ``round_index``는 도구 왕복 번호(0이면 첫 요청)다."""
+    with span("llm.request", **{"gen_ai.request.model": model, "llm.round": round_index, "llm.tool_choice": tool_choice, **fields}) as current:
+        yield current
+
+
+def record_budget(budget: ToolBudget, target: Any = None) -> None:
+    """completion span(기본: 현재 span)에 지금까지 쓴 도구 왕복·호출 수를 남긴다(마지막 값이 남는다)."""
+    set_attributes(target or current_span(), {"llm.tool_rounds": budget.rounds, "llm.tool_calls": budget.calls})
+
+
+def _plain(item: Any) -> Any:
+    """SDK 객체를 span 본문용 사전으로 바꾼다(fixture 사전은 그대로)."""
+    if isinstance(item, dict):
+        return item
+    dump = getattr(item, "model_dump", None)
+    return dump(mode="json") if callable(dump) else {"type": _value(item, "type"), "name": _value(item, "name"), "arguments": _value(item, "arguments")}
 
 
 def create_completion(api: str, client: Any, model: str, options: GenerationOptions | None = None) -> ResponsesCompletion | ChatCompletion:
@@ -338,6 +430,14 @@ def json_text(content: Any) -> Any:
     return text[start:end + 1] if 0 <= start < end else text
 
 
+def chat_output_instruction(output: StructuredOutput) -> str:
+    """Chat system 메시지 끝에 붙이는 출력 지침과 JSON 스키마다.
+
+    구조화 출력을 강제하지 못하는 서버(MLX, 일부 llama.cpp 등)도 같은 구조를 따르도록 스키마를 프롬프트에도 넣는다.
+    """
+    return prompts.get().structured_output.final_output + "\nJSON schema:\n" + json.dumps(output.schema, ensure_ascii=False)
+
+
 def _with_final_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """도구 대화 뒤에는 최종 출력을 요청하는 user 메시지를 붙인다.
 
@@ -345,7 +445,7 @@ def _with_final_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     if messages[-1]["role"] == "user":
         return messages
-    return messages + [{"role": "user", "content": FINAL_TURN_INSTRUCTION}]
+    return messages + [{"role": "user", "content": prompts.get().structured_output.final_turn}]
 
 
 def _chat_tool(tool: dict[str, Any]) -> dict[str, Any]:

@@ -9,12 +9,14 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from typing import Any
 from uuid import uuid4
 
+from opentelemetry.trace import Status, StatusCode
+
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, VersionConflict
-from n_note_ai_service_layers.observability import get_logger, log_event
+from n_note_ai_service_layers.observability import ContextThreadPoolExecutor, get_logger, log_event, mark_failed, span
 from n_note_ai_service_layers.services.clock import now_utc
 
 JOB_COLLECTION = "workflow_jobs"
@@ -130,8 +132,8 @@ class JobRunner:
         self._futures: dict[str, Future] = {}
         self._lock = threading.Lock()
 
-    def _new_executor(self) -> ThreadPoolExecutor:
-        return ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="workflow-job")
+    def _new_executor(self) -> ContextThreadPoolExecutor:
+        return ContextThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="workflow-job")
 
     @property
     def pending(self) -> int:
@@ -150,6 +152,11 @@ class JobRunner:
             self._futures[job_id] = future
 
     def _run(self, job_id: str, work: Callable[[Progress], dict[str, Any]]) -> None:
+        # 작업 하나가 추적 하나(root span)다. 단계·양식별 초안·LLM 호출 span이 이 아래에 놓인다.
+        with span("workflow_job", job_id=job_id) as current:
+            self._run_traced(job_id, work, current)
+
+    def _run_traced(self, job_id: str, work: Callable[[Progress], dict[str, Any]], current: Any) -> None:
         started = time.perf_counter()
         self.jobs.update(job_id, status="running", started_at=_now())
         try:
@@ -157,10 +164,12 @@ class JobRunner:
         except JobFailure as exc:
             self.jobs.update(job_id, status="failed", finished_at=_now(), error={"code": exc.code, "message": exc.message})
             log_event(_logger, "job_failed", job_id=job_id, code=exc.code, seconds=round(time.perf_counter() - started, 3))
+            current.set_status(Status(StatusCode.ERROR, exc.code))
             return
         except Exception as exc:
             self.jobs.update(job_id, status="failed", finished_at=_now(), error={"code": "internal_error", "message": "nursing note workflow failed"})
             log_event(_logger, "job_failed", job_id=job_id, code="internal_error", error=type(exc).__name__)
+            mark_failed(current, exc)
             return
         completed = _with_current_stage(self.jobs.get(job_id) or {})
         self.jobs.update(job_id, status="succeeded", stage=None, completed_stages=completed, finished_at=_now(), result=result)

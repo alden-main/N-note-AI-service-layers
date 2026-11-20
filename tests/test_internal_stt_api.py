@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from n_note_ai_service_layers import settings
+from n_note_ai_service_layers import prompts
 from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.api.app import create_app
 from n_note_ai_service_layers.api.deps import get_gateway_client, get_speech_to_text_provider, get_transcript_redactor
@@ -252,7 +252,7 @@ def test_stt_uses_nursing_context_prompt_when_setting_is_blank(monkeypatch):
     monkeypatch.setenv("N_NOTE_STT_PROMPT", "")
     monkeypatch.setenv("N_NOTE_STT_BASE_URL", "http://local-stt/v1")
     monkeypatch.setattr(model_providers, "openai_client", lambda *args: object())
-    assert model_providers.speech_to_text_provider().inner._prompt == settings.DEFAULT_STT_PROMPT
+    assert model_providers.speech_to_text_provider().inner._prompt == prompts.get().stt.context
     monkeypatch.setenv("N_NOTE_STT_PROMPT", "병동 문맥")
     assert model_providers.speech_to_text_provider().inner._prompt == "병동 문맥"
 

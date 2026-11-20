@@ -13,7 +13,6 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -21,6 +20,7 @@ import httpx2
 from jsonschema import Draft202012Validator
 
 from n_note_ai_service_layers import __version__
+from n_note_ai_service_layers.observability import ContextThreadPoolExecutor
 from n_note_ai_service_layers.settings import DEFAULT_MCP_GATEWAY_TIMEOUT_SECONDS, DEFAULT_MCP_GATEWAY_URL
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -103,7 +103,7 @@ class McpGatewayClient:
         self._batch_max_calls = max(1, batch_max_calls)
         # 호출마다 풀을 만들지 않고 클라이언트 수명 동안 재사용한다. 이 풀의 작업은 HTTP 요청만 하고
         # 다른 작업을 기다리지 않으므로, 위 계층(초안 검토 등)이 기다려도 교착이 생기지 않는다.
-        self._pool = ThreadPoolExecutor(max_workers=max(1, pool_workers), thread_name_prefix="gateway-call")
+        self._pool = ContextThreadPoolExecutor(max_workers=max(1, pool_workers), thread_name_prefix="gateway-call")
 
     @property
     def catalog(self) -> tuple[dict[str, Any], ...]:

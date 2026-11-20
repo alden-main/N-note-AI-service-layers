@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import threading
 from functools import lru_cache
 from typing import Any
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.audio_preprocessing import DEFAULT_HALLUCINATION_PATTERNS, AudioPreprocessingSpeechToText, HallucinationFilter, VadConfig
-from n_note_ai_service_layers.adapters.llm_completion import ChatCompletion, GenerationOptions, ResponsesCompletion, create_completion
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiChatDraftGenerationAdapter, OpenAiDraftGenerationAdapter
+from n_note_ai_service_layers.adapters.llm_completion import (
+    GenerationOptions, StructuredCompletion, ToolExecutor, create_completion,
+)
+from n_note_ai_service_layers.adapters.openai_draft_generation import (
+    DraftGenerationAdapter, OpenAiChatDraftGenerationAdapter, OpenAiDraftGenerationAdapter,
+)
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
@@ -40,6 +45,33 @@ def _cached_client(endpoint: settings.ModelEndpoint, timeout_seconds: float | No
     return OpenAI(api_key=endpoint.api_key, **options) if endpoint.api_key else OpenAI(**options)
 
 
+_async_clients = threading.local()
+
+
+def async_openai_client(endpoint: settings.ModelEndpoint, timeout_seconds: float | None = None, max_retries: int | None = None) -> Any:
+    """Pydantic AI용 AsyncOpenAI 클라이언트다. 스레드마다 하나를 만들어 재사용한다.
+
+    비동기 HTTP 커넥션은 만든 이벤트 루프에 묶이므로 스레드(=루프, ``pydantic_ai_completion.run_sync``) 사이에 공유하지 않는다.
+    """
+    cache: dict[tuple[Any, ...], Any] = _async_clients.__dict__.setdefault("clients", {})
+    key = (endpoint, timeout_seconds, max_retries)
+    client = cache.get(key)
+    if client is None:
+        from openai import AsyncOpenAI
+
+        options: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            options["timeout"] = timeout_seconds
+        if max_retries is not None:
+            options["max_retries"] = max_retries
+        if endpoint.base_url:
+            client = AsyncOpenAI(base_url=endpoint.base_url, api_key=endpoint.api_key or "EMPTY", **options)
+        else:
+            client = AsyncOpenAI(api_key=endpoint.api_key, **options) if endpoint.api_key else AsyncOpenAI(**options)
+        cache[key] = client
+    return client
+
+
 def speech_to_text_provider() -> AudioPreprocessingSpeechToText:
     """STT 어댑터를 전처리(WAV 변환·VAD·환각 필터)로 감싸 만든다."""
     config = settings.get()
@@ -56,16 +88,21 @@ def speech_to_text_provider() -> AudioPreprocessingSpeechToText:
     return AudioPreprocessingSpeechToText(adapter, config.stt_normalizes_audio, vad, hallucination_filter, config.stt_max_audio_seconds)
 
 
-def draft_generator(gateway: McpGatewayClient | None) -> OpenAiDraftGenerationAdapter:
+def draft_generator(gateway: McpGatewayClient | None) -> DraftGenerationAdapter:
     """``N_NOTE_LLM_API``에 따라 Responses 또는 Chat Completions 어댑터를 만든다.
+
+    ``N_NOTE_LLM_ENGINE=pydantic_ai``면 같은 지침·스키마·도구 상한으로 Pydantic AI Agent를 쓴다.
 
     tool call을 지원하지 않는 모델(``N_NOTE_LLM_TOOL_CALLING=false``)은 Gateway 사전 도구 없이
     전사문 용어 검토 힌트만으로 초안을 만든다.
     """
     config = settings.get()
     endpoint = config.llm_endpoint
-    client = openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
     tool_gateway = gateway if config.llm_tool_calling_enabled else None
+    if config.llm_engine == "pydantic_ai":
+        tools = ToolExecutor(tool_gateway, config.llm_tool_names, config.llm_max_tool_calls, config.llm_max_tool_rounds)
+        return DraftGenerationAdapter(pydantic_ai_completion(), endpoint.model, tools)
+    client = openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
     adapter = OpenAiChatDraftGenerationAdapter if config.llm_api == "chat" else OpenAiDraftGenerationAdapter
     # temperature·max_tokens·extra_body는 두 API 형식 모두에 적용한다(Responses는 max_output_tokens로 보낸다).
     return adapter(
@@ -79,9 +116,11 @@ def draft_generator(gateway: McpGatewayClient | None) -> OpenAiDraftGenerationAd
     )
 
 
-def structured_completion() -> ResponsesCompletion | ChatCompletion:
+def structured_completion() -> StructuredCompletion:
     """설정한 LLM 서버·API 형식·옵션의 구조화 출력 요청기다(동기 서식 추출이 쓴다)."""
     config = settings.get()
+    if config.llm_engine == "pydantic_ai":
+        return pydantic_ai_completion()
     endpoint = config.llm_endpoint
     client = openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries)
     return create_completion(config.llm_api, client, endpoint.model, generation_options())
@@ -91,3 +130,17 @@ def generation_options() -> GenerationOptions:
     """설정의 LLM 요청 공통 옵션이다(초안 생성과 동기 서식 추출이 함께 쓴다)."""
     config = settings.get()
     return GenerationOptions(config.llm_max_tokens, config.llm_temperature, dict(config.llm_extra_body))
+
+
+def pydantic_ai_completion() -> Any:
+    """설정한 LLM 서버·API 형식·옵션의 Pydantic AI 구조화 출력 요청기다."""
+    from n_note_ai_service_layers.adapters.pydantic_ai_completion import PydanticAiCompletion
+
+    config = settings.get()
+    endpoint = config.llm_endpoint
+    return PydanticAiCompletion(
+        config.llm_api,
+        lambda: async_openai_client(endpoint, config.llm_timeout_seconds, config.model_max_retries),
+        endpoint.model,
+        generation_options(),
+    )

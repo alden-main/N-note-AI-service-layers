@@ -15,12 +15,12 @@ from jsonschema import Draft202012Validator
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel
 
-from n_note_ai_service_layers import settings
+from n_note_ai_service_layers import prompts, settings
 from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.llm_completion import StructuredOutput, json_text
 from n_note_ai_service_layers.api.deps import get_transcript_preparation, read_audio
 from n_note_ai_service_layers.contracts.audio import AudioInput
-from n_note_ai_service_layers.observability import get_logger, stage
+from n_note_ai_service_layers.observability import get_logger, span, stage
 from n_note_ai_service_layers.adapters.audio_preprocessing import audio_creation_time
 from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
 from n_note_ai_service_layers.services.clock import now_local
@@ -65,37 +65,11 @@ _MAX_EVIDENCE = 3
 _MAX_SENTENCE_CHARS = 200
 _SENTENCE_BREAK = re.compile(r"(?<=[.?!。])\s+|\n+")
 _CLAUSE_BREAK = re.compile(r"(?<=,)\s+")
-_INSTRUCTIONS = (
-    "You fill Korean nursing forms from a dictated transcript that may contain speech recognition errors. "
-    "Return one JSON object with exactly two keys, fields and relatedSentences. Both are flat objects keyed by field_id; "
-    "never repeat sections or section_id, and include every field_id. "
-    "text is a string; radio is an option string or empty string; checkbox is an array of options. "
-    "When has_detail_text is true, radio is {status, detail} and checkbox is {selected, detail}. "
-    "Choose the option that means the same as the transcript even when it is worded differently, such as nonsmoker for 비흡연. "
-    "Rewrite spoken language, dialect, fillers, and misrecognized words in field values into standard Korean and standard "
-    "medical terminology, in concise Korean nursing-record style (for example sentences ending in '~함', '~임', '~호소함'). "
-    "Correct a word only when the context makes the intended term clear, and never change numbers. "
-    "Leave out an unintelligible part, but still fill the field from the readable facts around it: "
-    "a field with related sentences must not be empty unless those sentences are unintelligible. "
-    "Use only facts supported by the transcript; do not guess, and leave a field empty when the transcript has no information for it. "
-    "The transcript is given as transcript_sentences, each with an id. "
-    f"relatedSentences values are arrays of the ids of the sentences that support the field, at most {_MAX_EVIDENCE} of the most relevant; "
-    "use an empty array when there is no evidence. "
-    "Term review hints are suggestions, not facts: use them only if supported by context, never introduce a diagnosis the transcript does not state. "
-    "Privacy tokens in the form [[TYPE_n]] must never be expanded, guessed, or used as clinical evidence, and must not "
-    "appear in field values. Patient identity comes from the EMR, so omit the patient as the subject; refer to someone "
-    "else by role (e.g. '보호자', '담당의') when the transcript makes it clear, otherwise omit them. "
-    "Do not add clinical interpretations, judgments, or reference ranges that the transcript does not state "
-    "(for example '정상', '정상 범위', '안정적', '양호', '발열', '~이 필요함'). "
-    "Keep every measurement the transcript states (vital signs, scores, intake/output) with its exact number and unit; "
-    "never drop a measurement or replace it with a judgment. "
-    "Place each statement in the field whose label matches it. Actions the nurse performed (education, positioning, "
-    "giving water or medication, treatments, reporting to a physician) are interventions, not evaluations; fill an "
-    "evaluation or response field only with the patient's dictated response to an intervention. "
-    "Rewrite requests and spoken endings ('~해 주세요', '~할게요') in record style. "
-    "Never invent dates or times: resolve relative expressions such as '오후 2시' or '어제' against reference_time "
-    "(when the audio was recorded), and leave a date or time empty when the transcript states none."
-)
+
+
+def _instructions() -> str:
+    """서식 추출 지침이다(``prompts.toml``의 ``[form_extraction]``)."""
+    return prompts.render(prompts.get().form_extraction.instructions, max_evidence=_MAX_EVIDENCE)
 
 
 def _templates(raw: str) -> list[dict]:
@@ -185,7 +159,7 @@ def _extract(sentences: list[str], template: dict, hints: tuple[dict, ...], refe
         request["reference_time"] = reference_time.isoformat(timespec="minutes")
     payload = json.dumps(request, ensure_ascii=False)
     # 초안 생성과 같은 요청기다(API 형식·store=False·temperature 등 옵션·Chat의 스키마 프롬프트를 공유한다).
-    content = model_providers.structured_completion().complete(_INSTRUCTIONS, payload, StructuredOutput("form_extraction", schema))
+    content = model_providers.structured_completion().complete(_instructions(), payload, StructuredOutput("form_extraction", schema))
     result = json.loads(json_text(content))
     # 구조가 다르면 빈 서식으로 오인하지 않고 실패로 처리한다. options·문장 번호 범위 밖의 값과 근거 초과분은 _normalize가 정리한다.
     if any(error.validator not in {"enum", "maxItems"} for error in Draft202012Validator(schema).iter_errors(result)):
@@ -307,6 +281,12 @@ def _is_filled(value: object) -> bool:
     },
 )
 async def internal_transcription(request: Request, preparation: TranscriptPreparation = Depends(get_transcript_preparation)) -> dict:
+    # 요청 하나가 추적 하나다. 공통 단계·양식별 추출 span이 이 아래에 놓인다(run_in_threadpool은 문맥을 넘긴다).
+    with span("internal_stt"):
+        return await _internal_transcription(request, preparation)
+
+
+async def _internal_transcription(request: Request, preparation: TranscriptPreparation) -> dict:
     form = await request.form()
     parts = form.getlist("templates")
     if len(parts) != 1 or len(form.getlist("file")) != 1:

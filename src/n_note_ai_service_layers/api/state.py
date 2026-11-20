@@ -10,12 +10,12 @@ from functools import lru_cache
 
 from dotenv import load_dotenv
 
-from n_note_ai_service_layers import settings
+from n_note_ai_service_layers import prompts, settings
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, open_document_store
 from n_note_ai_service_layers.adapters.form_definition_loader import FormDefinitionLoader
 from n_note_ai_service_layers.api.handoff_store import HandoffStore
 from n_note_ai_service_layers.contracts.privacy import NamedEntityRecognizer
-from n_note_ai_service_layers.observability import configure_logging, get_logger, log_event
+from n_note_ai_service_layers.observability import configure_logging, configure_tracing, get_logger, log_event
 from n_note_ai_service_layers.services.audit import AuditTrail
 from n_note_ai_service_layers.services.draft_review import DraftReviewStore
 from n_note_ai_service_layers.services.jobs import JobRunner, JobStore
@@ -57,6 +57,9 @@ def build_services() -> AppServices:
     load_dotenv(".env")
     config = settings.get()
     configure_logging(config.log_level)
+    tracing = configure_tracing(config.otel_enabled, config.otel_capture_content)
+    # 프롬프트 파일이 없거나 키가 빠졌으면 여기서 기동을 멈춘다(빈 지침으로 초안을 만들지 않음).
+    catalog = prompts.get()
     db_path = config.state_db_path
     documents = open_document_store(db_path)
     audit = AuditTrail(documents)
@@ -75,6 +78,8 @@ def build_services() -> AppServices:
         state_store="sqlite" if db_path else "memory", forms=len(registry.list_versions()),
         timezone=str(config.local_timezone), require_local_stt=config.require_local_stt,
         ner_model=config.ner_model, job_concurrency=config.job_concurrency,
+        prompts_file=str(catalog.source), draft_prompt=catalog.draft.version, form_extraction_prompt=catalog.form_extraction.version,
+        tracing=tracing, llm_engine=config.llm_engine,
     )
     return AppServices(
         documents,

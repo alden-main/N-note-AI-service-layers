@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import unittest
 
-from n_note_ai_service_layers.adapters.openai_draft_generation import BASE_INSTRUCTIONS, OpenAiDraftGenerationAdapter
+from n_note_ai_service_layers import prompts
+from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
 from n_note_ai_service_layers.services.draft_token_scrub import scrub_privacy_tokens, scrub_text
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
+
+BASE_INSTRUCTIONS = prompts.get().draft.instructions
 
 
 class ScrubTextTests(unittest.TestCase):

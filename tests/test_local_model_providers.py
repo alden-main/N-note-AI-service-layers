@@ -6,12 +6,14 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from n_note_ai_service_layers import settings
+from n_note_ai_service_layers import prompts, settings
 from n_note_ai_service_layers.adapters import model_providers
-from n_note_ai_service_layers.adapters.llm_completion import FINAL_OUTPUT_INSTRUCTION, FINAL_TURN_INSTRUCTION
 from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiChatDraftGenerationAdapter, OpenAiDraftGenerationAdapter
 from support import LOOKUP_TOOL, FakeGateway as _Gateway, sample_form_schema
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
+
+FINAL_OUTPUT_INSTRUCTION = prompts.get().structured_output.final_output
+FINAL_TURN_INSTRUCTION = prompts.get().structured_output.final_turn
 
 FINAL = '{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":{"assessment.pain_score":["transcript"]},"needs_confirmation":false}'
 

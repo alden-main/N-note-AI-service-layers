@@ -1,6 +1,7 @@
 """구조화 출력으로 간호기록 초안을 생성하는 어댑터다.
 
-LLM 호출(API 형식·도구 왕복)은 ``llm_completion``이 맡고, 여기에는 초안에만 해당하는 지침·출력 스키마·결과 검증만 있다.
+LLM 호출(API 형식·도구 왕복)은 ``llm_completion``이 맡고, 여기에는 초안에만 해당하는 출력 스키마·결과 검증만 있다.
+지침 문장은 ``prompts/prompts.toml``의 ``[draft]``에 있다.
 ``OpenAiDraftGenerationAdapter``(Responses API)와 ``OpenAiChatDraftGenerationAdapter``(Chat Completions)는 어떤 API로
 보낼지만 다르다.
 """
@@ -12,6 +13,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from n_note_ai_service_layers import prompts
 from n_note_ai_service_layers.adapters.llm_completion import (
     ChatCompletion,
     GenerationOptions,
@@ -25,43 +27,6 @@ from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
-BASE_INSTRUCTIONS = (
-    "You write Korean nursing records. Fill the requested nursing form only from the supplied payload "
-    "(transcript and available facts). Do not infer unavailable, stale, or conflicting facts, and return null "
-    "for a field when the payload has no information for it. "
-    "Rewrite spoken language, dialect, fillers, and misrecognized words into standard Korean (표준어) and write "
-    "text fields in concise Korean nursing-record style (for example sentences ending in '~함', '~임', '~호소함'). "
-    "Use standard medical terminology; keep widely used clinical abbreviations (e.g. V/S, NPO, I/O) as spoken. "
-    "The payload's term_review_hints, when present, are dictionary candidates that the standard Korean and medical "
-    "terminology services found in the transcript; apply a hint only when it fits the clinical context. "
-    "Privacy tokens in the form [[TYPE_n]] must never be expanded, guessed, or used as clinical evidence, and must not "
-    "appear in any output field. Patient identity comes from the EMR, so omit the patient as the subject "
-    "(write '내일 폐수술 예정임.' instead of '[[PERSON_1]]님은 내일 폐수술 예정임.'). If a token refers to someone other "
-    "than the patient, refer to them by role (e.g. '보호자', '담당의') when the transcript makes it clear, otherwise omit it. "
-    "Do not create risk scores, risk levels, diagnoses, or interventions that the transcript does not state. "
-    "Do not add clinical interpretations, judgments, or reference ranges that the transcript does not state "
-    "(for example '정상', '정상 범위', '안정적', '양호', '발열', '~이 필요함'). "
-    "Keep every measurement the transcript states (vital signs, scores, intake/output) with its exact number and unit; "
-    "never drop a measurement or replace it with a judgment. "
-    "Record every clinical statement of the transcript in the form; do not drop statements. "
-    "Place each statement in the field whose label and description match it. Actions the nurse performed "
-    "(education, positioning, giving water or medication, treatments, reporting to a physician) are interventions, "
-    "not evaluations; fill an evaluation or response field only with the patient's dictated response to an intervention. "
-    "Put the patient's current symptoms and condition in the assessment or status field, and requests for the next shift "
-    "in the next-shift plan field. Rewrite requests and spoken endings ('~해 주세요', '~할게요') in record style "
-    "(for example '다음 근무에 기침 양상 관찰 필요함.'). "
-    "Never invent dates or times: resolve relative expressions such as '오후 2시' or '어제' against the payload's "
-    "reference_time (when the audio was recorded), and leave date/time fields null when the transcript states no time; "
-    "the service fills the record time from the recording time. "
-    "For each filled field only, add one evidence_refs item with its field_id and refs such as 'transcript' or "
-    "'fact:<fact_id>'; do not add items for null fields. "
-    "Set needs_confirmation to true when any statement is uncertain."
-)
-# 응답 하나에서 동시에 Gateway로 보내는 도구 호출 수다. 넘는 호출은 이어서 순차로 보낸다.
-MAX_PARALLEL_TOOL_CALLS = 4
-# 도구를 줄 때만 붙인다. 도구 없는 요청에 도구 안내가 있으면 일부 로컬 모델이 텍스트로 가짜 tool call을 낸다.
-TOOL_INSTRUCTION = " You may call the provided dictionary tools to confirm a term before using it."
-
 
 class DraftGenerationAdapter:
     """양식 허용 필드만 담은 ``DraftResult``를 만든다.
@@ -70,28 +35,30 @@ class DraftGenerationAdapter:
     """
 
     def __init__(
-        self, completion: StructuredCompletion, model_version: str, tools: ToolExecutor | None = None, prompt_version: str = "draft-v3",
+        self, completion: StructuredCompletion, model_version: str, tools: ToolExecutor | None = None, prompt_version: str | None = None,
     ) -> None:
         self.completion = completion
         self.tools = tools
         self._model = model_version
-        self._prompt_version = prompt_version
+        # 지정하지 않으면 prompts.toml의 [draft] version이다. 결과(DraftResult.prompt_version)에 그대로 남는다.
+        self._prompt_version = prompt_version or prompts.get().draft.version
 
     def generate(self, payload: dict, schema: FormSchema) -> DraftResult:
         """최소화된 LLM 입력으로 초안을 생성하고 스키마 허용 필드만 반환한다. 잘못된 응답은 ``ValueError``다."""
         output = self._output_format(schema)
         text = self.completion.complete(
             self._instructions(schema), json.dumps(payload, ensure_ascii=False), StructuredOutput(output["name"], output["schema"]),
-            self.tools, TOOL_INSTRUCTION, accept_unconstrained=lambda content: self._unconstrained(content, output["schema"]),
+            self.tools, prompts.get().draft.tool, accept_unconstrained=lambda content: self._unconstrained(content, output["schema"]),
         )
         return self._draft_result(text, schema)
 
     @staticmethod
     def _instructions(schema: FormSchema) -> str:
         """공통 작성 지침에 양식 제목과 양식별 지침을 덧붙인다(도구 안내는 도구를 줄 때 요청기가 붙인다)."""
-        instructions = BASE_INSTRUCTIONS + f" The form is '{schema.display_title}'."
+        draft = prompts.get().draft
+        instructions = draft.instructions + prompts.render(draft.form_title, title=schema.display_title)
         if schema.instructions:
-            instructions += " Form-specific instructions: " + schema.instructions
+            instructions += prompts.render(draft.form_instructions, instructions=schema.instructions)
         return instructions
 
     def _draft_result(self, output_text: Any, schema: FormSchema) -> DraftResult:
@@ -220,7 +187,7 @@ class OpenAiDraftGenerationAdapter(DraftGenerationAdapter):
         self,
         client: Any | None = None,
         model: str = "gpt-4o-mini",
-        prompt_version: str = "draft-v3",
+        prompt_version: str | None = None,
         gateway_client: McpGatewayClient | None = None,
         max_tool_calls: int = 6,
         tool_timeout_seconds: float = 30.0,
