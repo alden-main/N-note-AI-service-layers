@@ -81,11 +81,15 @@ class FormField:
     description: Text | None = None
     options: tuple[Annotated[str, BeforeValidator(str)], ...] = ()
     pdf: PdfPlacement | None = None
+    # 구술에서 값을 얻지 못했을 때 서비스가 채우는 값이다. ``recording_time``: 음성 녹음 시각(date·datetime 항목만).
+    default_from: Literal["recording_time"] | None = None
 
     @model_validator(mode="after")
     def _enum_has_options(self) -> FormField:
         if self.type == "enum" and not self.options:
             raise ValueError("enum field requires options")
+        if self.default_from == "recording_time" and self.type not in ("date", "datetime"):
+            raise ValueError("default_from 'recording_time' requires a date or datetime field")
         return self
 
 

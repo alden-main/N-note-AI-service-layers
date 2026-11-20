@@ -190,7 +190,7 @@ def run_case(case: EvalCase, stt_provider: Any | None = None) -> dict[str, Any]:
         "report_validation": result.report_validation.status,
         "report_findings": {item.criterion_id: item.status for item in result.report_validation.criteria},
         # 전사문에 없는 초안 수치(바뀐 활력징후, 지어낸 시각 등)다.
-        "numeric_findings": [f"{item.field_id}: {item.text}" for item in result.numeric_findings],
+        "numeric_findings": [item.describe() for item in result.numeric_findings],
         **score_draft(schema, result.draft.proposed_fields, case.expected),
         **(score_transcript(result.transcript.text, case.expected) if uses_audio else {}),
     })

@@ -16,6 +16,9 @@ from n_note_ai_service_layers.contracts.form_schema import FormSchema, PdfPlacem
 _DEPLOYMENT_KEYS = frozenset({"pdf", "status", "approved_by", "approved_at", "pdf_template", "pdf_meta"})
 
 FORM_DEFINITION_FILE = "form.json"
+# 이전 버전 정의를 두는 하위 디렉터리다(``<form>/previous/<이름>.json``). 이 버전으로 만든 초안·확정본을
+# 계속 조회·확정·PDF 출력할 수 있게 승인(비활성) 상태로 등록한다. 새 초안은 활성 버전(``form.json``)만 쓴다.
+PREVIOUS_VERSIONS_DIR = "previous"
 MetaKey = Literal["form_title", "patient_id", "encounter_id", "finalized_by", "finalized_at", "note_id"]
 
 
@@ -61,8 +64,26 @@ class FormDefinitionLoader:
             schemas = [schema for schema in schemas if schema.schema_id in enabled_ids]
         return tuple(schemas)
 
-    def load(self, path: Path) -> FormSchema:
-        """양식 정의 파일 하나를 검증해 활성 스키마로 변환한다."""
+    def load_previous(self, enabled_ids: tuple[str, ...] = ()) -> tuple[FormSchema, ...]:
+        """양식별 ``previous/*.json``을 승인(비활성) 스키마로 읽는다. 활성 정의와 ``schema_id``가 같고 버전은 달라야 한다."""
+        if not self.forms_dir.is_dir():
+            return ()
+        previous: list[FormSchema] = []
+        for definition in sorted(self.forms_dir.glob(f"*/{FORM_DEFINITION_FILE}")):
+            active = self.load(definition)
+            if enabled_ids and active.schema_id not in enabled_ids:
+                continue
+            versions = {active.version}
+            for path in sorted((definition.parent / PREVIOUS_VERSIONS_DIR).glob("*.json")):
+                schema = self.load(path, SchemaStatus.APPROVED, definition.parent)
+                if schema.schema_id != active.schema_id or schema.version in versions:
+                    raise FormDefinitionError(f"previous version must share schema_id and use a new version: {path}")
+                versions.add(schema.version)
+                previous.append(schema)
+        return tuple(previous)
+
+    def load(self, path: Path, status: SchemaStatus = SchemaStatus.ACTIVE, form_dir: Path | None = None) -> FormSchema:
+        """양식 정의 파일 하나를 검증해 스키마로 변환한다(기본 활성). PDF 양식 경로는 ``form_dir``(기본 파일 위치) 기준이다."""
         try:
             raw = json.loads(path.read_bytes())
         except OSError as exc:
@@ -73,12 +94,12 @@ class FormDefinitionLoader:
             raise FormDefinitionError(f"invalid form definition {path}: top level must be an object")
         try:
             pdf = _PdfConfig.model_validate(raw.get("pdf") or {})
-            pdf_template = self._pdf_template(path, pdf.template)
+            pdf_template = self._pdf_template((form_dir or path.parent) / FORM_DEFINITION_FILE, pdf.template)
             # 승인·활성 상태는 파일이 아니라 배포 사실(양식 디렉터리)로 정한다.
             return from_json_dict(FormSchema, {
                 **{key: value for key, value in raw.items() if key not in _DEPLOYMENT_KEYS},
-                "status": SchemaStatus.ACTIVE,
-                "approved_by": f"form-definition:{path.parent.name}",
+                "status": status,
+                "approved_by": f"form-definition:{(form_dir or path.parent).name}",
                 "approved_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc),
                 "pdf_template": pdf_template,
                 "pdf_meta": [(key, placement) for key, placement in (pdf.meta or {}).items()],

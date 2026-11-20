@@ -21,7 +21,9 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from n_note_ai_service_layers.services.clock import now_utc
+from n_note_ai_service_layers.adapters.audio_preprocessing import audio_creation_time
+from n_note_ai_service_layers.services.clock import now_local, now_utc
+from n_note_ai_service_layers.services.recording_time import parse_recorded_at, resolve_recording_time
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.api import mappers
 from n_note_ai_service_layers.api.deps import get_nursing_note_workflow, get_workflow_context_flow, read_validated_audio
@@ -199,6 +201,10 @@ async def create_nursing_note_workflow(
     ),
     schema_version: str | None = Form(default=None, min_length=1),
     language_hint: str | None = Form(default=None, max_length=16),
+    recorded_at: str | None = Form(
+        default=None, max_length=64,
+        description="녹음 시작 시각(ISO 8601, 예: 2026-11-18T09:00:00+09:00). 생략하면 음성 파일 메타데이터의 생성 시각, 그것도 없으면 접수 시각을 쓴다",
+    ),
     x_trace_id: str | None = Header(default=None),
     idempotency_key: str | None = Header(default=None, max_length=128, description="같은 키로 다시 보내면 새 작업을 만들지 않고 기존 작업을 반환한다"),
     context_flow: ClinicalContextFlow = Depends(get_workflow_context_flow),
@@ -207,12 +213,26 @@ async def create_nursing_note_workflow(
     """음성을 검증하고 초안 생성 작업을 접수한다. 처리는 백그라운드에서 진행되며 즉시 202를 반환한다."""
     if schema_ids and (schema_id or schema_version):
         raise HTTPException(status_code=422, detail="use either schema_id/schema_version or schema_ids")
+    received_at = now_local()
+    requested_time = _parse_recorded_at(recorded_at)
     content = await read_validated_audio(audio)
     plan = await prepare_workflow_forms(patient_id, encounter_id, purpose, schema_id, schema_ids, schema_version, x_trace_id, context_flow)
-    source = AudioInput(content, audio.filename or "audio", audio.content_type, plan.trace_id, language_hint)
+    metadata_time = None if requested_time else await run_in_threadpool(audio_creation_time, content)
+    recording = resolve_recording_time(requested_time, metadata_time, received_at)
+    log_event(_logger, "recording_time_resolved", trace_id=plan.trace_id, source=recording.source)
+    source = AudioInput(content, audio.filename or "audio", audio.content_type, plan.trace_id, language_hint, recorded_at=recording.value)
     job = await run_in_threadpool(submit_workflow_job, plan, source, workflow, idempotency_key)
     response.headers["Location"] = f"/v1/nursing-note-jobs/{job['job_id']}"
     return job_response(job)
+
+
+def _parse_recorded_at(value: str | None):
+    if value is None or not value.strip():
+        return None
+    try:
+        return parse_recorded_at(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="recorded_at must be an ISO 8601 date-time") from exc
 
 
 @dataclass(frozen=True)

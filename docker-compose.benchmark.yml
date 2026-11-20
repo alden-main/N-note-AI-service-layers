@@ -1,0 +1,20 @@
+# 벤치마크 전용: 로컬 LLM 서버(local-llm)를 서버 호스트의 127.0.0.1에만 공개한다. 운영 기동에는 쓰지 않는다.
+#   N_NOTE_COMPOSE_EXTRA_FILES=docker-compose.benchmark.yml scripts/compose-model.sh <profile> up -d local-llm
+# 개발 PC에서는 SSH 터널로 접근한다(benchmark/README.md).
+#   ssh -N -L 18000:127.0.0.1:18000 <server>
+#
+# internal 네트워크에만 연결된 컨테이너는 포트를 공개할 수 없어 벤치마크 전용 bridge 네트워크를 하나 더 붙인다.
+# 이 네트워크로 local-llm의 외부 통신이 가능해지므로(모델은 HF_HUB_OFFLINE=1로 캐시만 씀) 측정이 끝나면
+# 이 파일 없이 `scripts/compose-model.sh <profile> up -d local-llm`을 다시 실행해 닫는다.
+# 적용·해제 모두 local-llm 컨테이너를 다시 만들므로 모델을 다시 적재한다(수 분).
+services:
+  local-llm:
+    ports:
+      - "127.0.0.1:${N_NOTE_BENCHMARK_LLM_PORT:-18000}:8000"
+    networks:
+      - ai-gateway-network
+      - n-note-benchmark
+
+networks:
+  n-note-benchmark:
+    name: n-note-benchmark

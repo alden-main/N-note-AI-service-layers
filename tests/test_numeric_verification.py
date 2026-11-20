@@ -94,6 +94,51 @@ class NumericVerifierTests(unittest.TestCase):
         self.assertEqual(findings, ())
 
 
+class NumericOmissionTests(unittest.TestCase):
+    """전사문에 구술한 수치가 초안에서 빠진 경우다(벤치마크 openai-baseline: 맥박 92회·체온 38.2도 누락)."""
+
+    def omissions(self, fields, transcript):
+        return [(item.field_id, item.text, item.reason) for item in NumericVerifier.omissions(transcript, fields)]
+
+    def test_dropped_vital_signs_are_reported_with_transcript_offsets(self):
+        transcript = "맥박은 분당 92회입니다. 체온은 38.2도입니다."
+        self.assertEqual(self.omissions({}, transcript), [(None, "92", "missing_from_draft"), (None, "38.2", "missing_from_draft")])
+        finding = NumericVerifier.omissions(transcript, {})[1]
+        self.assertEqual(transcript[finding.start_offset:finding.end_offset], "38.2")
+
+    def test_value_replaced_by_judgment_is_reported(self):
+        self.assertEqual(self.omissions({"assessment": "맥박 정상 범위임."}, "맥박은 분당 92회입니다."), [(None, "92", "missing_from_draft")])
+
+    def test_value_in_any_field_or_number_form_counts_as_written(self):
+        transcript = "혈압 120/80, 체온 38.20도, 14시 30분 측정"
+        fields = {"evaluation": "혈압 120/80mmHg, 체온 38.2도", "recorded_at": "2026-10-28 14:30"}
+        self.assertEqual(self.omissions(fields, transcript), [])
+
+    def test_single_digits_privacy_tokens_and_repeats_are_ignored(self):
+        self.assertEqual(self.omissions({}, "통증 4점, [[PHONE_12]] 연락, 3회 구토"), [])
+        self.assertEqual(self.omissions({}, "맥박 92회, 다시 재도 92회"), [(None, "92", "missing_from_draft")])
+
+    def test_check_includes_omissions_only_when_transcript_is_given(self):
+        verifier = NumericVerifier()
+        self.assertEqual(verifier.check(SCHEMA, {}, ["맥박 92회"], REFERENCE), ())
+        self.assertEqual([item.reason for item in verifier.check(SCHEMA, {}, ["맥박 92회"], REFERENCE, transcript="맥박 92회")], ["missing_from_draft"])
+
+    def test_finalize_requires_confirmation_for_omissions(self):
+        store = DraftReviewStore()
+        record = store.create(SCHEMA, "맥박은 분당 92회입니다.", {"assessment": "맥박 정상임.", "evaluation": "보고함."}, (), "t",
+                              numeric_sources=("맥박은 분당 92회입니다.",), reference_time=REFERENCE)
+        with self.assertRaises(NumericReviewRequired):
+            store.finalize(record.draft_id, SCHEMA, "nurse-1", "t")
+        note = store.finalize(record.draft_id, SCHEMA, "nurse-1", "t", numeric_review_confirmed=True)
+        self.assertEqual(note.confirmed_numeric_findings, ("transcript: 92 (missing_from_draft)",))
+
+    def test_adding_the_value_clears_the_omission(self):
+        store = DraftReviewStore()
+        record = store.create(SCHEMA, "맥박은 분당 92회입니다.", {"assessment": "맥박 정상임."}, (), "t", reference_time=REFERENCE)
+        store.revise(record.draft_id, SCHEMA, {"assessment": "맥박 92회/분임."}, {}, "nurse-1", "t")
+        self.assertEqual(store.numeric_findings(store.get(record.draft_id), SCHEMA), ())
+
+
 class NumericFinalizeTests(unittest.TestCase):
     def test_finalize_requires_confirmation_and_records_confirmed_values(self):
         store = DraftReviewStore()

@@ -8,10 +8,12 @@ AI 서비스는 STT와 초안 생성 LLM을 **OpenAI 호환 API**로만 호출�
 ```bash
 scripts/compose-model.sh qwen3.5-27b up -d                 # 프로필로 전체 실행
 scripts/compose-model.sh qwen3.5-27b logs -f local-llm      # 모델 적재 확인(수 분 소요)
-scripts/compose-model.sh qwen3.5-27b run --rm ai-service \
-  uv run --no-sync n-note-model-eval run                    # 같은 평가 사례로 채점
-uv run n-note-model-eval compare                            # 프로필별 결과 비교
+# 모델 비교 평가는 호스트(개발 환경)에서 실행한다. 평가기는 운영 이미지에 포함하지 않는다.
+uv run python -m n_note_ai_service_layers.run_model_eval run --profile qwen3.5-27b   # 같은 평가 사례로 채점
+uv run python -m n_note_ai_service_layers.run_model_eval compare                     # 프로필별 결과 비교
 ```
+
+호스트에서 평가할 때는 호스트에서 접근할 수 있는 모델 서버 주소를 `N_NOTE_LLM_BASE_URL`(STT는 `N_NOTE_STT_BASE_URL`)로 지정합니다. 프로필의 `http://local-llm:8000/v1`은 내부 전용 `ai-gateway-network` 안에서만 쓰는 주소라 호스트에서는 접근할 수 없습니다. 측정하는 동안만 `docker-compose.benchmark.yml`(번들에 포함)로 `local-llm`을 서버의 127.0.0.1에 공개하고, 개발 PC에서 SSH 터널로 접근합니다. 절차는 [benchmark/README.md](../../benchmark/README.md#로컬-모델-서버로-실행-gpu-서버--개발-pc)에 있습니다.
 
 ## 프로필 (A100 40GB 1장 기준)
 
@@ -48,7 +50,7 @@ scripts/smoke-test.sh whisper-large-v3-turbo --stt-only  # STT만 확인
 | `recording_chunks` | 20초 청크(`--chunk-seconds`)로 녹음 세션에 보낸 청크별 지연 시간, 누적 전사문 CER |
 | `draft_workflow` | 녹음 세션 종료 후 초안 생성 작업의 단계, 채운 필드 수, 용어 검토·양식 검증 상태 (`--stt-only`면 생략) |
 
-보고서는 `eval/smoke/<profile>/<시각>.json`에 남고, 필수 단계가 실패하면 종료 코드 1입니다. 다른 음성은 `--audio <파일>`로 넣습니다. 이때 전사문 내용은 보고서에 남기지 않습니다(`--include-text`로 켬). 모델 품질 비교는 이어서 `n-note-model-eval run`으로 합니다.
+보고서는 `eval/smoke/<profile>/<시각>.json`에 남고, 필수 단계가 실패하면 종료 코드 1입니다. 다른 음성은 `--audio <파일>`로 넣습니다. 이때 전사문 내용은 보고서에 남기지 않습니다(`--include-text`로 켬). 모델 품질 비교는 이어서 호스트에서 `uv run python -m n_note_ai_service_layers.run_model_eval run`으로 합니다.
 
 공통: STT는 `openai/whisper-large-v3-turbo`(GPU 메모리 10%)를 같은 GPU에서 함께 띄웁니다. LLM은 GPU 메모리 80~85%를 씁니다.
 

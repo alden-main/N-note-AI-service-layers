@@ -39,8 +39,20 @@ BASE_INSTRUCTIONS = (
     "(write '내일 폐수술 예정임.' instead of '[[PERSON_1]]님은 내일 폐수술 예정임.'). If a token refers to someone other "
     "than the patient, refer to them by role (e.g. '보호자', '담당의') when the transcript makes it clear, otherwise omit it. "
     "Do not create risk scores, risk levels, diagnoses, or interventions that the transcript does not state. "
+    "Do not add clinical interpretations, judgments, or reference ranges that the transcript does not state "
+    "(for example '정상', '정상 범위', '안정적', '양호', '발열', '~이 필요함'). "
+    "Keep every measurement the transcript states (vital signs, scores, intake/output) with its exact number and unit; "
+    "never drop a measurement or replace it with a judgment. "
+    "Record every clinical statement of the transcript in the form; do not drop statements. "
+    "Place each statement in the field whose label and description match it. Actions the nurse performed "
+    "(education, positioning, giving water or medication, treatments, reporting to a physician) are interventions, "
+    "not evaluations; fill an evaluation or response field only with the patient's dictated response to an intervention. "
+    "Put the patient's current symptoms and condition in the assessment or status field, and requests for the next shift "
+    "in the next-shift plan field. Rewrite requests and spoken endings ('~해 주세요', '~할게요') in record style "
+    "(for example '다음 근무에 기침 양상 관찰 필요함.'). "
     "Never invent dates or times: resolve relative expressions such as '오후 2시' or '어제' against the payload's "
-    "reference_time, and leave date/time fields null when the transcript states no time. "
+    "reference_time (when the audio was recorded), and leave date/time fields null when the transcript states no time; "
+    "the service fills the record time from the recording time. "
     "For each filled field only, add one evidence_refs item with its field_id and refs such as 'transcript' or "
     "'fact:<fact_id>'; do not add items for null fields. "
     "Set needs_confirmation to true when any statement is uncertain."
@@ -58,7 +70,7 @@ class DraftGenerationAdapter:
     """
 
     def __init__(
-        self, completion: StructuredCompletion, model_version: str, tools: ToolExecutor | None = None, prompt_version: str = "draft-v2",
+        self, completion: StructuredCompletion, model_version: str, tools: ToolExecutor | None = None, prompt_version: str = "draft-v3",
     ) -> None:
         self.completion = completion
         self.tools = tools
@@ -208,7 +220,7 @@ class OpenAiDraftGenerationAdapter(DraftGenerationAdapter):
         self,
         client: Any | None = None,
         model: str = "gpt-4o-mini",
-        prompt_version: str = "draft-v2",
+        prompt_version: str = "draft-v3",
         gateway_client: McpGatewayClient | None = None,
         max_tool_calls: int = 6,
         tool_timeout_seconds: float = 30.0,

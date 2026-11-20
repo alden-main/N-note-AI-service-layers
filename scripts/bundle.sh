@@ -89,6 +89,8 @@ copy() {  # copy <저장소 기준 경로> [번들 안 경로]
   cp -R "$source" "$target"
 }
 copy docker-compose.yml
+# 벤치마크할 때만 local-llm을 127.0.0.1에 공개하는 override(N_NOTE_COMPOSE_EXTRA_FILES로 지정할 때만 쓰임)
+copy docker-compose.benchmark.yml
 copy .env.example
 copy forms
 copy eval/cases

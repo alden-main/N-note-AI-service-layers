@@ -8,6 +8,9 @@ data
 data_sample
 docs
 tests
+benchmark
+eval
+src/n_note_ai_service_layers/run_model_eval.py
 *.docx
 *.pdf
 *.xlsx

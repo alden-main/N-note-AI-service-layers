@@ -31,10 +31,10 @@ class DraftAlreadyFinalized(ValueError):
 
 
 class NumericReviewRequired(ValueError):
-    """출처에 없는 수치가 남아 있는데 확정자가 수치 확인을 표시하지 않았을 때 발생한다."""
+    """출처에 없는 수치나 초안에서 빠진 구술 수치가 남아 있는데 확정자가 수치 확인을 표시하지 않았을 때 발생한다."""
 
     def __init__(self, findings: tuple[NumericFinding, ...]) -> None:
-        super().__init__("numeric values not found in the transcript need confirmation")
+        super().__init__("numeric values need confirmation: not found in the transcript, or dictated but missing from the draft")
         self.findings = findings
 
 
@@ -191,8 +191,8 @@ class DraftReviewStore:
         return updated
 
     def numeric_findings(self, record: DraftReviewRecord, schema: FormSchema) -> tuple[NumericFinding, ...]:
-        """최신 revision의 필드 값 중 출처(전사문·사실)에 없는 수치다."""
-        return NumericVerifier().check(schema, record.revisions[-1].fields, record.numeric_sources, record.reference_time)
+        """최신 revision의 필드 값 중 출처(전사문·사실)에 없는 수치와, 전사문에 있는데 초안에서 빠진 수치다."""
+        return NumericVerifier().check(schema, record.revisions[-1].fields, record.numeric_sources, record.reference_time, transcript=record.transcript)
 
     def finalize(
         self, draft_id: str, schema: FormSchema, finalized_by: str, trace_id: str, numeric_review_confirmed: bool = False,
@@ -226,7 +226,7 @@ class DraftReviewStore:
             str(uuid4()), draft_id, latest.revision, schema.schema_id, schema.version, schema.display_title,
             record.patient_id, record.encounter_id, dict(latest.fields), dict(latest.candidate_decisions), applied,
             finalized_by, now_utc(), trace_id,
-            tuple(f"{item.field_id}: {item.text}" for item in numeric),
+            tuple(item.describe() for item in numeric),
             record.llm_applied_term_hints,
         )
         # 같은 초안을 두 요청이 동시에 확정하면 저장소 버전 검사로 하나만 성공한다.

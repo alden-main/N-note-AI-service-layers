@@ -1,0 +1,61 @@
+{
+  "schema_id": "nursing-daily-note",
+  "version": "nursing-daily-note/v1",
+  "purpose": "NURSING_DAILY_NOTE",
+  "title": "간호일지",
+  "instructions": "간호사가 구술한 내용을 간호일지 항목별로 정리한다. 활력징후 수치와 단위는 구술한 그대로 유지한다.",
+  "pdf": {},
+  "sections": [
+    {
+      "section_id": "record",
+      "label": "기록 정보",
+      "display_order": 1,
+      "fields": [
+        {
+          "field_id": "recorded_at",
+          "type": "datetime",
+          "label": "일시",
+          "description": "전사문에 기록 시각이 명시된 경우에만 작성한다.",
+          "display_order": 1
+        }
+      ]
+    },
+    {
+      "section_id": "nursing_process",
+      "label": "간호과정",
+      "display_order": 2,
+      "fields": [
+        {
+          "field_id": "assessment",
+          "type": "text",
+          "label": "간호사정 및 평가",
+          "required": true,
+          "description": "환자 호소(주관적 자료)와 활력징후·관찰 소견(객관적 자료)을 간호기록체 문장으로 작성한다.",
+          "display_order": 1
+        },
+        {
+          "field_id": "nursing_diagnosis",
+          "type": "text",
+          "label": "간호진단",
+          "description": "구술에 간호진단이 명시된 경우에만 작성한다. 새로 추론하지 않는다.",
+          "display_order": 2
+        },
+        {
+          "field_id": "plan_and_intervention",
+          "type": "text",
+          "label": "간호계획 및 중재",
+          "required": true,
+          "description": "시행한 간호중재, 교육, 보고·처치 내용을 시행 순서대로 작성한다.",
+          "display_order": 3
+        },
+        {
+          "field_id": "evaluation",
+          "type": "text",
+          "label": "간호평가",
+          "description": "중재 후 환자 반응이 구술된 경우에만 작성한다.",
+          "display_order": 4
+        }
+      ]
+    }
+  ]
+}

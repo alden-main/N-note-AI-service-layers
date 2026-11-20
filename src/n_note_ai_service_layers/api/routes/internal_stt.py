@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -19,19 +21,31 @@ from n_note_ai_service_layers.adapters.llm_completion import StructuredOutput, j
 from n_note_ai_service_layers.api.deps import get_transcript_preparation, read_audio
 from n_note_ai_service_layers.contracts.audio import AudioInput
 from n_note_ai_service_layers.observability import get_logger, stage
-from n_note_ai_service_layers.services.draft_token_scrub import scrub_value as _scrub_value
+from n_note_ai_service_layers.adapters.audio_preprocessing import audio_creation_time
+from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
+from n_note_ai_service_layers.services.clock import now_local
+from n_note_ai_service_layers.services.draft_token_scrub import has_content, scrub_value as _scrub_value
+from n_note_ai_service_layers.services.numeric_verification import NumericVerifier
+from n_note_ai_service_layers.services.recording_time import format_for_field, parse_recorded_at, resolve_recording_time
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
 from n_note_ai_service_layers.services.nursing_note_workflow import TranscriptPreparation, WorkflowStageError
+
+class NumericVerification(BaseModel):
+    status: str
+    findings: list[dict[str, Any]]
+
 
 class FormResult(BaseModel):
     templateType: str
     templateName: str
     fields: dict
     relatedSentences: dict[str, list[str]]
+    numericVerification: NumericVerification
 
 
 class InternalSttResponse(BaseModel):
     transcript: str
+    recordedAt: str
     forms: list[FormResult]
 
 
@@ -70,7 +84,17 @@ _INSTRUCTIONS = (
     "Term review hints are suggestions, not facts: use them only if supported by context, never introduce a diagnosis the transcript does not state. "
     "Privacy tokens in the form [[TYPE_n]] must never be expanded, guessed, or used as clinical evidence, and must not "
     "appear in field values. Patient identity comes from the EMR, so omit the patient as the subject; refer to someone "
-    "else by role (e.g. '보호자', '담당의') when the transcript makes it clear, otherwise omit them."
+    "else by role (e.g. '보호자', '담당의') when the transcript makes it clear, otherwise omit them. "
+    "Do not add clinical interpretations, judgments, or reference ranges that the transcript does not state "
+    "(for example '정상', '정상 범위', '안정적', '양호', '발열', '~이 필요함'). "
+    "Keep every measurement the transcript states (vital signs, scores, intake/output) with its exact number and unit; "
+    "never drop a measurement or replace it with a judgment. "
+    "Place each statement in the field whose label matches it. Actions the nurse performed (education, positioning, "
+    "giving water or medication, treatments, reporting to a physician) are interventions, not evaluations; fill an "
+    "evaluation or response field only with the patient's dictated response to an intervention. "
+    "Rewrite requests and spoken endings ('~해 주세요', '~할게요') in record style. "
+    "Never invent dates or times: resolve relative expressions such as '오후 2시' or '어제' against reference_time "
+    "(when the audio was recorded), and leave a date or time empty when the transcript states none."
 )
 
 
@@ -94,6 +118,9 @@ def _templates(raw: str) -> list[dict]:
                         raise ValueError
                     ids.add(field["field_id"])
                     if field.get("field_type") not in {"text", "radio", "checkbox"}:
+                        raise ValueError
+                    # 구술에 값이 없을 때 채울 기본값(선택)이다. 녹음 시각은 text 필드에만 쓴다.
+                    if "default_from" in field and (field["default_from"] != "recording_time" or field["field_type"] != "text"):
                         raise ValueError
                     if field["field_type"] != "text" and (not isinstance(field.get("options"), list) or not all(isinstance(x, str) for x in field["options"])):
                         raise ValueError
@@ -150,10 +177,13 @@ def _output_schema(template: dict, sentence_count: int) -> dict:
     }
 
 
-def _extract(sentences: list[str], template: dict, hints: tuple[dict, ...]) -> dict:
+def _extract(sentences: list[str], template: dict, hints: tuple[dict, ...], reference_time: datetime | None = None) -> dict:
     schema = _output_schema(template, len(sentences))
     transcript = [{"id": index, "text": sentence} for index, sentence in enumerate(sentences)]
-    payload = json.dumps({"transcript_sentences": transcript, "schemaDefinition": template["schemaDefinition"], "term_review_hints": hints}, ensure_ascii=False)
+    request: dict[str, Any] = {"transcript_sentences": transcript, "schemaDefinition": template["schemaDefinition"], "term_review_hints": hints}
+    if reference_time is not None:
+        request["reference_time"] = reference_time.isoformat(timespec="minutes")
+    payload = json.dumps(request, ensure_ascii=False)
     # 초안 생성과 같은 요청기다(API 형식·store=False·temperature 등 옵션·Chat의 스키마 프롬프트를 공유한다).
     content = model_providers.structured_completion().complete(_INSTRUCTIONS, payload, StructuredOutput("form_extraction", schema))
     result = json.loads(json_text(content))
@@ -190,8 +220,70 @@ def _normalize(template: dict, sentences: list[str], result: dict) -> dict:
                 valid = (i for i in ids if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(sentences))
                 related[key] = [sentences[i] for i in list(dict.fromkeys(valid))[:_MAX_EVIDENCE]]
     # 프롬프트로 막아도 남은 보호 토큰은 초안 생성과 같은 규칙으로 지운다. 근거 문장은 전사문 원문 그대로 둔다.
-    fields = {key: _scrub_value(value) for key, value in fields.items()}
+    fields = {key: _blank_without_content(_scrub_value(value)) for key, value in fields.items()}
     return {"templateType": template["templateType"], "templateName": template["templateName"], "fields": fields, "relatedSentences": related}
+
+
+def _blank_without_content(value: Any) -> Any:
+    """토큰을 지운 뒤 "환자명:"·"."만 남은 문자열(상세 텍스트 포함)은 빈 값으로 둔다."""
+    if isinstance(value, str):
+        return value if has_content(value) else ""
+    if isinstance(value, dict) and isinstance(value.get("detail"), str) and not has_content(value["detail"]):
+        return {**value, "detail": ""}
+    return value
+
+
+def _template_fields(template: dict) -> list[dict]:
+    return [field for section in template["schemaDefinition"]["sections"] for field in section["fields"]]
+
+
+def _fill_recording_time(template: dict, extracted: dict, recorded_at: datetime) -> set[str]:
+    """``default_from: "recording_time"``인 빈 text 필드를 녹음 시각(``YYYY-MM-DD HH:MM``)으로 채우고 채운 field_id를 돌려준다."""
+    filled = set()
+    for field in _template_fields(template):
+        key = field["field_id"]
+        if field.get("default_from") == "recording_time" and not extracted["fields"].get(key):
+            extracted["fields"][key] = format_for_field(recorded_at, "datetime")
+            filled.add(key)
+    return filled
+
+
+def _finding(item: NumericFinding) -> dict[str, Any]:
+    return {"findingId": item.finding_id, "fieldId": item.field_id, "startOffset": item.start_offset,
+            "endOffset": item.end_offset, "text": item.text, "reason": item.reason}
+
+
+def _numeric_verification(template: dict, fields: dict, transcript: str, recorded_at: datetime, defaulted: set[str]) -> dict:
+    """서식 값의 수치 대조다: 출처에 없는 수치(text 값·상세 텍스트)와 전사문에 있는데 서식에서 빠진 수치.
+
+    서비스가 녹음 시각으로 채운 필드는 출처 대조에서 뺀다. 추출에 실패한 서식(빈 ``fields``)은 ``skipped``다.
+    """
+    if not fields:
+        return {"status": "skipped", "findings": []}
+    values = []
+    for field in _template_fields(template):
+        key = field["field_id"]
+        if key in defaulted:
+            continue
+        value = fields.get(key)
+        text = value.get("detail") if isinstance(value, dict) else value if field["field_type"] == "text" else None
+        values.append((key, "text", text))
+    verifier = NumericVerifier()
+    findings = verifier.values_not_in_source(values, (transcript,), recorded_at) + verifier.omissions(transcript, fields)
+    return {"status": "needs_review" if findings else "ok", "findings": [_finding(item) for item in findings]}
+
+
+def _recorded_at_part(form) -> datetime | None:
+    """선택 part ``recorded_at``(녹음 시작 시각, ISO 8601)이다. 시간대가 없으면 병동 시간대로 본다."""
+    parts = form.getlist("recorded_at")
+    if len(parts) > 1 or (parts and not isinstance(parts[0], str)):
+        raise HTTPException(status_code=422, detail="recorded_at must be a single ISO 8601 text part")
+    if not parts or not parts[0].strip():
+        return None
+    try:
+        return parse_recorded_at(parts[0])
+    except ValueError:
+        raise HTTPException(status_code=422, detail="recorded_at must be an ISO 8601 date-time") from None
 
 
 def _is_filled(value: object) -> bool:
@@ -232,12 +324,17 @@ async def internal_transcription(request: Request, preparation: TranscriptPrepar
     else:
         raw = part
     templates = _templates(raw)
+    received_at = now_local()
+    requested_time = _recorded_at_part(form)
     if Path(file.filename or "").suffix.lower() not in _EXTENSIONS:
         raise HTTPException(status_code=415, detail="unsupported audio file extension")
     # 백엔드 계약(docs/STT_API.md)은 확장자와 50 MiB 상한이다.
     content = await read_audio(file, _MAX_AUDIO)
     trace_id = str(uuid4())
-    audio = AudioInput(content, file.filename or "audio", file.content_type or "application/octet-stream", trace_id, "ko")
+    # 녹음 시각: 요청 recorded_at → 음성 메타데이터 생성 시각 → 접수 시각(초안 작업 API와 같은 규칙).
+    metadata_time = None if requested_time else await run_in_threadpool(audio_creation_time, content)
+    recording = resolve_recording_time(requested_time, metadata_time, received_at)
+    audio = AudioInput(content, file.filename or "audio", file.content_type or "application/octet-stream", trace_id, "ko", recorded_at=recording.value)
     # STT → 비식별화 → 전사문 검토(힌트 대기 상한까지)는 비동기 초안 작업과 같은 공통 단계다.
     try:
         prepared = await run_in_threadpool(preparation.prepare, audio, (), lambda _stage: None)
@@ -249,10 +346,13 @@ async def internal_transcription(request: Request, preparation: TranscriptPrepar
     reviewed_in_time = prepared.review.done()
     if reviewed_in_time:
         _require_review(prepared.review.result())
-    forms = await _extract_forms(templates, prepared.transcript.text, prepared.hints, trace_id, settings.get().form_concurrency, hints_deferred=not reviewed_in_time)
+    forms = await _extract_forms(
+        templates, prepared.transcript.text, prepared.hints, trace_id, settings.get().form_concurrency,
+        hints_deferred=not reviewed_in_time, recorded_at=prepared.reference_time,
+    )
     if not reviewed_in_time:
         _require_review(await asyncio.wrap_future(prepared.review))
-    return {"transcript": prepared.transcript.text, "forms": forms}
+    return {"transcript": prepared.transcript.text, "recordedAt": prepared.reference_time.isoformat(), "forms": forms}
 
 
 def _require_review(review: GatewayTermVerificationResult) -> None:
@@ -261,17 +361,23 @@ def _require_review(review: GatewayTermVerificationResult) -> None:
         raise HTTPException(status_code=503, detail="term review is unavailable")
 
 
-async def _extract_forms(templates: list[dict], transcript: str, hints: tuple[dict, ...], trace_id: str, concurrency: int, hints_deferred: bool) -> list[dict]:
+async def _extract_forms(
+    templates: list[dict], transcript: str, hints: tuple[dict, ...], trace_id: str, concurrency: int, hints_deferred: bool,
+    recorded_at: datetime | None = None,
+) -> list[dict]:
     """양식별 추출은 서로 독립이라 동시에 보낸다. 로컬 vLLM은 동시 요청을 묶어 처리하므로 총 시간이 가장 느린 양식 수준이 된다."""
     sentences = _sentences(transcript)
     limit = asyncio.Semaphore(concurrency)
+    recorded_at = recorded_at or now_local()
 
     async def extract_form(template: dict) -> dict:
         async with limit:
             try:
                 with stage(_logger, trace_id, "form_extraction", template_type=template["templateType"], hints=len(hints), hints_deferred=hints_deferred) as metrics:
-                    result = await run_in_threadpool(_extract, sentences, template, hints)
+                    result = await run_in_threadpool(_extract, sentences, template, hints, recorded_at)
                     extracted = _normalize(template, sentences, result)
+                    defaulted = _fill_recording_time(template, extracted, recorded_at)
+                    extracted["numericVerification"] = _numeric_verification(template, extracted["fields"], transcript, recorded_at, defaulted)
                     metrics.update(
                         fields=len(extracted["fields"]),
                         filled=sum(_is_filled(value) for value in extracted["fields"].values()),
@@ -279,6 +385,7 @@ async def _extract_forms(templates: list[dict], transcript: str, hints: tuple[di
                     )
                 return extracted
             except Exception:
-                return {"templateType": template["templateType"], "templateName": template["templateName"], "fields": {}, "relatedSentences": {}}
+                return {"templateType": template["templateType"], "templateName": template["templateName"], "fields": {}, "relatedSentences": {},
+                        "numericVerification": {"status": "skipped", "findings": []}}
 
     return list(await asyncio.gather(*(extract_form(template) for template in templates)))

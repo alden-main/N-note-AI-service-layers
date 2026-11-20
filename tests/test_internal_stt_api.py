@@ -31,7 +31,7 @@ def test_internal_stt_multipart_and_output_validation(monkeypatch):
     app = create_app()
     setup_review(app, monkeypatch)
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("고혈압이 있습니다.", "fake", "fake-stt"))
-    monkeypatch.setattr(internal_stt, "_extract", lambda transcript, template, hints: {
+    monkeypatch.setattr(internal_stt, "_extract", lambda transcript, template, hints, *_: {
         "fields": {"history": "고혈압", "choice": {"status": "없음", "detail": "잘못된 상세"}, "allergy": ["약", "허위"]},
         "relatedSentences": {"history": [0, 7]},
     })
@@ -43,7 +43,9 @@ def test_internal_stt_multipart_and_output_validation(monkeypatch):
     client = TestClient(app)
     response = client.post("/internal/v1", files={"file": ("test.aac", b"audio", "audio/aac"), "templates": ("templates.json", json.dumps([template]), "application/json")})
     assert response.status_code == 200
-    assert response.json() == {"transcript": "고혈압이 있습니다.", "forms": [{"templateType": "CUSTOM", "templateName": "서식", "fields": {"history": "고혈압", "choice": {"status": "없음", "detail": ""}, "allergy": ["약"]}, "relatedSentences": {"history": ["고혈압이 있습니다."]}}]}
+    body = response.json()
+    assert body.pop("recordedAt")
+    assert body == {"transcript": "고혈압이 있습니다.", "forms": [{"templateType": "CUSTOM", "templateName": "서식", "fields": {"history": "고혈압", "choice": {"status": "없음", "detail": ""}, "allergy": ["약"]}, "relatedSentences": {"history": ["고혈압이 있습니다."]}, "numericVerification": {"status": "ok", "findings": []}}]}
 
 
 def test_internal_stt_extraction_failure_preserves_transcript(monkeypatch):
@@ -55,7 +57,9 @@ def test_internal_stt_extraction_failure_preserves_transcript(monkeypatch):
     monkeypatch.setattr(internal_stt, "_extract", fail)
     template = {"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": []}}
     response = TestClient(app).post("/internal/v1", files={"file": ("test.wav", b"audio", "audio/wav")}, data={"templates": json.dumps([template])})
-    assert response.json() == {"transcript": "전사문", "forms": [{"templateType": "X", "templateName": "Y", "fields": {}, "relatedSentences": {}}]}
+    body = response.json()
+    assert body.pop("recordedAt")
+    assert body == {"transcript": "전사문", "forms": [{"templateType": "X", "templateName": "Y", "fields": {}, "relatedSentences": {}, "numericVerification": {"status": "skipped", "findings": []}}]}
     assert TestClient(app).post("/internal/v1", files={"file": ("bad.txt", b"x")}, data={"templates": "[]"}).status_code == 415
 
 
@@ -65,7 +69,7 @@ def test_redaction_and_term_hints_precede_extraction(monkeypatch):
     setup_review(app, monkeypatch, GatewayTermVerificationResult("transcript", "ok", (occurrence,)))
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("홍길동님 고혈압", "fake", "fake-stt"))
     seen = {}
-    def extract(sentences, template, hints):
+    def extract(sentences, template, hints, *_):
         seen.update(sentences=sentences, hints=hints)
         return {"fields": {"history": "고혈압증"}, "relatedSentences": {"history": [0, 0]}}
     monkeypatch.setattr(internal_stt, "_extract", extract)
@@ -189,7 +193,7 @@ def test_malformed_extraction_returns_empty_form_and_logs_failure(monkeypatch):
     capture_stages(monkeypatch, logs)
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM])})
     assert response.status_code == 200
-    assert response.json()["forms"] == [{"templateType": "HAND_OVER", "templateName": "인계", "fields": {}, "relatedSentences": {}}]
+    assert response.json()["forms"] == [{"templateType": "HAND_OVER", "templateName": "인계", "fields": {}, "relatedSentences": {}, "numericVerification": {"status": "skipped", "findings": []}}]
     assert logs == [
         ("stt", {"chars": 13}), ("redaction", {"replacements": 0}),
         ("transcript_term_review", {"status": "ok", "candidates": 0, "hints_deferred": False}), ("form_extraction", "ValueError"),
@@ -272,7 +276,7 @@ def test_forms_are_extracted_concurrently_and_keep_request_order(monkeypatch):
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("전사문", "fake", "fake-stt"))
     # 두 양식이 동시에 실행 중이어야 barrier를 통과한다. 순차 실행이면 BrokenBarrierError로 빈 서식이 된다.
     barrier = threading.Barrier(2, timeout=5)
-    def extract(sentences, template, hints):
+    def extract(sentences, template, hints, *_):
         barrier.wait()
         return {"fields": {"note": template["templateType"]}, "relatedSentences": {}}
     monkeypatch.setattr(internal_stt, "_extract", extract)
@@ -320,7 +324,7 @@ def _slow_review(app, monkeypatch, status):
     monkeypatch.setenv("N_NOTE_TERM_HINT_BUDGET_SECONDS", "0.05")
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("전사문", "fake", "fake-stt"))
     seen = []
-    def extract(sentences, template, hints):
+    def extract(sentences, template, hints, *_):
         seen.append(hints)
         return {"fields": {"note": "값"}, "relatedSentences": {"note": [0]}}
     monkeypatch.setattr(internal_stt, "_extract", extract)
@@ -344,3 +348,83 @@ def test_late_term_review_failure_still_returns_503_after_extraction(monkeypatch
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(SIMPLE)})
     assert response.status_code == 503 and response.json() == {"detail": "term review is unavailable"}
     assert seen == [()]
+
+
+# --- 녹음 시각·기록 시각 기본값·수치 대조(초안 작업 API와 같은 규칙) ---
+
+TIMED = [{"templateType": "HAND_OVER", "templateName": "인계", "schemaDefinition": {"sections": [{"fields": [
+    {"field_id": "recorded", "label": "기록 일시", "field_type": "text", "default_from": "recording_time"},
+    {"field_id": "status", "label": "상태", "field_type": "text"},
+]}]}}]
+
+
+def _timed_app(monkeypatch, transcript, fields):
+    app = create_app()
+    setup_review(app, monkeypatch)
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript(transcript, "fake", "fake-stt"))
+    seen = {}
+    def extract(sentences, template, hints, reference_time=None):
+        seen["reference_time"] = reference_time
+        return {"fields": fields, "relatedSentences": {"status": [0]}}
+    monkeypatch.setattr(internal_stt, "_extract", extract)
+    return TestClient(app), seen
+
+
+def test_recorded_at_part_sets_reference_time_and_fills_default_field(monkeypatch):
+    client, seen = _timed_app(monkeypatch, "맥박 92회입니다.", {"recorded": "", "status": "맥박 92회임."})
+    response = client.post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(TIMED), "recorded_at": "2026-11-18T08:00:00+09:00"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["recordedAt"] == "2026-11-18T08:00:00+09:00"
+    assert seen["reference_time"].isoformat() == "2026-11-18T08:00:00+09:00"
+    assert body["forms"][0]["fields"] == {"recorded": "2026-11-18 08:00", "status": "맥박 92회임."}
+    # 서비스가 채운 녹음 시각의 숫자는 출처 대조에서 제외한다.
+    assert body["forms"][0]["numericVerification"] == {"status": "ok", "findings": []}
+
+
+def test_time_read_from_the_transcript_is_kept(monkeypatch):
+    client, _ = _timed_app(monkeypatch, "14시 30분 맥박 92회입니다.", {"recorded": "2026-11-18 14:30", "status": "맥박 92회임."})
+    response = client.post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(TIMED), "recorded_at": "2026-11-18T08:00:00+09:00"})
+    assert response.json()["forms"][0]["fields"]["recorded"] == "2026-11-18 14:30"
+
+
+def test_without_recorded_at_the_receipt_time_is_used(monkeypatch):
+    client, seen = _timed_app(monkeypatch, "통증 호소", {"recorded": "", "status": "통증 호소함."})
+    body = client.post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(TIMED)}).json()
+    assert seen["reference_time"] is not None and body["recordedAt"] == seen["reference_time"].isoformat()
+
+
+def test_numeric_verification_reports_missing_and_unsupported_values(monkeypatch):
+    client, _ = _timed_app(monkeypatch, "맥박은 분당 92회, 체온 38.2도입니다.", {"recorded": "", "status": "맥박 정상 범위(60-100회/분)임. 체온 38.2도."})
+    form = client.post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(TIMED), "recorded_at": "2026-11-18T08:00:00+09:00"}).json()["forms"][0]
+    verification = form["numericVerification"]
+    assert verification["status"] == "needs_review"
+    assert [(item["fieldId"], item["text"], item["reason"]) for item in verification["findings"]] == [
+        ("status", "60", "not_in_source"), ("status", "100", "not_in_source"), (None, "92", "missing_from_draft"),
+    ]
+
+
+def test_invalid_recorded_at_and_default_from_are_rejected(monkeypatch):
+    client, _ = _timed_app(monkeypatch, "통증", {"recorded": "", "status": ""})
+    bad_time = client.post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(TIMED), "recorded_at": "어제"})
+    assert bad_time.status_code == 422
+    radio = [{"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": [{"fields": [
+        {"field_id": "r", "field_type": "radio", "options": ["예"], "default_from": "recording_time"}]}]}}]
+    assert client.post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(radio)}).status_code == 422
+
+
+def test_label_left_after_token_scrub_becomes_an_empty_value():
+    form = {"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": [{"fields": [
+        {"field_id": "summary", "field_type": "text"},
+        {"field_id": "med", "field_type": "radio", "has_detail_text": True, "options": ["없음", "있음"]}]}]}}
+    result = {"fields": {"summary": "환자명: [[LABELED_PERSON_1]].", "med": {"status": "있음", "detail": "환자명: [[LABELED_PERSON_1]]"}}, "relatedSentences": {}}
+    assert internal_stt._normalize(form, ["문장"], result)["fields"] == {"summary": "", "med": {"status": "있음", "detail": ""}}
+
+
+def test_extraction_payload_carries_reference_time_and_prompt_rules(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    calls = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
+    internal_stt._extract(["전사문"], FORM, (), datetime(2026, 11, 18, 8, 0, tzinfo=timezone(timedelta(hours=9))))
+    assert json.loads(calls[0]["messages"][1]["content"])["reference_time"] == "2026-11-18T08:00+09:00"
+    instructions = calls[0]["messages"][0]["content"]
+    assert "never drop a measurement" in instructions and "Do not add clinical interpretations" in instructions

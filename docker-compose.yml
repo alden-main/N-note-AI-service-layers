@@ -107,8 +107,9 @@ services:
       - n-note-state:/var/lib/n-note/state
       # 로컬 NER 모델 캐시(로컬 STT·LLM과 같은 캐시)다.
       - ${N_NOTE_MODEL_CACHE:-./model-cache}:/root/.cache/huggingface:ro
-      # 모델 비교 평가 사례·결과(scripts/compose-model.sh <profile> run --rm ai-service ...)
-      - ./eval:/app/eval
+      # 스모크 테스트(scripts/smoke-test.sh)의 기본 음성과 보고서다. 이미지에는 eval/을 넣지 않는다.
+      - ./eval/cases:/app/eval/cases:ro
+      - ./eval/smoke:/app/eval/smoke
     depends_on:
       gateway:
         condition: service_healthy

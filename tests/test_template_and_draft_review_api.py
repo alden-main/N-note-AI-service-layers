@@ -117,7 +117,7 @@ class TemplateAndDraftReviewApiTests(unittest.TestCase):
         self.assertEqual(revised.json()["candidate_decisions"][candidate_id], "accepted")
 
     def test_configured_form_flows_from_audio_to_corrected_draft_finalized_note_and_pdf(self) -> None:
-        schema = template_registry.get("nursing-daily-note", "nursing-daily-note/v1")
+        schema = template_registry.get("nursing-daily-note", "nursing-daily-note/v2")
 
         class Context:
             class Registry:

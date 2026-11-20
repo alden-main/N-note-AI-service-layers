@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
@@ -17,13 +17,14 @@ from n_note_ai_service_layers.contracts.report_validation import ReportValidatio
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
 from n_note_ai_service_layers.observability import get_logger, log_event, stage
 from n_note_ai_service_layers.services.clock import now_local
-from n_note_ai_service_layers.services.draft_document import DraftDocument
+from n_note_ai_service_layers.services.draft_document import DraftDocument, is_filled
 from n_note_ai_service_layers.services import executors
 from n_note_ai_service_layers.services.draft_token_scrub import scrub_privacy_tokens
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.llm_payload import LlmPayloadProjector
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayError
 from n_note_ai_service_layers.services.numeric_verification import NumericVerifier
+from n_note_ai_service_layers.services.recording_time import format_for_field
 from n_note_ai_service_layers.services.report_validation import FormReportValidationFlow
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
 
@@ -67,6 +68,7 @@ class PreparedTranscript:
     catalog: tuple[dict[str, Any], ...] | None
     # 힌트 대기 상한 안에 끝난 전사문 검토로 만든 LLM 힌트다. 늦으면 비어 있다.
     hints: tuple[dict[str, Any], ...]
+    # 구술 기준 시각이다. 음성의 녹음 시각(``recorded_at``)이 있으면 그 시각, 없으면 준비 시각이다.
     reference_time: datetime
     # 전사문 검토다. 힌트 대기 상한을 넘겼으면 아직 진행 중이며, 초안 단계가 결과를 받는다(공유 풀에서 실행).
     review: Future[GatewayTermVerificationResult]
@@ -137,7 +139,7 @@ class TranscriptPreparation:
             )
         return PreparedTranscript(
             trace_id, external_transcript, redacted.replacement_count, catalog,
-            self.hints(hint_source) if hint_source else (), now_local(), review,
+            self.hints(hint_source) if hint_source else (), audio.recorded_at or now_local(), review,
         )
 
     def _start_transcript_review(
@@ -294,11 +296,13 @@ class NursingNoteWorkflow:
             scrubbed = scrub_privacy_tokens(draft)
             metrics.update(privacy_tokens_scrubbed=scrubbed is not draft)
             draft = scrubbed
+            # 구술에 시각이 없어 LLM이 비운 기록 시각 항목은 녹음 시각으로 채운다(LLM이 시각을 지어내지 않게 코드가 정한다).
+            draft = fill_recording_time(draft, schema, prepared.reference_time)
             metrics.update(fields=len(draft.proposed_fields), hints=len(hints))
         # 힌트 대기 상한을 넘긴 검토도 화면의 검토 후보로는 필요하다. Gateway timeout 안에 끝난다.
         transcript_gateway = prepared.review.result()
         sources = self.numeric_sources(transcript.text, payload)
-        numeric_findings = NumericVerifier().check(schema, draft.proposed_fields, sources, prepared.reference_time)
+        numeric_findings = NumericVerifier().check(schema, draft.proposed_fields, sources, prepared.reference_time, transcript=transcript.text)
         document = DraftDocument.build(schema, draft.proposed_fields)
         notify("draft_review")
         with stage(_logger, trace_id, "draft_review", schema_id=schema.schema_id) as metrics:
@@ -353,3 +357,19 @@ class NursingNoteWorkflow:
             if used:
                 applied.append({"source_text": source, "applied_text": used, "category": str(hint.get("category") or "")})
         return tuple(applied)
+
+
+def fill_recording_time(draft: DraftResult, schema: FormSchema, recorded_at: datetime) -> DraftResult:
+    """``default_from == "recording_time"`` 항목이 비어 있으면 녹음 시각을 넣고 근거를 ``recording_time``으로 남긴다.
+
+    LLM이 구술에서 읽은 시각("오후 2시")을 채운 항목은 그대로 둔다.
+    """
+    fields = dict(draft.proposed_fields)
+    evidence = dict(draft.evidence_refs)
+    for item in schema.fields:
+        if item.default_from == "recording_time" and not is_filled(fields.get(item.field_id)):
+            fields[item.field_id] = format_for_field(recorded_at, item.type)
+            evidence[item.field_id] = ("recording_time",)
+    if fields == draft.proposed_fields:
+        return draft
+    return replace(draft, proposed_fields=fields, evidence_refs=evidence)

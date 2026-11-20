@@ -56,6 +56,7 @@ def _session_response(session: RecordingSession) -> dict[str, Any]:
         "session_id": session.session_id,
         "trace_id": session.trace_id,
         "status": "workflow_started" if session.job_id else "recording",
+        "started_at": session.started_at,
         "next_sequence": session.next_sequence,
         "chunk_count": len(session.chunks),
         "transcript": session.redacted_transcript,
@@ -158,7 +159,7 @@ async def finish_recording_session(
         )
 
         def submit(transcript) -> str:
-            return submit_workflow_job(plan, PreTranscribedAudio(transcript, session.trace_id), workflow)["job_id"]
+            return submit_workflow_job(plan, PreTranscribedAudio(transcript, session.trace_id, recorded_at=session.started_at), workflow)["job_id"]
 
         try:
             job_id, _ = await run_in_threadpool(services.recording_sessions.start_workflow, session, submit)

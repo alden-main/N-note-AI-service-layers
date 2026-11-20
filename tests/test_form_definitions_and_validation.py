@@ -50,6 +50,30 @@ class FormDefinitionLoaderTests(unittest.TestCase):
             with self.assertRaises(FormDefinitionError):
                 loader.load_all(("form-c",))
 
+    def test_previous_versions_load_as_approved_for_existing_drafts(self):
+        schemas = FormDefinitionLoader(FORMS_DIR).load_previous()
+        daily = [schema for schema in schemas if schema.schema_id == "nursing-daily-note"]
+        self.assertEqual([(schema.version, schema.status) for schema in daily], [("nursing-daily-note/v1", SchemaStatus.APPROVED)])
+        self.assertEqual(FormDefinitionLoader(FORMS_DIR).load_previous(("sbar-handoff",)), ())
+
+    def test_registry_keeps_previous_version_lookup_but_creates_with_active(self):
+        from n_note_ai_service_layers.api import get_services
+        registry = get_services().template_registry
+        self.assertEqual(registry.get("nursing-daily-note", "nursing-daily-note/v1").status, SchemaStatus.APPROVED)
+        self.assertEqual(registry.resolve_active("nursing-daily-note", "NURSING_DAILY_NOTE").version, "nursing-daily-note/v2")
+        with self.assertRaises(LookupError):
+            registry.resolve_active("nursing-daily-note", "NURSING_DAILY_NOTE", "nursing-daily-note/v1")
+
+    def test_previous_version_must_share_schema_id_and_differ_in_version(self):
+        for schema_id, version in (("form-a", "form-a/v1"), ("other", "other/v0")):
+            with self.subTest(schema_id=schema_id), tempfile.TemporaryDirectory() as root:
+                directory = _write_form(Path(root), "form-a")
+                active = json.loads((directory / "form.json").read_text(encoding="utf-8"))
+                (directory / "previous").mkdir()
+                (directory / "previous" / "old.json").write_text(json.dumps({**active, "schema_id": schema_id, "version": version}), encoding="utf-8")
+                with self.assertRaises(FormDefinitionError):
+                    FormDefinitionLoader(Path(root)).load_previous()
+
     def test_pdf_template_must_stay_inside_the_form_directory(self):
         with tempfile.TemporaryDirectory() as root:
             _write_form(Path(root), "form-a", pdf={"template": "../outside.pdf"})

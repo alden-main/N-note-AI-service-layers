@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
 class AudioDecodeError(ValueError):
@@ -16,6 +17,8 @@ class AudioInput:
     입력: 음성 바이트, 파일명, MIME 형식, 추적 ID와 선택 언어 힌트이다.
     ``preceding_text``는 녹음 세션에서 바로 앞 청크까지 전사된 문장의 끝부분이다. STT가 청크 경계에서
     문맥을 이어 받도록 프롬프트 뒤에 붙인다(원본 전사문이므로 로컬 STT 경계 밖으로 보내지 않는다).
+    ``recorded_at``은 음성이 녹음된 시각이다(요청 값 → 음성 파일 메타데이터 → 접수 시각 순으로 API가 정한다,
+    ``services.recording_time``). 구술의 상대 시각을 해석하는 기준이고, 구술에 시각이 없으면 기록 시각 항목을 채운다.
     출력: 전사 서비스가 소비하는 불변 입력 객체이다.
     """
     content: bytes
@@ -24,6 +27,7 @@ class AudioInput:
     trace_id: str
     language_hint: str | None = None
     preceding_text: str | None = None
+    recorded_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -58,8 +62,9 @@ class Transcript:
 class PreTranscribedAudio:
     """이미 전사된 음성이다(녹음 세션에서 청크별로 전사해 이어 붙인 전사문).
 
-    입력: 비식별화 전 원본 전사 결과와 추적 ID이다.
+    입력: 비식별화 전 원본 전사 결과, 추적 ID와 녹음 시각(녹음 세션 시작 시각)이다.
     출력: 초안 생성 흐름이 STT를 다시 하지 않고 비식별화부터 시작하도록 하는 입력이다.
     """
     transcript: Transcript
     trace_id: str
+    recorded_at: datetime | None = None

@@ -13,10 +13,12 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from uuid import uuid4
 
 from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.contracts.privacy import RedactedText
+from n_note_ai_service_layers.services.clock import now_local
 
 # 다음 청크 STT에 문맥으로 넘길 앞 전사문 길이(글자)다. Whisper 프롬프트 상한(약 224토큰) 안에서 기본 용어 힌트를 밀어내지 않게 짧게 둔다.
 PRECEDING_TEXT_CHARS = 60
@@ -53,6 +55,9 @@ class RecordingSession:
     created_at: float
     last_activity: float
     chunks: list[RecordingChunk] = field(default_factory=list)
+    # 세션을 연(녹음을 시작한) 병동 시각이다. ``created_at``은 만료 계산용 monotonic 시각이라 벽시계 시각이 아니다.
+    # 초안 생성의 녹음 시각(구술 기준 시각, 기록 시각 항목의 기본값)으로 쓴다.
+    started_at: datetime = field(default_factory=now_local)
     # 녹음을 마치고 시작한 초안 생성 작업이다. 정해지면 더는 청크를 받지 않는다.
     job_id: str | None = None
     # 같은 세션의 청크는 순서대로 하나씩 전사한다(앞 청크 문맥을 다음 STT에 넘기고, 재전송을 중복 전사하지 않기 위해).

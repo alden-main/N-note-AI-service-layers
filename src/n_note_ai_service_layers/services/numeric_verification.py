@@ -9,6 +9,10 @@ LLM은 '혈압 백에 육십'을 160/100으로 쓰거나, 구술에 없는 기�
 - 날짜·일시 항목의 날짜는 한 덩어리로 보고, 구술 기준일(reference_time) 전후(그제~내일)이거나
   연·월·일이 모두 출처에 있으면 허용한다.
 
+반대 방향도 본다(``transcript``를 주면): 전사문에 아라비아 숫자로 구술한 수치(한 자리 정수 제외)가 초안 어느 항목에도
+없으면 ``missing_from_draft``다. 활력징후를 빠뜨리거나 판단 문구로 바꾼 초안을 잡는다. 한글 수사로 전사된 수치는
+읽는 방법이 여러 가지라 이 방향에서는 보지 않는다.
+
 결과는 간호사 확인 대상(``NumericFinding``)이며, 초안을 자동 수정하지 않는다.
 """
 
@@ -174,18 +178,55 @@ def _is_hour(words: list[str], index: int) -> bool:
 class NumericVerifier:
     """초안 필드의 수치를 출처 수치와 대조한다."""
 
-    def check(self, schema: FormSchema, fields: dict[str, Any], sources: Iterable[str], reference_time: datetime | None = None) -> tuple[NumericFinding, ...]:
+    def check(
+        self, schema: FormSchema, fields: dict[str, Any], sources: Iterable[str], reference_time: datetime | None = None,
+        transcript: str | None = None,
+    ) -> tuple[NumericFinding, ...]:
+        """출처에 없는 초안 수치와(``transcript``를 주면) 초안에서 빠진 전사문 수치다."""
+        findings = self._not_in_source(schema, fields, sources, reference_time)
+        return findings + self.omissions(transcript, fields) if transcript else findings
+
+    @staticmethod
+    def omissions(transcript: str, fields: dict[str, Any]) -> tuple[NumericFinding, ...]:
+        """전사문의 아라비아 숫자 수치 중 초안 어느 항목에도 없는 값이다. 같은 값은 처음 나온 곳 하나만 남긴다."""
+        written: set[Decimal] = set()
+        for value in fields.values():
+            for match in ARABIC_NUMBER.finditer(format_value(value)):
+                number = _number(match.group())
+                if number is not None:
+                    written.add(number)
+        masked = PRIVACY_TOKEN.sub(lambda match: " " * len(match.group()), transcript)
+        findings: list[NumericFinding] = []
+        reported: set[Decimal] = set()
+        for match in ARABIC_NUMBER.finditer(masked):
+            number = _number(match.group())
+            if number is None or number in written or number in reported:
+                continue
+            if number == number.to_integral_value() and 0 <= number <= 9:
+                continue
+            reported.add(number)
+            findings.append(NumericFinding(f"numeric-missing:{match.start()}", None, match.start(), match.end(), match.group(), "missing_from_draft"))
+        return tuple(findings)
+
+    def _not_in_source(
+        self, schema: FormSchema, fields: dict[str, Any], sources: Iterable[str], reference_time: datetime | None,
+    ) -> tuple[NumericFinding, ...]:
+        return self.values_not_in_source(((field.field_id, field.type, fields.get(field.field_id)) for field in schema.fields), sources, reference_time)
+
+    def values_not_in_source(
+        self, values: Iterable[tuple[str, str, Any]], sources: Iterable[str], reference_time: datetime | None = None,
+    ) -> tuple[NumericFinding, ...]:
+        """``(field_id, 자료형, 값)``마다 출처에 없는 수치다. 양식 스키마가 없는 서식(동기 추출 API)도 이 경로를 쓴다."""
         allowed = source_numbers(sources)
         allowed_dates = self._allowed_dates(reference_time)
         findings: list[NumericFinding] = []
-        for field in schema.fields:
-            value = fields.get(field.field_id)
+        for field_id, field_type, value in values:
             if value is None:
                 continue
             text = format_value(value)
             masked = PRIVACY_TOKEN.sub(lambda match: " " * len(match.group()), text)
             skip: set[tuple[int, int]] = set()
-            if field.type in {"date", "datetime"}:
+            if field_type in {"date", "datetime"}:
                 # 날짜는 한 덩어리로 판단한다: 기준일 전후이거나 연·월·일이 모두 출처에 있으면 허용한다.
                 for match in DATE_VALUE.finditer(masked):
                     skip.update({match.span(1), match.span(2), match.span(3)})
@@ -195,7 +236,7 @@ class NumericVerifier:
                         written = None
                     spoken = all(Decimal(int(match.group(index))) in allowed for index in (1, 2, 3))
                     if written not in allowed_dates and not spoken:
-                        findings.append(NumericFinding(f"numeric:{field.field_id}:{match.start()}", field.field_id, match.start(), match.end(), match.group()))
+                        findings.append(NumericFinding(f"numeric:{field_id}:{match.start()}", field_id, match.start(), match.end(), match.group()))
             for match in ARABIC_NUMBER.finditer(masked):
                 number = _number(match.group())
                 if number is None or match.span() in skip:
@@ -203,7 +244,7 @@ class NumericVerifier:
                 if number == number.to_integral_value() and 0 <= number <= 9:
                     continue
                 if number not in allowed:
-                    findings.append(NumericFinding(f"numeric:{field.field_id}:{match.start()}", field.field_id, match.start(), match.end(), match.group()))
+                    findings.append(NumericFinding(f"numeric:{field_id}:{match.start()}", field_id, match.start(), match.end(), match.group()))
         return tuple(findings)
 
     @staticmethod

@@ -60,7 +60,9 @@ forms/
 - `type`: `text`, `string`, `integer`, `number`, `boolean`, `array`, `date`, `datetime`, `enum`(`options` 필수).
 - `required`: 확정(finalize) 전에 반드시 채워야 하는 항목입니다. 보고서 검증 MCP의 섹션별 기준으로도 사용됩니다.
 - `llm_allowed: false`: LLM이 채우지 않고 사용자가 직접 입력하는 항목입니다.
+- `default_from: "recording_time"`: 구술에서 값을 얻지 못하면 서비스가 음성의 녹음 시각으로 채우는 항목입니다(`date`·`datetime`만). 녹음 시각을 정하는 순서는 [API 명세](../docs/api_specification.md#시각)에 있습니다.
 - 양식을 바꿀 때는 `version`을 올립니다. 확정본은 작성 당시 양식 버전을 기록합니다.
+- 버전을 올리면 바꾸기 전 `form.json`을 같은 디렉터리의 `previous/<이름>.json`으로 옮겨 둡니다. 이전 버전은 승인(비활성) 상태로 등록되어, 그 버전으로 만든 초안의 조회·확정과 확정본 PDF 출력이 계속 됩니다. 새 초안은 `form.json`(활성 버전)만 씁니다. `previous/`의 `schema_id`는 활성 정의와 같고 `version`은 서로 달라야 하며, 어기면 기동하지 않습니다.
 
 ## PDF 출력
 
@@ -74,7 +76,7 @@ forms/
 
 ## validation_criteria (선택)
 
-보고서 검증 MCP(`report-validation-standard/v1`)에 섹션별 필수 항목 기준 외의 기준을 추가합니다.
+섹션별 필수 항목 외의 기준을 추가합니다. 필수 항목(`required: true`)은 AI 서비스가 초안 값으로 직접 판정하고, 여기 적은 기준만 보고서 검증 MCP(`report-validation-standard/v1`)로 보냅니다. 기준이 없으면 MCP를 호출하지 않습니다.
 
 ```json
 {"criterion_id": "pain-detail", "description": "통증 호소 시 부위·강도·양상을 기록한다.",

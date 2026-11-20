@@ -188,6 +188,8 @@ class RecordingSessionResponse(BaseModel):
     session_id: str
     trace_id: str
     status: Literal["recording", "workflow_started"]
+    # 녹음 시작 시각(병동 시간대)이다. 초안의 기록 시각 항목은 구술에 시각이 없으면 이 시각으로 채운다.
+    started_at: datetime | None = None
     next_sequence: int
     chunk_count: int
     transcript: str

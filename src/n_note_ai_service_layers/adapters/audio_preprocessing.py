@@ -43,6 +43,25 @@ _NORMALIZE = re.compile(r"[\s.,!?·~\-\"'“”‘’。…]+")
 _WORD_LOOP = re.compile(r"(?<!\S)(\S+)(?:\s+\1(?!\S)){5,}")
 
 
+def audio_creation_time(content: bytes) -> str | None:
+    """음성 컨테이너 메타데이터의 생성 시각 문자열이다(mp4·m4a ``creation_time``, webm/mkv ``DATEUTC``).
+
+    WAV처럼 생성 시각이 없거나 읽을 수 없는 음성은 ``None``이다. 헤더만 읽고 디코딩하지 않는다.
+    """
+    import av
+
+    try:
+        with av.open(BytesIO(content), mode="r") as container:
+            values = [container.metadata, *(stream.metadata for stream in container.streams if stream.type == "audio")]
+    except Exception:  # 형식·손상 오류는 디코딩 단계에서 따로 알린다.
+        return None
+    for metadata in values:
+        value = metadata.get("creation_time") or metadata.get("DATE_RECORDED") or metadata.get("DATEUTC")
+        if value:
+            return str(value)
+    return None
+
+
 def decode_to_pcm(content: bytes, max_seconds: float) -> np.ndarray:
     """음성 바이트를 16kHz mono int16 샘플로 디코딩한다. 실패하거나 ``max_seconds``를 넘으면 ``AudioDecodeError``다."""
     import av

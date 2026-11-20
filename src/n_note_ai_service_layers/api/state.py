@@ -62,7 +62,11 @@ def build_services() -> AppServices:
     audit = AuditTrail(documents)
     registry = FormSchemaRegistry(documents)
     # 운영자가 배포한 양식 정의(N_NOTE_FORMS_DIR)를 활성 양식으로 등록한다.
-    for form in FormDefinitionLoader(config.forms_dir).load_all(config.enabled_form_ids):
+    loader = FormDefinitionLoader(config.forms_dir)
+    for form in loader.load_all(config.enabled_form_ids):
+        registry.add_base(form)
+    # 이전 버전(previous/)은 기존 초안·확정본 조회용 승인 상태다. 새 초안 생성에는 쓰지 않는다.
+    for form in loader.load_previous(config.enabled_form_ids):
         registry.add_base(form)
     ner = build_ner()
     jobs = JobStore(documents, config.job_timeout_seconds, config.draft_retention_hours)
