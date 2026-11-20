@@ -33,7 +33,6 @@ ner = [
 [project.scripts]
 n-note-ai-service-layers = "n_note_ai_service_layers:main"
 n-note-api = "n_note_ai_service_layers.api:main"
-n-note-model-eval = "n_note_ai_service_layers.run_model_eval:main"
 n-note-smoke = "n_note_ai_service_layers.run_smoke_test:main"
 
 [build-system]
