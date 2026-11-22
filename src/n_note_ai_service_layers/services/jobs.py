@@ -152,7 +152,8 @@ class JobRunner:
             self._futures[job_id] = future
 
     def _run(self, job_id: str, work: Callable[[Progress], dict[str, Any]]) -> None:
-        # 작업 하나가 추적 하나(root span)다. 단계·양식별 초안·LLM 호출 span이 이 아래에 놓인다.
+        # 작업 span이다. 단계·양식별 초안·LLM 호출 span이 이 아래에 놓인다. 제출한 요청의 문맥을 이어받으므로
+        # 추적 화면에서는 작업을 만든 API 요청(POST) span 아래에 보인다(요청은 먼저 끝나고 작업이 이어진다).
         with span("workflow_job", job_id=job_id) as current:
             self._run_traced(job_id, work, current)
 

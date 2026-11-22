@@ -1,11 +1,13 @@
 # 개발·평가 환경 전용: LLM 추적 화면(Arize Phoenix)을 함께 띄우고 ai-service 추적을 켠다.
 #
-#   1) .env에 Phoenix 비밀값을 넣는다(각 32자 이상, 저장소에 넣지 않는다).
-#        PHOENIX_SECRET=$(python3 -c "import secrets;print(secrets.token_urlsafe(36))")
-#        PHOENIX_ADMIN_SECRET=$(python3 -c "import secrets;print(secrets.token_urlsafe(36))")
-#        PHOENIX_ADMIN_PASSWORD=<화면 첫 로그인 비밀번호>
+#   개발 PC:
+#   1) .env에 Phoenix 비밀값을 넣는다(각 32자 이상, 저장소에 넣지 않는다). .env.example의 Phoenix 항목 참고.
 #   2) docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
 #   3) 브라우저 http://127.0.0.1:6006 → admin@localhost / PHOENIX_ADMIN_PASSWORD 로그인 → 프로젝트 n-note
+#
+#   서버(배포 번들): scripts/bundle.sh --with-observability 로 Phoenix 이미지를 번들에 넣으면, install.sh가
+#   비밀값을 만들어 .env에 넣고 함께 띄운다(.env의 N_NOTE_OBSERVABILITY=false면 띄우지 않는다).
+#   화면 포트는 서버의 127.0.0.1에만 열리므로 다른 PC에서는 ssh -L 6006:127.0.0.1:6006 <서버> 로 접속한다.
 #
 # 화면에서 볼 수 있는 것: 작업(workflow_job) → 단계(stage.*) → 양식별 초안(form_draft) → LLM 호출(llm.completion:
 # 엔진·프롬프트 판·도구 왕복 수) → Pydantic AI 실행(invoke_agent)·모델 요청(chat <model>: 토큰 수)·사전 도구(execute_tool)
@@ -35,6 +37,13 @@ services:
       - n-note-edge
     ports:
       - "${PHOENIX_BIND_ADDRESS:-127.0.0.1}:${PHOENIX_PORT:-6006}:6006"
+    # 이미지에 셸·curl이 없으므로 내장 python으로 확인한다. install.sh의 --wait가 이 상태를 기다린다.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6006/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     restart: unless-stopped
 
   ai-service:

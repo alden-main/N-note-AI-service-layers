@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from n_note_ai_service_layers.api.routes import bridge, internal_stt, nursing_notes, recording_sessions, templates, transcription, workflow_jobs
 from n_note_ai_service_layers.api.state import get_services
+from n_note_ai_service_layers.observability import fastapi_telemetry
 
 
 @asynccontextmanager
@@ -22,7 +23,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="N-note Bridge API", version="0.1.0", lifespan=_lifespan)
+    # 추적이 켜지면(N_NOTE_OTEL_ENABLED) FastAPI가 요청 span을 만든다. 설정은 observability.fastapi_telemetry에 있다.
+    app = FastAPI(title="N-note Bridge API", version="0.1.0", lifespan=_lifespan, telemetry=fastapi_telemetry())
 
     @app.get("/healthz", tags=["system"])
     def healthz() -> dict[str, str]:

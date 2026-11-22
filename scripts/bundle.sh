@@ -6,16 +6,18 @@
 #   scripts/bundle.sh --version 1.2.0                     # 이미지 태그·번들 이름에 쓸 버전
 #   scripts/bundle.sh --version 1.2.0 --profile qwen3.5-27b   # 로컬 STT·LLM(vLLM) 이미지까지 포함
 #   scripts/bundle.sh --platform linux/arm64              # ARM 서버용
+#   scripts/bundle.sh --version 1.2.0 --with-observability   # LLM 추적 화면(Phoenix) 이미지·설정까지 포함
 #
 # 결과: dist/bundles/n-note-<version>-linux-<arch>.tar.gz 와 .sha256
 # 서버에서는 압축을 풀고 scripts/install.sh 하나로 이미지 로드와 기동까지 한다(docs/linux_docker_model_deployment.md).
-# 모델 가중치(model-cache)와 API 키는 번들에 넣지 않는다.
+# 모델 가중치(model-cache)·API 키·Phoenix 비밀값은 번들에 넣지 않는다(Phoenix 비밀값은 install.sh가 서버에서 만든다).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
 version=""
 platform="linux/amd64"
 profile=""
+observability=false
 output="$root/dist/bundles"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,6 +25,7 @@ while [[ $# -gt 0 ]]; do
     --platform) platform="${2:?--platform needs a value}"; shift 2 ;;
     --profile) profile="${2:?--profile needs a value}"; shift 2 ;;
     --output) output="${2:?--output needs a value}"; shift 2 ;;
+    --with-observability) observability=true; shift ;;
     -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -54,17 +57,29 @@ mkdir -p "$stage" "$output"
 # 셸 환경 변수가 .env·프로필 값보다 우선하므로 모든 이미지가 같은 태그·플랫폼으로 만들어진다.
 export N_NOTE_IMAGE_TAG="$version" DOCKER_DEFAULT_PLATFORM="$platform"
 
+observability_file="docker-compose.observability.yml"
+compose_files=(-f "$root/docker-compose.yml")
+if $observability; then
+  compose_files+=(-f "$root/$observability_file")
+  # overlay는 Phoenix 비밀값이 없으면 멈춘다. 여기서는 이미지 목록을 읽을 때만 쓰는 자리 값이며 번들에 저장하지 않는다.
+  export PHOENIX_SECRET="${PHOENIX_SECRET:-bundle-placeholder}" \
+    PHOENIX_ADMIN_SECRET="${PHOENIX_ADMIN_SECRET:-bundle-placeholder}" \
+    PHOENIX_ADMIN_PASSWORD="${PHOENIX_ADMIN_PASSWORD:-bundle-placeholder}"
+  # 프로필 구성(compose-model.sh)은 이 변수로 추가 compose 파일을 읽는다.
+  export N_NOTE_COMPOSE_EXTRA_FILES="${N_NOTE_COMPOSE_EXTRA_FILES:+$N_NOTE_COMPOSE_EXTRA_FILES,}$observability_file"
+fi
+
 compose() {
   if [[ -n "$profile" ]]; then
     "$root/scripts/compose-model.sh" "$profile" "$@"
   else
-    docker compose --project-directory "$root" -f "$root/docker-compose.yml" "$@"
+    docker compose --project-directory "$root" "${compose_files[@]}" "$@"
   fi
 }
 
-echo "[1/5] 이미지 빌드 ($platform, tag $version${profile:+, profile $profile})" >&2
+echo "[1/5] 이미지 빌드 ($platform, tag $version${profile:+, profile $profile}$($observability && echo ', observability'))" >&2
 compose build
-# 빌드하지 않는 이미지(vLLM 등)는 대상 플랫폼으로 받는다.
+# 빌드하지 않는 이미지(vLLM·Phoenix 등)는 대상 플랫폼으로 받는다.
 compose pull --ignore-buildable
 
 images="$(compose config --images | sort -u)"
@@ -97,6 +112,10 @@ copy eval/cases
 copy deploy/models
 copy scripts/compose-model.sh
 copy scripts/install.sh
+# 추적 화면(Phoenix)을 포함할 때만 넣는다. install.sh는 BUNDLE_INFO의 N_NOTE_BUNDLE_OBSERVABILITY로 판단한다.
+if $observability; then
+  copy "$observability_file"
+fi
 copy mcp_servers/main-mcp-gateway-server/config/upstreams.yaml
 find "$stage" -name .DS_Store -delete
 
@@ -106,6 +125,7 @@ cat > "$stage/BUNDLE_INFO" <<INFO
 N_NOTE_BUNDLE_VERSION=$version
 N_NOTE_BUNDLE_PLATFORM=$platform
 N_NOTE_BUNDLE_PROFILE=$profile
+N_NOTE_BUNDLE_OBSERVABILITY=$observability
 N_NOTE_BUNDLE_GIT_COMMIT=$commit
 N_NOTE_BUNDLE_GIT_DIRTY=$dirty
 N_NOTE_BUNDLE_BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)

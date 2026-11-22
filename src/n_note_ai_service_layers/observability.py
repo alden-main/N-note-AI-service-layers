@@ -93,6 +93,8 @@ def configure_tracing(enabled: bool, capture_content: bool = False) -> bool:
     # OTEL_SERVICE_NAME·OTEL_RESOURCE_ATTRIBUTES가 있으면 그 값을 쓴다(명시 속성이 환경 변수보다 우선하므로 없을 때만 준다).
     attributes = {} if os.environ.get("OTEL_SERVICE_NAME") else {"service.name": DEFAULT_SERVICE_NAME}
     provider = TracerProvider(resource=Resource.create(attributes))
+    # 내보내기 전에 쿼리 문자열을 가린다(BatchSpanProcessor보다 먼저 붙여야 한다).
+    provider.add_span_processor(_redact_url_query())
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
     _tracing_configured = True
@@ -103,6 +105,30 @@ def configure_tracing(enabled: bool, capture_content: bool = False) -> bool:
         capture_content=capture_content,
     )
     return True
+
+
+# 추적하지 않는 요청 경로다. 헬스체크는 10초마다 호출되어 추적 화면을 채우고, 문서 화면은 서비스 동작이 아니다.
+UNTRACED_PATHS = frozenset({"/healthz", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"})
+
+
+def fastapi_telemetry() -> dict[str, Any]:
+    """FastAPI 내장 OpenTelemetry(0.142+) 설정이다. ``FastAPI(telemetry=...)``에 넘긴다.
+
+    FastAPI는 전역 tracer provider가 설치되면(``configure_tracing``) 요청 span을 만든다. 요청 span은 남기고
+    (작업·단계·LLM span이 그 아래에 놓인다) 이 서비스의 원칙에 맞지 않는 기본값은 끈다.
+    """
+    return {
+        "tracing": True,
+        # 의존성 해석·직렬화 단위 span은 요청마다 여러 개가 생겨 LLM 흐름을 가린다.
+        "operation_spans": False,
+        # 켜면 검증 실패·처리되지 않은 예외의 메시지와 스택을 남긴다. 본문이 섞일 수 있으므로 끈다(예외 유형은 span에 남는다).
+        "logs": False,
+        # Phoenix는 metrics를 받지 않는다. 수신기를 정한 뒤 필요하면 켠다.
+        "metrics": False,
+        # exporter는 configure_tracing만 붙인다. 켜 두면 FastAPI가 환경 변수로 exporter를 하나 더 붙여 같은 span을 두 번 보낸다.
+        "auto_configure": False,
+        "exclude": lambda scope: scope.get("path") in UNTRACED_PATHS,
+    }
 
 
 def capture_content() -> bool:
@@ -196,6 +222,24 @@ def stage(logger: logging.Logger, trace_id: str, name: str, **fields: Any) -> It
         set_attributes(current, extra)
         log_event(logger, "stage_completed", trace_id=trace_id, stage=name,
                   seconds=round(time.perf_counter() - started, 3), **fields, **extra)
+
+
+def _redact_url_query() -> Any:
+    """요청 span의 쿼리 문자열(``url.query``) 값을 가리는 span processor다.
+
+    FastAPI는 토큰 같은 정해진 이름만 가리고 나머지 쿼리 값은 그대로 남긴다. 환자·내원 식별자가 쿼리로 들어오는
+    경로가 생겨도 추적 저장소에 남지 않도록 이름만 두고 값을 모두 가린다.
+    """
+    from opentelemetry.sdk.trace import SpanProcessor
+
+    class RedactUrlQuery(SpanProcessor):
+        def on_start(self, span: Any, parent_context: Any = None) -> None:
+            query = (span.attributes or {}).get("url.query")
+            if isinstance(query, str) and query:
+                names = [part.split("=", 1)[0] for part in query.split("&") if part]
+                span.set_attribute("url.query", "&".join(f"{name}=REDACTED" for name in names))
+
+    return RedactUrlQuery()
 
 
 class ContextThreadPoolExecutor(ThreadPoolExecutor):

@@ -15,6 +15,12 @@ fi
 args=(--project-directory "$root" -f "$root/docker-compose.yml")
 # 서버별 설정(포트 공개 등)은 docker-compose.override.yml에 둔다. 일반 docker compose처럼 함께 읽는다.
 [[ -f "$root/docker-compose.override.yml" ]] && args+=(-f "$root/docker-compose.override.yml")
+# 추적 화면(Phoenix)을 함께 설치한 경우(.env의 N_NOTE_OBSERVABILITY=true, install.sh가 정한다) overlay도 읽는다.
+observability_file="docker-compose.observability.yml"
+if [[ -f "$root/.env" && -f "$root/$observability_file" ]] && grep -q '^N_NOTE_OBSERVABILITY=true$' "$root/.env" \
+  && [[ ",${N_NOTE_COMPOSE_EXTRA_FILES:-}," != *",$observability_file,"* ]]; then
+  args+=(-f "$root/$observability_file")
+fi
 # 추가 compose 파일(쉼표 구분, 저장소·번들 기준 경로). 예: N_NOTE_COMPOSE_EXTRA_FILES=docker-compose.benchmark.yml
 IFS=',' read -ra extra_files <<< "${N_NOTE_COMPOSE_EXTRA_FILES:-}"
 for item in ${extra_files[@]+"${extra_files[@]}"}; do

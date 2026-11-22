@@ -135,6 +135,30 @@ class LlmSpanTests(unittest.TestCase):
         self.assertFalse(observability.configure_tracing(False, capture_content=True))
         self.assertFalse(observability.capture_content())
 
+    def test_api_requests_are_traced_without_health_checks_operation_spans_or_query_values(self):
+        from fastapi.testclient import TestClient
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        from n_note_ai_service_layers.api.app import create_app
+
+        with recorded_spans() as spans, TestClient(create_app()) as client:
+            client.get("/healthz")
+            client.get("/openapi.json")
+            client.get("/v1/templates?patient_id=P-12345")
+        self.assertEqual([item.name for item in spans if item.attributes.get("url.path") in observability.UNTRACED_PATHS], [])
+        self.assertFalse([item for item in spans if item.name.startswith("fastapi.")])  # operation_spans 끔
+        request = [item for item in spans if item.attributes.get("url.path") == "/v1/templates"]
+        self.assertEqual(len(request), 1)
+        # 쿼리 값 가림은 configure_tracing이 붙이는 processor다(테스트 provider와 따로 확인).
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(observability._redact_url_query())
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        provider.get_tracer("t").start_span("GET", attributes={"url.query": "patient_id=P-12345&page=2"}).end()
+        self.assertEqual(exporter.get_finished_spans()[0].attributes["url.query"], "patient_id=REDACTED&page=REDACTED")
+
     def test_enabled_tracing_without_an_endpoint_stays_off(self):
         # compose의 ${OTEL_EXPORTER_OTLP_ENDPOINT:-}처럼 빈 값이면 켜지 않는다(localhost로 조용히 보내지 않음).
         with unittest.mock.patch.dict("os.environ", {"OTEL_EXPORTER_OTLP_ENDPOINT": " "}):
