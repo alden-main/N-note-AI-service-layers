@@ -131,6 +131,16 @@ class MedicalDictionaryTests(unittest.TestCase):
         aliases = self.repository.search("DM", limit=10)
         self.assertTrue(any(hit.match_type is MatchType.SYNONYM_OR_ABBREVIATION for hit in aliases.results))
 
+    def test_document_analysis_does_not_evict_issued_search_results(self) -> None:
+        """문서 분석의 내부 오타 검색은 사용자가 받은 search_result_id를 밀어내지 않는다."""
+        issued = self.repository.search("당뇨뼝", limit=3)
+        with self.repository._search_results_lock:
+            stored_before = len(self.repository._search_results)
+        DocumentAnalyzer(self.repository).analyze_document("당뇨뼝 강경변증 " * 600, 0)
+        self.assertIs(self.repository.get_search_result(issued.search_result_id), issued)
+        with self.repository._search_results_lock:
+            self.assertEqual(len(self.repository._search_results), stored_before)
+
     def test_extended_mcp_tools_are_registered(self) -> None:
         """Gateway catalog의 모든 도구가 이름·설명·객체 입력 스키마를 제공한다."""
         with TemporaryDirectory() as directory:

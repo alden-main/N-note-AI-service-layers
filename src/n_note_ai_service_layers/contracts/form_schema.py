@@ -215,17 +215,3 @@ class SchemaReview:
     change_log: tuple[ChangeLogEntry, ...] = ()
     reviewed_by: str | None = None
     reviewed_at: datetime | None = None
-
-
-@dataclass(frozen=True)
-class DraftHandoff:
-    """검증된 초안을 외부 브리지에 전달할 데이터로 표현한다.
-
-    입력: 스키마 ID·버전, 전송 필드, 검증 결과와 간호사 검토 상태이다.
-    출력: 브리지 API 요청으로 직렬화할 불변 핸드오프 객체이다.
-    """
-    schema_id: str
-    schema_version: str
-    fields: dict[str, Any]
-    validation: dict[str, Any]
-    nurse_review_status: str

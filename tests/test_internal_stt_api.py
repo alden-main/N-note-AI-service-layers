@@ -11,7 +11,7 @@ from n_note_ai_service_layers.api.deps import get_gateway_client, get_speech_to_
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermOccurrence, GatewaySuggestion, GatewayTermVerificationResult
 from n_note_ai_service_layers.api import deps
-from n_note_ai_service_layers.api.routes import internal_stt
+from n_note_ai_service_layers.services import form_extraction
 from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.services import nursing_note_workflow
 
@@ -31,7 +31,7 @@ def test_internal_stt_multipart_and_output_validation(monkeypatch):
     app = create_app()
     setup_review(app, monkeypatch)
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("고혈압이 있습니다.", "fake", "fake-stt"))
-    monkeypatch.setattr(internal_stt, "_extract", lambda transcript, template, hints, *_: {
+    monkeypatch.setattr(form_extraction, "extract", lambda transcript, template, hints, *_: {
         "fields": {"history": "고혈압", "choice": {"status": "없음", "detail": "잘못된 상세"}, "allergy": ["약", "허위"]},
         "relatedSentences": {"history": [0, 7]},
     })
@@ -54,7 +54,7 @@ def test_internal_stt_extraction_failure_preserves_transcript(monkeypatch):
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("전사문", "fake", "fake-stt"))
     def fail(*args):
         raise RuntimeError()
-    monkeypatch.setattr(internal_stt, "_extract", fail)
+    monkeypatch.setattr(form_extraction, "extract", fail)
     template = {"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": []}}
     response = TestClient(app).post("/internal/v1", files={"file": ("test.wav", b"audio", "audio/wav")}, data={"templates": json.dumps([template])})
     body = response.json()
@@ -72,7 +72,7 @@ def test_redaction_and_term_hints_precede_extraction(monkeypatch):
     def extract(sentences, template, hints, *_):
         seen.update(sentences=sentences, hints=hints)
         return {"fields": {"history": "고혈압증"}, "relatedSentences": {"history": [0, 0]}}
-    monkeypatch.setattr(internal_stt, "_extract", extract)
+    monkeypatch.setattr(form_extraction, "extract", extract)
     template = {"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": [{"fields": [{"field_id": "history", "field_type": "text"}]}]}}
     response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([template])})
     assert response.status_code == 200
@@ -103,12 +103,12 @@ def chat_client(monkeypatch, content):
         calls.append(request)
         return {"choices": [{"message": {"content": content}}]}
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    monkeypatch.setattr(internal_stt.model_providers, "openai_client", lambda *args: client)
+    monkeypatch.setattr(form_extraction.model_providers, "openai_client", lambda *args: client)
     return calls
 
 
 def test_output_schema_is_flat_and_matches_response_contract():
-    schema = internal_stt._output_schema(FORM, 1)
+    schema = form_extraction.output_schema(FORM, 1)
     fields = schema["properties"]["fields"]
     assert fields["required"] == ["situation", "smoking", "age", "allergy", "tags"] and fields["additionalProperties"] is False
     assert fields["properties"]["smoking"]["description"] == "흡연력 - 현재"
@@ -116,15 +116,15 @@ def test_output_schema_is_flat_and_matches_response_contract():
     assert fields["properties"]["allergy"]["required"] == ["selected", "detail"]
     assert fields["properties"]["tags"] == {"type": "array", "items": {"type": "string"}}
     assert schema["properties"]["relatedSentences"]["properties"]["tags"] == {"type": "array", "items": {"type": "integer", "enum": [0]}, "maxItems": 3}
-    assert internal_stt.Draft202012Validator(schema).is_valid(VALID)
+    assert form_extraction.Draft202012Validator(schema).is_valid(VALID)
 
 
 def test_chat_extraction_requests_structured_output_with_correction_rules(monkeypatch):
     calls = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
-    assert internal_stt._extract(["전사문"], FORM, ()) == VALID
+    assert form_extraction.extract(["전사문"], FORM, ()) == VALID
     request = calls[0]
     assert request["response_format"]["json_schema"]["strict"] is True
-    assert request["response_format"]["json_schema"]["schema"] == internal_stt._output_schema(FORM, 1)
+    assert request["response_format"]["json_schema"]["schema"] == form_extraction.output_schema(FORM, 1)
     assert "standard Korean" in request["messages"][0]["content"] and "JSON schema:" in request["messages"][0]["content"]
 
 
@@ -135,9 +135,9 @@ def test_responses_extraction_requests_structured_output(monkeypatch):
     def create(**request):
         seen.update(request)
         return SimpleNamespace(output_text=json.dumps(VALID, ensure_ascii=False))
-    monkeypatch.setattr(internal_stt.model_providers, "openai_client", lambda *args: SimpleNamespace(responses=SimpleNamespace(create=create)))
-    assert internal_stt._extract(["전사문"], FORM, ()) == VALID
-    assert seen["text"]["format"]["strict"] is True and seen["text"]["format"]["schema"] == internal_stt._output_schema(FORM, 1)
+    monkeypatch.setattr(form_extraction.model_providers, "openai_client", lambda *args: SimpleNamespace(responses=SimpleNamespace(create=create)))
+    assert form_extraction.extract(["전사문"], FORM, ()) == VALID
+    assert seen["text"]["format"]["strict"] is True and seen["text"]["format"]["schema"] == form_extraction.output_schema(FORM, 1)
     # 전사문을 OpenAI 쪽에 보관하지 않는다.
     assert seen["store"] is False
 
@@ -146,7 +146,7 @@ def test_extraction_uses_shared_generation_options(monkeypatch):
     monkeypatch.setenv("N_NOTE_LLM_TEMPERATURE", "0")
     monkeypatch.setenv("N_NOTE_LLM_MAX_TOKENS", "1024")
     calls = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
-    internal_stt._extract(["전사문"], FORM, ())
+    form_extraction.extract(["전사문"], FORM, ())
     assert (calls[0]["temperature"], calls[0]["max_tokens"]) == (0.0, 1024)
 
 
@@ -154,7 +154,7 @@ def test_privacy_tokens_are_scrubbed_from_field_values_but_kept_in_evidence():
     sentences = ["[[PERSON_1]]님은 흑색변으로 입원함."]
     result = {**VALID, "fields": {**VALID["fields"], "situation": "[[PERSON_1]]님은 흑색변으로 입원함", "allergy": {"selected": ["약"], "detail": "[[PERSON_2]]가 두드러기"}},
               "relatedSentences": {**VALID["relatedSentences"], "situation": [0]}}
-    normalized = internal_stt._normalize(FORM, sentences, result)
+    normalized = form_extraction.normalize(FORM, sentences, result)
     assert normalized["fields"]["situation"] == "흑색변으로 입원함"
     assert normalized["fields"]["allergy"] == {"selected": ["약"], "detail": "두드러기"}
     assert normalized["relatedSentences"]["situation"] == sentences
@@ -170,7 +170,7 @@ def test_extraction_rejects_structure_that_would_silently_empty_fields(monkeypat
     for result in (NESTED, ARRAY, WRAPPED_TEXT, NO_EVIDENCE, []):
         chat_client(monkeypatch, json.dumps(result, ensure_ascii=False))
         try:
-            internal_stt._extract(["전사문"], FORM, ())
+            form_extraction.extract(["전사문"], FORM, ())
         except ValueError:
             continue
         raise AssertionError(f"accepted {result}")
@@ -179,7 +179,7 @@ def test_extraction_rejects_structure_that_would_silently_empty_fields(monkeypat
 def test_out_of_option_value_stays_a_blank_field_not_a_failed_form(monkeypatch):
     result = {**VALID, "fields": {**VALID["fields"], "age": "노인", "smoking": {"status": "비흡연", "detail": ""}}}
     chat_client(monkeypatch, json.dumps(result, ensure_ascii=False))
-    normalized = internal_stt._normalize(FORM, ["전사문"], internal_stt._extract(["전사문"], FORM, ()))
+    normalized = form_extraction.normalize(FORM, ["전사문"], form_extraction.extract(["전사문"], FORM, ()))
     assert normalized["fields"]["age"] == "" and normalized["fields"]["smoking"] == {"status": "", "detail": ""}
     assert normalized["fields"]["situation"] == "흑색변으로 입원함"
 
@@ -213,8 +213,8 @@ def test_extraction_metrics_count_filled_fields_only(monkeypatch):
 
 
 def capture_stages(monkeypatch, logs):
-    """공통 단계(TranscriptPreparation)와 서식 추출(internal_stt)의 단계 로그를 함께 모은다."""
-    for module in (nursing_note_workflow, internal_stt):
+    """공통 단계(TranscriptPreparation)와 서식 추출(form_extraction)의 단계 로그를 함께 모은다."""
+    for module in (nursing_note_workflow, form_extraction):
         monkeypatch.setattr(module, "stage", lambda *args, **kwargs: observed_stage(logs, *args, **kwargs))
 
 
@@ -235,7 +235,7 @@ def test_redaction_or_gateway_failure_stops_extraction(monkeypatch):
     app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("홍길동님", "fake", "fake-stt"))
     def fail(*args):
         raise AssertionError("extraction must not run")
-    monkeypatch.setattr(internal_stt, "_extract", fail)
+    monkeypatch.setattr(form_extraction, "extract", fail)
     template = [{"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": []}}]
     def send():
         return TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps(template)})
@@ -279,7 +279,7 @@ def test_forms_are_extracted_concurrently_and_keep_request_order(monkeypatch):
     def extract(sentences, template, hints, *_):
         barrier.wait()
         return {"fields": {"note": template["templateType"]}, "relatedSentences": {}}
-    monkeypatch.setattr(internal_stt, "_extract", extract)
+    monkeypatch.setattr(form_extraction, "extract", extract)
     templates = [
         {"templateType": kind, "templateName": kind, "schemaDefinition": {"sections": [{"fields": [{"field_id": "note", "field_type": "text"}]}]}}
         for kind in ("A", "B")
@@ -292,22 +292,22 @@ def test_forms_are_extracted_concurrently_and_keep_request_order(monkeypatch):
 def test_sentences_split_on_endings_and_long_clauses_and_stay_transcript_substrings():
     long_run = ", ".join(["혈압 측정함"] * 40)
     text = f"흑색변으로 입원했습니다. 통증 있나요?\n{long_run}"
-    sentences = internal_stt._sentences(text)
+    sentences = form_extraction.split_sentences(text)
     assert sentences[:2] == ["흑색변으로 입원했습니다.", "통증 있나요?"]
-    assert all(len(sentence) <= internal_stt._MAX_SENTENCE_CHARS and sentence in text for sentence in sentences)
-    assert internal_stt._sentences("") == []
+    assert all(len(sentence) <= form_extraction.MAX_SENTENCE_CHARS and sentence in text for sentence in sentences)
+    assert form_extraction.split_sentences("") == []
 
 
 def test_evidence_ids_map_to_sentences_deduplicated_and_capped():
     template = {"templateType": "X", "templateName": "Y", "schemaDefinition": {"sections": [{"fields": [{"field_id": "a", "field_type": "text"}]}]}}
     sentences = ["s0", "s1", "s2", "s3"]
     result = {"fields": {"a": "값"}, "relatedSentences": {"a": [2, 2, True, -1, 9, "1", 0, 1, 3]}}
-    assert internal_stt._normalize(template, sentences, result)["relatedSentences"]["a"] == ["s2", "s0", "s1"]
+    assert form_extraction.normalize(template, sentences, result)["relatedSentences"]["a"] == ["s2", "s0", "s1"]
 
 
 def test_extraction_sends_numbered_sentences_instead_of_raw_transcript(monkeypatch):
     calls = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
-    internal_stt._extract(["첫 문장.", "둘째 문장."], FORM, ())
+    form_extraction.extract(["첫 문장.", "둘째 문장."], FORM, ())
     payload = json.loads(calls[0]["messages"][1]["content"])
     assert payload["transcript_sentences"] == [{"id": 0, "text": "첫 문장."}, {"id": 1, "text": "둘째 문장."}] and "transcript" not in payload
     assert "transcript_sentences" in calls[0]["messages"][0]["content"]
@@ -327,7 +327,7 @@ def _slow_review(app, monkeypatch, status):
     def extract(sentences, template, hints, *_):
         seen.append(hints)
         return {"fields": {"note": "값"}, "relatedSentences": {"note": [0]}}
-    monkeypatch.setattr(internal_stt, "_extract", extract)
+    monkeypatch.setattr(form_extraction, "extract", extract)
     return seen
 
 
@@ -366,7 +366,7 @@ def _timed_app(monkeypatch, transcript, fields):
     def extract(sentences, template, hints, reference_time=None):
         seen["reference_time"] = reference_time
         return {"fields": fields, "relatedSentences": {"status": [0]}}
-    monkeypatch.setattr(internal_stt, "_extract", extract)
+    monkeypatch.setattr(form_extraction, "extract", extract)
     return TestClient(app), seen
 
 
@@ -418,13 +418,13 @@ def test_label_left_after_token_scrub_becomes_an_empty_value():
         {"field_id": "summary", "field_type": "text"},
         {"field_id": "med", "field_type": "radio", "has_detail_text": True, "options": ["없음", "있음"]}]}]}}
     result = {"fields": {"summary": "환자명: [[LABELED_PERSON_1]].", "med": {"status": "있음", "detail": "환자명: [[LABELED_PERSON_1]]"}}, "relatedSentences": {}}
-    assert internal_stt._normalize(form, ["문장"], result)["fields"] == {"summary": "", "med": {"status": "있음", "detail": ""}}
+    assert form_extraction.normalize(form, ["문장"], result)["fields"] == {"summary": "", "med": {"status": "있음", "detail": ""}}
 
 
 def test_extraction_payload_carries_reference_time_and_prompt_rules(monkeypatch):
     from datetime import datetime, timedelta, timezone
     calls = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
-    internal_stt._extract(["전사문"], FORM, (), datetime(2026, 11, 18, 8, 0, tzinfo=timezone(timedelta(hours=9))))
+    form_extraction.extract(["전사문"], FORM, (), datetime(2026, 11, 18, 8, 0, tzinfo=timezone(timedelta(hours=9))))
     assert json.loads(calls[0]["messages"][1]["content"])["reference_time"] == "2026-11-18T08:00+09:00"
     instructions = calls[0]["messages"][0]["content"]
     assert "never drop a measurement" in instructions and "Do not add clinical interpretations" in instructions

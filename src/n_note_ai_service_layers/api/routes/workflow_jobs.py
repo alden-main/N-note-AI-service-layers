@@ -81,6 +81,12 @@ def job_response(job: dict[str, Any]) -> dict[str, Any]:
     return {**job, "links": links}
 
 
+def check_form_selection(schema_id: str | None, schema_ids: list[str] | None, schema_version: str | None) -> None:
+    """양식은 ``schema_id``(+``schema_version``) 하나 또는 ``schema_ids`` 목록 중 하나로만 고른다."""
+    if schema_ids and (schema_id or schema_version):
+        raise HTTPException(status_code=422, detail="use either schema_id/schema_version or schema_ids")
+
+
 def requested_form_ids(values: list[str]) -> list[str]:
     """반복 필드(``schema_ids=a&schema_ids=b``)와 쉼표 구분(``a,b``)을 모두 받아 순서를 지키며 중복을 없앤다."""
     ids = [item.strip() for value in values for item in value.split(",") if item.strip()]
@@ -211,8 +217,8 @@ async def create_nursing_note_workflow(
     workflow: NursingNoteWorkflow = Depends(get_nursing_note_workflow),
 ) -> dict[str, Any]:
     """음성을 검증하고 초안 생성 작업을 접수한다. 처리는 백그라운드에서 진행되며 즉시 202를 반환한다."""
-    if schema_ids and (schema_id or schema_version):
-        raise HTTPException(status_code=422, detail="use either schema_id/schema_version or schema_ids")
+    # 음성을 읽기 전에 거부한다(prepare_workflow_forms도 같은 검사를 한다).
+    check_form_selection(schema_id, schema_ids, schema_version)
     received_at = now_local()
     requested_time = _parse_recorded_at(recorded_at)
     content = await read_validated_audio(audio)
@@ -253,9 +259,8 @@ async def prepare_workflow_forms(
 ) -> WorkflowPlan:
     """요청한 양식의 활성 버전과 임상 문맥을 준비한다. 쓸 수 없는 양식은 작업을 만들기 전에 422로 거부한다."""
     trace_id = trace_id or str(uuid4())
+    check_form_selection(schema_id, schema_ids, schema_version)
     if schema_ids:
-        if schema_id or schema_version:
-            raise HTTPException(status_code=422, detail="use either schema_id/schema_version or schema_ids")
         requested = [(form_id, None) for form_id in requested_form_ids(schema_ids)]
     else:
         requested = [(schema_id, schema_version)]

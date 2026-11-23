@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from n_note_ai_service_layers.contracts.clinical_context import ClinicalContextQuery
+from n_note_ai_service_layers.contracts.clinical_context import (
+    ClinicalContextQuery, ClinicalContextSnapshot, ClinicalDataRepository, ClinicalFactNormalizer,
+)
 from n_note_ai_service_layers.services.access_policy import PurposeAccessPolicy
 from n_note_ai_service_layers.services.context_assembler import ClinicalContextAssembler
 from n_note_ai_service_layers.services.schema_review import FormSchemaRegistry
@@ -15,11 +17,14 @@ class ClinicalContextFlow:
     입력: 접근 정책, 스키마 레지스트리, 저장소, 조립기와 선택 정규화기이다.
     출력: ``build`` 호출 시 승인된 요청의 ``ClinicalContextSnapshot``이다.
     """
-    def __init__(self, policy: PurposeAccessPolicy, registry: FormSchemaRegistry, repository, assembler: ClinicalContextAssembler, normalizer=None) -> None:
+    def __init__(
+        self, policy: PurposeAccessPolicy, registry: FormSchemaRegistry, repository: ClinicalDataRepository,
+        assembler: ClinicalContextAssembler, normalizer: ClinicalFactNormalizer | None = None,
+    ) -> None:
         self.policy, self.registry, self.repository, self.assembler = policy, registry, repository, assembler
         self.normalizer = normalizer or CodeMappingNormalizer()
 
-    def build(self, query: ClinicalContextQuery):
+    def build(self, query: ClinicalContextQuery) -> ClinicalContextSnapshot:
         self.policy.authorize_read(query)
         schema = self.registry.resolve_active(query.schema_id, query.purpose, query.schema_version)
         records = self.repository.fetch(query, schema.requested_fact_ids)

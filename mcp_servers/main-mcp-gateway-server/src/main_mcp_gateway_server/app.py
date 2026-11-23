@@ -28,7 +28,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import configured_upstreams
-from .mcp import DEFAULT_BATCH_MAX_CONCURRENCY, DEFAULT_UPSTREAM_TIMEOUT_SECONDS, GatewayCatalog, HttpTransport
+from .mcp import DEFAULT_BATCH_MAX_CONCURRENCY, DEFAULT_CATALOG_TTL_SECONDS, DEFAULT_UPSTREAM_TIMEOUT_SECONDS, GatewayCatalog, HttpTransport
 
 
 DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576
@@ -69,8 +69,8 @@ def create_mcp_server(catalog: Any) -> Server:
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
-        # Gateway가 upstream보다 먼저 올라와도 다음 client discovery에서 다시 연결한다.
-        await anyio.to_thread.run_sync(catalog.discover_all)
+        # catalog TTL이 지난 서비스만 다시 찾는다. 연결되지 않은 upstream은 5초마다 다시 시도해 늦게 떠도 곧 나타난다.
+        await anyio.to_thread.run_sync(catalog.refresh)
         tools = await anyio.to_thread.run_sync(catalog.list_tools)
         return [types.Tool.model_validate(tool) for tool in tools]
 
@@ -253,6 +253,7 @@ def serve_gateway(port: int) -> None:
         HttpTransport(_upstream_timeout_seconds()),
         health_ttl_seconds=_non_negative_float("GATEWAY_HEALTH_TTL_SECONDS", DEFAULT_HEALTH_TTL_SECONDS),
         batch_max_concurrency=_positive_int("GATEWAY_BATCH_MAX_CONCURRENCY", DEFAULT_BATCH_MAX_CONCURRENCY),
+        catalog_ttl_seconds=_non_negative_float("GATEWAY_CATALOG_TTL_SECONDS", DEFAULT_CATALOG_TTL_SECONDS),
     )
     catalog.discover_all()
     service = GatewayService(catalog, _max_request_body_bytes(), _positive_int("GATEWAY_BATCH_MAX_CALLS", DEFAULT_BATCH_MAX_CALLS))

@@ -177,14 +177,14 @@ class DocumentAnalyzer:
     def _typo_terms(self, source: str, find_exact: Callable[[str], list[DictionaryTerm]]) -> tuple[str, list[DictionaryTerm]]:
         """오타 후보와 조사·어미를 뺀 원문을 반환한다. 한글은 자모 차이가 작은 용어만 남긴다."""
         if not re.fullmatch(r"[가-힣]+", source):
-            return source, [hit.term for hit in self._dictionary.search(source, limit=MAX_TYPO_TERMS).results if hit.match_type.value == "similar"]
+            return source, [hit.term for hit in self._dictionary.rank(source, limit=MAX_TYPO_TERMS) if hit.match_type.value == "similar"]
         bases = [source, *(source[:-len(ending)] for ending in _TYPO_ENDINGS if source.endswith(ending))]
         for base in bases:
             if len(base) < PHONETIC_MIN_SYLLABLES:
                 continue
             if find_exact(base):
                 return source, []
-            hits = [hit.term for hit in self._dictionary.search(base, limit=20).results if hit.match_type.value == "similar"]
+            hits = [hit.term for hit in self._dictionary.rank(base, limit=20) if hit.match_type.value == "similar"]
             close = [term for term in hits if self._is_close_typo(base, comparison_key(term.kor_name))]
             if close:
                 return base, close[:MAX_TYPO_TERMS]

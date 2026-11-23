@@ -179,14 +179,27 @@ class DictionaryRepository:
         return [term for name in names for term in self.find_exact(name)]
 
     def search(self, query: str, limit: int = 10, match_modes: set[MatchType] | None = None) -> SearchResult:
-        """색인된 정규화 키의 제한된 접두 후보만 점수화해 검색한다.
+        """검색 결과를 재검증용 식별자와 함께 보관하고 반환한다(공개 검색 도구용).
+
+        내부 분석(오타 후보 등)은 ``rank``를 써서 사용자가 받은 ``search_result_id``를 밀어내지 않는다.
+        """
+        result = SearchResult(str(uuid4()), self.version, self.rank(query, limit, match_modes))
+        with self._search_results_lock:
+            self._search_results[result.search_result_id] = result
+            self._search_results.move_to_end(result.search_result_id)
+            while len(self._search_results) > 1_000:
+                self._search_results.popitem(last=False)
+        return result
+
+    def rank(self, query: str, limit: int = 10, match_modes: set[MatchType] | None = None) -> list[SearchHit]:
+        """색인된 정규화 키의 제한된 접두 후보만 점수화한다. 결과를 보관하지 않는다.
 
         Args:
             query: 저장하지 않는 사용자 검색 표현이다.
             limit: 반환할 최대 결과 수이며 1에서 50 사이여야 한다.
 
         Returns:
-            활성 사전 버전과 재검증 가능한 검색 결과 식별자를 포함한 결과다.
+            점수 내림차순의 검색 결과 목록이다.
 
         Raises:
             ValueError: 비어 있는 검색어 또는 허용 범위를 벗어난 limit일 때 발생한다.
@@ -221,14 +234,7 @@ class DictionaryRepository:
         ordered = sorted(hits.values(), key=lambda hit: (-hit.score, hit.term.kor_name, hit.term.eng_name, hit.term.term_code))
         if match_modes is not None:
             ordered = [hit for hit in ordered if hit.match_type in match_modes]
-        ordered = ordered[:limit]
-        result = SearchResult(str(uuid4()), self.version, ordered)
-        with self._search_results_lock:
-            self._search_results[result.search_result_id] = result
-            self._search_results.move_to_end(result.search_result_id)
-            while len(self._search_results) > 1_000:
-                self._search_results.popitem(last=False)
-        return result
+        return ordered[:limit]
 
     def get_search_result(self, search_result_id: str) -> SearchResult | None:
         """현재 활성 사전에서 발급한 제한적 검색 결과를 반환한다.

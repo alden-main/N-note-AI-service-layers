@@ -31,6 +31,9 @@ CLIENT_INFO = {"name": "n-note-ai-service", "version": __version__}
 DEFAULT_POOL_WORKERS = 16
 # A catalog missing expected tools (an upstream MCP still starting or down) is refreshed this often.
 INCOMPLETE_CATALOG_TTL_SECONDS = 15.0
+# catalog 조회가 실패하면 이 시간 동안은 다시 시도하지 않고 바로 실패한다. Gateway가 응답 없이 멈췄을 때
+# catalog lock을 기다리던 스레드가 차례로 timeout까지 기다리는 것을 막는다(catalog TTL을 쓸 때만 적용).
+FAILED_DISCOVERY_RETRY_SECONDS = 5.0
 # Gateway의 일괄 도구 호출 경로다. MCP endpoint와 같은 host·접두 경로를 쓴다.
 BATCH_CALL_PATH = "/v1/tools/batch-call"
 # Gateway가 일괄 호출 한 번에 받는 최대 호출 수(GATEWAY_BATCH_MAX_CALLS 기본값)다. 넘으면 요청 전체를 거부하므로 나눠 보낸다.
@@ -81,6 +84,7 @@ class McpGatewayClient:
         batch_url: str | None = None,
         expected_tools: tuple[str, ...] = (),
         incomplete_catalog_ttl_seconds: float = INCOMPLETE_CATALOG_TTL_SECONDS,
+        failed_discovery_retry_seconds: float = FAILED_DISCOVERY_RETRY_SECONDS,
         batch_max_calls: int = DEFAULT_BATCH_MAX_CALLS,
         pool_workers: int = DEFAULT_POOL_WORKERS,
     ) -> None:
@@ -94,6 +98,8 @@ class McpGatewayClient:
         self._expected_tools = frozenset(expected_tools)
         self._incomplete_catalog_ttl_seconds = incomplete_catalog_ttl_seconds
         self._catalog_loaded_at: float | None = None
+        self._failed_discovery_retry_seconds = failed_discovery_retry_seconds
+        self._discovery_failed_at: float | None = None
         self._catalog_lock = threading.Lock()
         # Streamable HTTP 세션이다. 상태 없는 서버는 세션 ID를 주지 않으므로 None으로 남는다.
         self._session_id: str | None = None
@@ -138,10 +144,22 @@ class McpGatewayClient:
         with self._catalog_lock:
             if self._catalog_fresh():
                 return self._catalog
-            self.initialize(request_id)
-            self._catalog = self.list_tools(request_id)
+            if self._recently_failed():
+                raise McpGatewayConnectionError("Gateway discovery failed recently")
+            try:
+                self.initialize(request_id)
+                self._catalog = self.list_tools(request_id)
+            except McpGatewayError:
+                self._discovery_failed_at = time.monotonic()
+                raise
             self._catalog_loaded_at = time.monotonic()
+            self._discovery_failed_at = None
             return self._catalog
+
+    def _recently_failed(self) -> bool:
+        if self._catalog_ttl_seconds <= 0 or self._discovery_failed_at is None:
+            return False
+        return time.monotonic() - self._discovery_failed_at < self._failed_discovery_retry_seconds
 
     def invalidate_catalog(self) -> None:
         self._catalog_loaded_at = None

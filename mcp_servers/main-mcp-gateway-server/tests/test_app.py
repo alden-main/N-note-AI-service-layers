@@ -23,7 +23,7 @@ class RecordingCatalog:
         self.calls: list[tuple[str, dict, str | None]] = []
         self.discovery_calls = 0
 
-    def discover_all(self) -> None:
+    def refresh(self) -> None:
         self.discovery_calls += 1
 
     def list_tools(self) -> list[dict]:

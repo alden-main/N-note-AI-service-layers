@@ -115,6 +115,15 @@ class DockerGatewayConfigurationTests(unittest.TestCase):
                 self.assertIn(f"\n  {name}:\n", compose)
         self.assertNotIn("ports:", compose)
 
+    def test_override_publishes_only_the_ai_service_api(self):
+        override = (ROOT / "docker-compose.override.yml").read_text()
+        services = re.findall(r"^  ([\w-]+):\s*$", override, re.MULTILINE)
+        self.assertEqual(services, ["ai-service"])
+        self.assertEqual(override.count("ports:"), 1)
+        self.assertIn(":8000\"", override)
+        # 서버 설치 번들에도 같은 파일이 들어가야 API가 공개된다.
+        self.assertIn("copy docker-compose.override.yml", (ROOT / "scripts" / "bundle.sh").read_text())
+
     def test_local_model_servers_are_opt_in_profiles(self):
         compose = (ROOT / "docker-compose.yml").read_text()
         self.assertIn('profiles: ["local-stt"]', compose)

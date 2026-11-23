@@ -142,6 +142,37 @@ class GatewayConcurrencyTest(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertTrue(all(result.get("isError") is False for result in results))
 
+    def test_discovery_contacts_upstreams_in_parallel(self) -> None:
+        """두 upstream의 health 확인이 동시에 진행돼야 한다(직렬이면 barrier가 깨진다)."""
+        transport = FakeTransport()
+        barrier = threading.Barrier(2, timeout=2)
+        original = transport.healthy
+        transport.healthy = lambda url: (barrier.wait(), original(url))[1]
+        catalog = GatewayCatalog((UpstreamConfig("a", "http://a/mcp", "http://a/healthz"), UpstreamConfig("b", "http://b/mcp", "http://b/healthz")), transport)
+        catalog.discover_all()
+        self.assertEqual(sorted(tool["name"] for tool in catalog.list_tools()), ["a__lookup", "b__lookup"])
+
+    def test_refresh_reuses_active_catalog_until_the_ttl(self) -> None:
+        """tools/list(refresh)는 TTL 안에서 upstream에 다시 묻지 않고, 연결되지 않은 서비스만 짧은 간격으로 다시 찾는다."""
+        transport = FakeTransport()
+        transport.health["http://b/healthz"] = False
+        now = [0.0]
+        with patch("main_mcp_gateway_server.mcp.monotonic", side_effect=lambda: now[0]):
+            catalog = self._catalog(transport, catalog_ttl_seconds=30)
+            lists = lambda: sum(1 for item in transport.calls if item[1]["method"] == "tools/list")
+            self.assertEqual(lists(), 1)  # a만 active
+            now[0] = 2.0
+            catalog.refresh()
+            self.assertEqual((lists(), transport.health_checks), (1, 2))  # 둘 다 아직 새 discovery 아님
+            transport.health["http://b/healthz"] = True
+            now[0] = 6.0
+            catalog.refresh()  # b(연결 안 됨)는 5초가 지나 다시 찾고, a는 TTL 안이라 그대로다
+            self.assertEqual(lists(), 2)
+            self.assertEqual(sorted(tool["name"] for tool in catalog.list_tools()), ["a__lookup", "b__lookup"])
+            now[0] = 31.0
+            catalog.refresh()  # a의 TTL이 지났다
+            self.assertEqual(lists(), 3)
+
     def test_discovery_does_not_block_calls(self) -> None:
         """discovery가 upstream을 기다리는 동안에도 기존 catalog로 도구를 호출할 수 있다."""
         transport = FakeTransport()

@@ -23,6 +23,8 @@ DEFAULT_MAX_IDLE_CONNECTIONS = 16
 DEFAULT_BATCH_MAX_CONCURRENCY = 8
 # 연결되지 않은 서비스로 온 호출이 그 서비스를 다시 discovery하는 최소 간격(초)이다.
 REDISCOVERY_INTERVAL_SECONDS = 5.0
+# tools/list가 active 서비스의 catalog를 다시 discovery하지 않고 재사용하는 시간(초)이다.
+DEFAULT_CATALOG_TTL_SECONDS = 30.0
 
 
 class Transport(Protocol):
@@ -143,6 +145,7 @@ class GatewayCatalog:
         transport: Transport | None = None,
         health_ttl_seconds: float = 0.0,
         batch_max_concurrency: int = DEFAULT_BATCH_MAX_CONCURRENCY,
+        catalog_ttl_seconds: float = 0.0,
     ) -> None:
         self._transport = transport or HttpTransport()
         self._services = {item.service_id: ServiceState(item) for item in upstreams}
@@ -152,6 +155,9 @@ class GatewayCatalog:
         self._discovery_lock = Lock()
         self._health_ttl_seconds = health_ttl_seconds
         self._batch_executor = ThreadPoolExecutor(max_workers=max(batch_max_concurrency, 1), thread_name_prefix="gateway-batch")
+        # upstream마다 discovery 왕복(health·initialize·알림·tools/list)을 동시에 보낸다. 전체 시간은 가장 느린 서비스 수준이다.
+        self._discovery_executor = ThreadPoolExecutor(max_workers=max(len(upstreams), 1), thread_name_prefix="gateway-discovery")
+        self._catalog_ttl_seconds = catalog_ttl_seconds
 
     def discover_all(self) -> None:
         """각 upstream을 독립적으로 health 검사하고 MCP session 및 tools/list를 검증한다.
@@ -160,10 +166,29 @@ class GatewayCatalog:
         성립한 서비스만 active catalog에 넣는다. 하나가 실패해도 다른 서비스 상태에는 영향을 주지 않는다.
         """
         with self._discovery_lock:
-            for state in self._snapshot().values():
-                discovered = self._discover(state.config)
-                with self._lock:
-                    self._services[state.config.service_id] = discovered
+            self._discover_many(list(self._snapshot().values()))
+
+    def refresh(self) -> None:
+        """tools/list용 갱신이다. 오래된 서비스만 다시 discovery한다.
+
+        active 서비스는 ``catalog_ttl_seconds``, 연결되지 않은 서비스는 그보다 짧은 ``REDISCOVERY_INTERVAL_SECONDS``가
+        지났을 때만 다시 찾는다. Gateway보다 늦게 뜨거나 복구된 upstream은 다음 tools/list에서 바로 나타난다.
+        """
+        with self._discovery_lock:
+            now = monotonic()
+            stale = [state for state in self._snapshot().values() if now - state.discovered_at >= self._max_age(state)]
+            self._discover_many(stale)
+
+    def _max_age(self, state: ServiceState) -> float:
+        if state.status == "active":
+            return self._catalog_ttl_seconds
+        return min(self._catalog_ttl_seconds, REDISCOVERY_INTERVAL_SECONDS)
+
+    def _discover_many(self, states: list[ServiceState]) -> None:
+        """``_discovery_lock`` 안에서 부른다. 서비스별 결과는 끝나는 대로 따로 교체한다."""
+        for discovered in self._discovery_executor.map(lambda state: self._discover(state.config), states):
+            with self._lock:
+                self._services[discovered.config.service_id] = discovered
 
     def _discover(self, config: UpstreamConfig) -> ServiceState:
         state = ServiceState(config, discovered_at=monotonic())

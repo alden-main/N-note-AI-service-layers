@@ -8,7 +8,7 @@ from unittest import mock
 
 from n_note_ai_service_layers import prompts
 from n_note_ai_service_layers.adapters.openai_draft_generation import DraftGenerationAdapter, OpenAiDraftGenerationAdapter
-from n_note_ai_service_layers.api.routes import internal_stt
+from n_note_ai_service_layers.services import form_extraction
 from support import sample_form_schema
 
 
@@ -28,8 +28,8 @@ class PromptCatalogTests(unittest.TestCase):
 
     def test_render_fills_only_named_placeholders(self) -> None:
         self.assertEqual(prompts.render("at most {n} of {status, detail} {other}", n=3), "at most 3 of {status, detail} {other}")
-        rendered = internal_stt._instructions()
-        self.assertIn(f"at most {internal_stt._MAX_EVIDENCE} of", rendered)
+        rendered = form_extraction.instructions()
+        self.assertIn(f"at most {form_extraction.MAX_EVIDENCE} of", rendered)
         self.assertIn("{status, detail}", rendered)
         self.assertNotIn("{max_evidence}", rendered)
 

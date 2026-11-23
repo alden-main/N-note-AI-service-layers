@@ -50,12 +50,3 @@ def worker_parallelism() -> int:
 
     config = settings.get()
     return config.job_concurrency * config.form_concurrency
-
-
-def reset_for_tests() -> None:
-    """테스트가 설정을 바꿔 풀 크기를 다시 정하게 할 때만 쓴다."""
-    with _lock:
-        executors = list(_executors.values())
-        _executors.clear()
-    for executor in executors:
-        executor.shutdown(wait=False)

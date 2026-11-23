@@ -145,6 +145,49 @@ class CatalogRefreshTests(unittest.TestCase):
             client.discover()
         self.assertEqual(sum(1 for request, _ in gateway.requests if request["method"] == "tools/list"), 1)
 
+    def test_failed_discovery_is_not_retried_until_the_backoff_passes(self):
+        """Gateway가 멈췄을 때 catalog lock을 기다리던 호출이 차례로 timeout까지 기다리지 않는다."""
+        from unittest.mock import patch
+
+        class Down(_Gateway):
+            def __init__(self):
+                super().__init__(); self.down = True; self.attempts = 0
+            def __call__(self, url, body, headers, timeout):
+                if self.down:
+                    self.attempts += 1
+                    raise TimeoutError("timed out")
+                return super().__call__(url, body, headers, timeout)
+
+        gateway = Down()
+        client = McpGatewayClient(transport=gateway, catalog_ttl_seconds=300, failed_discovery_retry_seconds=5)
+        now = [0.0]
+        with patch("n_note_ai_service_layers.services.mcp_gateway_client.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaises(McpGatewayConnectionError):
+                client.discover()
+            now[0] = 3.0
+            with self.assertRaises(McpGatewayConnectionError):
+                client.discover()  # 5초 안: Gateway에 다시 묻지 않고 바로 실패한다
+            self.assertEqual(gateway.attempts, 1)
+            gateway.down = False
+            now[0] = 6.0
+            self.assertEqual(client.discover(), tuple(gateway.tools))  # 5초가 지나 다시 조회해 복구한다
+
+    def test_failed_discovery_is_retried_immediately_without_a_catalog_ttl(self):
+        class Flaky(_Gateway):
+            def __init__(self):
+                super().__init__(); self.failures = 1
+            def __call__(self, url, body, headers, timeout):
+                if self.failures:
+                    self.failures -= 1
+                    raise OSError("refused")
+                return super().__call__(url, body, headers, timeout)
+
+        gateway = Flaky()
+        client = McpGatewayClient(transport=gateway)
+        with self.assertRaises(McpGatewayConnectionError):
+            client.discover()
+        self.assertEqual(client.discover(), tuple(gateway.tools))
+
 
 if __name__ == "__main__":
     unittest.main()

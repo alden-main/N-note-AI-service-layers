@@ -51,3 +51,14 @@ torch = { index = "pytorch-cpu" }
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+# 루트 테스트만 모은다. mcp_servers/* 는 각자 자기 프로젝트 환경에서 실행한다.
+testpaths = ["tests"]
+# tests/test_benchmark.py가 루트의 benchmark 패키지를 가져온다.
+pythonpath = ["."]

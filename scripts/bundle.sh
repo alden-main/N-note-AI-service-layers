@@ -104,6 +104,8 @@ copy() {  # copy <저장소 기준 경로> [번들 안 경로]
   cp -R "$source" "$target"
 }
 copy docker-compose.yml
+# ai-service API 포트만 공개한다. 업그레이드(--from)면 install.sh가 이전 설치의 파일로 덮어써 서버별 설정을 유지한다.
+copy docker-compose.override.yml
 # 벤치마크할 때만 local-llm을 127.0.0.1에 공개하는 override(N_NOTE_COMPOSE_EXTRA_FILES로 지정할 때만 쓰임)
 copy docker-compose.benchmark.yml
 copy .env.example
