@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import ValidationError
+
 from n_note_ai_service_layers.settings import DEFAULT_REPORT_VALIDATION_TOOL
+from n_note_ai_service_layers.contracts.gateway_payloads import ReportEvaluation
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.report_validation import (
     ReportValidationCriterion,
@@ -17,7 +20,6 @@ from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClien
 STANDARD_SCHEMA_VERSION = "report-validation-standard/v1"
 RESULT_POLICY = "candidate_only_human_review_required"
 MUTATION_POLICY = "no_automatic_report_modification"
-_STATUSES = {"satisfied", "missing", "insufficient", "uncertain"}
 
 
 class FormReportValidationFlow:
@@ -146,7 +148,9 @@ class FormReportValidationFlow:
     @staticmethod
     def _parse(payload: Any, standard: dict[str, Any]) -> tuple[ReportValidationCriterion, ...] | None:
         """report 도구 응답을 기준 결과로 바꾼다. 형식이 다르면 ``None``이다."""
-        if not isinstance(payload, dict) or not isinstance(payload.get("criteria"), list):
+        try:
+            evaluation = ReportEvaluation.model_validate(payload)
+        except ValidationError:
             return None
         field_ids = {
             element["element_id"]: element.get("field_id")
@@ -154,24 +158,19 @@ class FormReportValidationFlow:
             for element in criterion.get("required_elements", [])
             if isinstance(element, dict) and "element_id" in element
         }
-        criteria: list[ReportValidationCriterion] = []
-        for item in payload["criteria"]:
-            finding = item.get("finding") if isinstance(item, dict) else None
-            if not isinstance(finding, dict) or finding.get("status") not in _STATUSES or not isinstance(item.get("elements"), list):
-                return None
-            elements: list[ReportValidationElement] = []
-            for element in item["elements"]:
-                if not isinstance(element, dict) or element.get("status") not in _STATUSES or not isinstance(element.get("id"), str):
-                    return None
-                elements.append(ReportValidationElement(element["id"], element["status"], field_ids.get(element["id"]), tuple(str(w) for w in element.get("warnings", []))))
-            criteria.append(ReportValidationCriterion(
-                str(item.get("criterion_id")),
-                str(item.get("description") or ""),
-                finding["status"],
-                tuple(elements),
-                tuple(str(w) for w in finding.get("warnings", [])),
-            ))
-        return tuple(criteria)
+        return tuple(
+            ReportValidationCriterion(
+                str(item.criterion_id),
+                str(item.description or ""),
+                item.finding.status,
+                tuple(
+                    ReportValidationElement(element.id, element.status, field_ids.get(element.id), tuple(str(w) for w in element.warnings))
+                    for element in item.elements
+                ),
+                tuple(str(w) for w in item.finding.warnings),
+            )
+            for item in evaluation.criteria
+        )
 
 
 def _filled(document: DraftDocument, field_id: str) -> bool:

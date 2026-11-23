@@ -1,58 +1,56 @@
+"""Responses API 초안 생성의 사전 도구(Gateway) 왕복을 검증한다(가짜 HTTP 서버, ``llm_support``)."""
+
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+import threading
 import unittest
 
-from n_note_ai_service_layers.adapters.llm_completion import model_tool_output
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
-from support import FakeGateway as _Gateway, sample_form_schema
+from n_note_ai_service_layers import prompts
+from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions, model_tool_output
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
+from llm_support import FakeServer, adapter, function_outputs, responses
+from support import FakeGateway as _Gateway, sample_form_schema
+
+FINAL = '{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":[{"field_id":"assessment.pain_score","refs":["tool:1"]}],"needs_confirmation":true}'
+EMPTY = '{"proposed_fields":{},"evidence_refs":[],"needs_confirmation":false}'
+LOOKUP = ("call-1", "dictionary__lookup", {"term": "통증"})
 
 
-class _Responses:
-    def __init__(self): self.requests = []; self.number = 0
-    def create(self, **kwargs):
-        self.requests.append(kwargs); self.number += 1
-        if self.number == 1:
-            return SimpleNamespace(id="response-1", output=[SimpleNamespace(type="function_call", name="dictionary__lookup", arguments='{"term":"통증"}', call_id="call-1")], output_text=None)
-        return SimpleNamespace(id="response-2", output=[], output_text='{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":{"assessment.pain_score":["tool:1"]},"needs_confirmation":true}')
+def generate(server: FakeServer, **options):
+    return adapter(server, api="responses", **options).generate({"facts": []}, sample_form_schema())
 
 
-class OpenAiMcpToolLoopTests(unittest.TestCase):
+class McpToolLoopTests(unittest.TestCase):
     def test_gateway_catalog_drives_tool_loop_and_final_draft_stays_filtered(self):
         gateway = _Gateway()
-        responses = _Responses()
-        client = SimpleNamespace(responses=responses)
-        adapter = OpenAiDraftGenerationAdapter(client, gateway_client=McpGatewayClient(transport=gateway))
-        result = adapter.generate({"facts": []}, sample_form_schema())
+        server = FakeServer(responses(None, LOOKUP), responses(FINAL))
+        result = generate(server, gateway=gateway)
         self.assertEqual(gateway.called, [{"name": "dictionary__lookup", "arguments": {"term": "통증"}}])
         self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
         self.assertTrue(result.needs_confirmation)
-        self.assertEqual(responses.requests[0]["tools"][0]["name"], "dictionary__lookup")
-        self.assertFalse(responses.requests[0]["tools"][0]["strict"])
-        # store=False라 서버에 앞 응답이 없다: 원래 입력 → 모델의 function_call → 그 결과를 매번 이어 보낸다.
-        self.assertTrue(all(request["store"] is False for request in responses.requests))
-        self.assertNotIn("previous_response_id", responses.requests[1])
-        self.assertEqual([item.get("type", item.get("role")) for item in responses.requests[1]["input"]], ["user", "function_call", "function_call_output"])
-        self.assertEqual(responses.requests[1]["input"][1]["call_id"], responses.requests[1]["input"][2]["call_id"])
-        self.assertIn("dictionary tools", responses.requests[0]["instructions"])
+        first, second = server.requests
+        self.assertEqual(first["tools"][0]["name"], "dictionary__lookup")
+        self.assertFalse(first["tools"][0]["strict"])
+        # store=False라 서버에 앞 응답이 없다: 원래 입력 → 모델의 function_call → 그 결과를 이어 보낸다.
+        self.assertTrue(all(request["store"] is False for request in server.requests))
+        self.assertNotIn("previous_response_id", second)
+        types = [item.get("type", item.get("role")) for item in second["input"]]
+        self.assertEqual(types[-2:], ["function_call", "function_call_output"])
+        self.assertEqual(second["input"][-1]["call_id"], "call-1")
+        self.assertIn(prompts.get().draft.tool, first["instructions"])
 
     def test_instructions_do_not_mention_tools_when_none_are_offered(self):
-        responses = _Responses()
-        responses.number = 1
-        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), max_tool_rounds=0).generate({"facts": []}, sample_form_schema())
-        self.assertNotIn("dictionary tools", responses.requests[0]["instructions"])
+        server = FakeServer(responses(FINAL))
+        generate(server, gateway=_Gateway(), max_tool_rounds=0)
+        self.assertNotIn(prompts.get().draft.tool, server.requests[0]["instructions"])
+        self.assertNotIn("tools", server.requests[0])
 
     def test_generation_options_reach_the_responses_request(self):
-        from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions
-
-        responses = _Responses()
-        responses.number = 1
-        options = GenerationOptions(max_tokens=512, temperature=0.0, extra_body={"seed": 1})
-        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), options=options).generate({"facts": []}, sample_form_schema())
-        request = responses.requests[0]
-        self.assertEqual((request["max_output_tokens"], request["temperature"], request["extra_body"]), (512, 0.0, {"seed": 1}))
+        server = FakeServer(responses(FINAL))
+        generate(server, options=GenerationOptions(max_tokens=512, temperature=0.0, extra_body={"seed": 1}))
+        request = server.requests[0]
+        self.assertEqual((request["max_output_tokens"], request["temperature"], request["seed"]), (512, 0.0, 1))
 
     def test_tool_not_found_refreshes_catalog_and_survives_gateway_outage(self):
         """도구가 사라졌는데 재조회까지 실패해도 초안 생성은 계속된다(그 호출만 오류로 답한다)."""
@@ -71,113 +69,89 @@ class OpenAiMcpToolLoopTests(unittest.TestCase):
                     return 200, {"X-Request-ID": headers["X-Request-ID"]}, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
                 return super().__call__(url, body, headers, timeout)
 
-        gateway = Gateway()
-        responses = _Responses()
-        client = McpGatewayClient(transport=gateway, catalog_ttl_seconds=300)
-        result = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=client).generate({"facts": []}, sample_form_schema())
+        server = FakeServer(responses(None, LOOKUP), responses(FINAL))
+        result = generate(server, gateway=McpGatewayClient(transport=Gateway(), catalog_ttl_seconds=300))
         self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
-        outputs = [item["output"] for item in responses.requests[1]["input"] if item.get("type") == "function_call_output"]
-        self.assertEqual(json.loads(outputs[0]), {"error": "not_found", "retryable": False})
+        self.assertEqual(json.loads(function_outputs(server.requests[1])[0]["output"]), {"error": "not_found", "retryable": False})
 
     def test_only_allowlisted_gateway_tools_are_exposed_or_callable(self):
         gateway = _Gateway()
-        responses = _Responses()
-        responses.number = 1  # 도구가 없으므로 첫 응답부터 최종 초안을 반환한다.
-        adapter = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), allowed_tool_names=("other__search",))
-        adapter.generate({"facts": []}, sample_form_schema())
-        self.assertNotIn("tools", responses.requests[0])
+        server = FakeServer(responses(FINAL))
+        generate(server, gateway=gateway, allowed_tool_names=("other__search",))
+        self.assertNotIn("tools", server.requests[0])
         self.assertEqual(gateway.called, [])
 
     def test_draft_is_generated_without_tools_when_gateway_is_unreachable(self):
         def unreachable(url, body, headers, timeout):
             raise OSError("down")
-        responses = _Responses()
-        responses.number = 1  # 첫 응답부터 최종 초안을 반환한다.
-        adapter = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=unreachable))
-        result = adapter.generate({"facts": []}, sample_form_schema())
+        server = FakeServer(responses(FINAL))
+        result = generate(server, gateway=McpGatewayClient(transport=unreachable))
         self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
-        self.assertNotIn("tools", responses.requests[0])
+        self.assertNotIn("tools", server.requests[0])
 
     def test_tool_calls_in_one_response_run_concurrently_and_keep_order(self):
-        import threading
         barrier = threading.Barrier(2, timeout=2)
 
         class SlowGateway(_Gateway):
             def __call__(self, url, body, headers, timeout):
                 if b"tools/call" in body:
-                    barrier.wait()
+                    barrier.wait()  # 두 호출이 동시에 와야 통과한다
                 return super().__call__(url, body, headers, timeout)
 
-        class Responses(_Responses):
-            def create(self, **kwargs):
-                self.requests.append(kwargs); self.number += 1
-                if self.number == 1:
-                    calls = [SimpleNamespace(type="function_call", name="dictionary__lookup", arguments=f'{{"term":"{term}"}}', call_id=f"call-{term}") for term in ("a", "b")]
-                    return SimpleNamespace(id="response-1", output=calls, output_text=None)
-                return SimpleNamespace(id="response-2", output=[], output_text='{"proposed_fields":{},"evidence_refs":[],"needs_confirmation":false}')
-
-        responses = Responses()
-        adapter = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=SlowGateway()))
-        adapter.generate({"facts": []}, sample_form_schema())
-        self.assertEqual([item["call_id"] for item in responses.requests[1]["input"] if item.get("type") == "function_call_output"], ["call-a", "call-b"])
+        calls = [(f"call-{term}", "dictionary__lookup", {"term": term}) for term in ("a", "b")]
+        server = FakeServer(responses(None, *calls), responses(EMPTY))
+        generate(server, gateway=SlowGateway())
+        self.assertEqual([item["call_id"] for item in function_outputs(server.requests[1])], ["call-a", "call-b"])
 
     def test_calls_beyond_the_limit_get_tool_limit_reached(self):
-        class Responses(_Responses):
-            def create(self, **kwargs):
-                self.requests.append(kwargs); self.number += 1
-                if self.number == 1:
-                    calls = [SimpleNamespace(type="function_call", name="dictionary__lookup", arguments='{"term":"x"}', call_id=f"call-{index}") for index in range(3)]
-                    return SimpleNamespace(id="response-1", output=calls, output_text=None)
-                return SimpleNamespace(id="response-2", output=[], output_text='{"proposed_fields":{},"evidence_refs":[],"needs_confirmation":false}')
-
         gateway = _Gateway()
-        responses = Responses()
-        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), max_tool_calls=2).generate({"facts": []}, sample_form_schema())
-        outputs = [item["output"] for item in responses.requests[1]["input"] if item.get("type") == "function_call_output"]
+        calls = [(f"call-{index}", "dictionary__lookup", {"term": "x"}) for index in range(3)]
+        server = FakeServer(responses(None, *calls), responses(EMPTY))
+        generate(server, gateway=gateway, max_tool_calls=2)
+        outputs = sorted(function_outputs(server.requests[1]), key=lambda item: item["call_id"])
         self.assertEqual(len(gateway.called), 2)
-        self.assertEqual(outputs[2], '{"error": "tool_limit_reached"}')
+        self.assertEqual(sum(json.loads(item["output"]) == {"error": "tool_limit_reached"} for item in outputs), 1)
 
     def test_tool_rounds_are_capped_and_the_last_request_forbids_tools(self):
         """도구를 계속 요청하는 모델도 LLM 호출은 ``1 + max_tool_rounds``번에서 끝난다."""
-        final = '{"proposed_fields":{},"evidence_refs":[],"needs_confirmation":false}'
+        count = [0]
 
-        class Responses(_Responses):
-            def create(self, **kwargs):
-                self.requests.append(kwargs); self.number += 1
-                if self.number > 10:
-                    raise AssertionError("tool loop did not stop")
-                call = SimpleNamespace(type="function_call", name="dictionary__lookup", arguments='{"term":"x"}', call_id=f"call-{self.number}")
-                # tool_choice="none"이면 실제 API처럼 도구 없이 초안을 낸다.
-                if kwargs.get("tool_choice") == "none":
-                    return SimpleNamespace(id=f"r-{self.number}", output=[], output_text=final)
-                return SimpleNamespace(id=f"r-{self.number}", output=[call], output_text=None)
+        def reply(request):
+            count[0] += 1
+            if count[0] > 10:
+                raise AssertionError("tool loop did not stop")
+            # tool_choice="none"이면 실제 API처럼 도구 없이 초안을 낸다.
+            if request.get("tool_choice") == "none":
+                return responses(EMPTY)
+            return responses(None, (f"call-{count[0]}", "dictionary__lookup", {"term": "x"}))
 
         gateway = _Gateway()
-        responses = Responses()
-        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), max_tool_rounds=2).generate({"facts": []}, sample_form_schema())
-        self.assertEqual(len(responses.requests), 3)
+        server = FakeServer(reply)
+        generate(server, gateway=gateway, max_tool_rounds=2)
+        self.assertEqual(len(server.requests), 3)
         self.assertEqual(len(gateway.called), 2)
-        self.assertEqual([request.get("tool_choice") for request in responses.requests], [None, None, "none"])
+        self.assertEqual([request.get("tool_choice") for request in server.requests][-1], "none")
 
     def test_loop_stops_even_if_the_model_ignores_tool_choice_none(self):
-        class Responses(_Responses):
-            def create(self, **kwargs):
-                self.requests.append(kwargs); self.number += 1
-                if self.number > 10:
-                    raise AssertionError("tool loop did not stop")
-                call = SimpleNamespace(type="function_call", name="dictionary__lookup", arguments='{"term":"x"}', call_id=f"call-{self.number}")
-                return SimpleNamespace(id=f"r-{self.number}", output=[call], output_text='{"proposed_fields":{},"evidence_refs":[],"needs_confirmation":false}')
+        """tool_choice="none"을 무시하고 도구를 계속 요청해도 1 + max_tool_rounds번에서 멈추고 마지막 응답의 초안을 쓴다."""
+        count = [0]
 
-        responses = Responses()
-        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=_Gateway()), max_tool_rounds=1).generate({"facts": []}, sample_form_schema())
-        self.assertEqual(len(responses.requests), 2)
+        def reply(request):
+            count[0] += 1
+            if count[0] > 10:
+                raise AssertionError("tool loop did not stop")
+            return responses(EMPTY, (f"call-{count[0]}", "dictionary__lookup", {"term": "x"}))
+
+        server = FakeServer(reply)
+        result = generate(server, gateway=_Gateway(), max_tool_rounds=1)
+        self.assertEqual(len(server.requests), 2)
+        self.assertEqual(result.proposed_fields, {})
 
     def test_zero_tool_rounds_offers_no_tools(self):
         gateway = _Gateway()
-        responses = _Responses()
-        responses.number = 1
-        OpenAiDraftGenerationAdapter(SimpleNamespace(responses=responses), gateway_client=McpGatewayClient(transport=gateway), max_tool_rounds=0).generate({"facts": []}, sample_form_schema())
-        self.assertNotIn("tools", responses.requests[0])
+        server = FakeServer(responses(FINAL))
+        generate(server, gateway=gateway, max_tool_rounds=0)
+        self.assertNotIn("tools", server.requests[0])
         self.assertEqual(gateway.called, [])
 
 

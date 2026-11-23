@@ -4,46 +4,21 @@ import json
 import logging
 import unittest
 import unittest.mock
-from types import SimpleNamespace
 
 from tracing_support import all_attribute_text, by_name, recorded_spans
 
 from n_note_ai_service_layers import observability, prompts
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiChatDraftGenerationAdapter
-from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
+from llm_support import FakeServer, adapter, chat
 from support import FakeGateway, sample_form_schema
 
 PRIVATE = "환자가 오늘 흉통을 호소함"
 FINAL = '{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":[{"field_id":"assessment.pain_score","refs":["transcript"]}],"needs_confirmation":false}'
 
 
-def _completion(content=None, tool_calls=None, usage=None):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))], usage=usage)
-
-
-class _Completions:
-    def __init__(self, *responses):
-        self.responses = list(responses)
-
-    def create(self, **kwargs):
-        return self.responses.pop(0)
-
-
-def _tool_call():
-    return SimpleNamespace(id="call-1", function=SimpleNamespace(name="dictionary__lookup", arguments='{"term":"흉통"}'))
-
-
 def _generate_with_one_tool_round():
-    completions = _Completions(
-        _completion(None, [_tool_call()], SimpleNamespace(prompt_tokens=100, completion_tokens=10)),
-        _completion("not json", None, SimpleNamespace(prompt_tokens=120, completion_tokens=5)),
-        _completion(FINAL, None, SimpleNamespace(prompt_tokens=130, completion_tokens=40)),
-    )
-    adapter = OpenAiChatDraftGenerationAdapter(
-        SimpleNamespace(chat=SimpleNamespace(completions=completions)), "local-llm",
-        gateway_client=McpGatewayClient(transport=FakeGateway()), max_tool_rounds=2,
-    )
-    return adapter.generate({"transcript": PRIVATE}, sample_form_schema())
+    """도구 단계 2번(도구 호출 → 자유 형식 답) 뒤 구조화 출력 1번으로 초안을 만든다."""
+    server = FakeServer(chat(None, ("call-1", "dictionary__lookup", {"term": "흉통"})), chat("not json"), chat(FINAL))
+    return adapter(server, model="local-llm", gateway=FakeGateway(), max_tool_rounds=2).generate({"transcript": PRIVATE}, sample_form_schema())
 
 
 class StageSpanTests(unittest.TestCase):
@@ -104,18 +79,17 @@ class LlmSpanTests(unittest.TestCase):
             draft = _generate_with_one_tool_round()
         self.assertEqual(draft.proposed_fields, {"assessment.pain_score": 2})
         completion = by_name(spans, "n_note.llm.completion")[0]
-        requests = sorted(by_name(spans, "n_note.llm.request"), key=lambda item: item.start_time)
+        model_requests = [item for item in spans if item.name.startswith("chat ")]
         tool = by_name(spans, "n_note.llm.tool")[0]
-        self.assertEqual(completion.attributes["n_note.llm.engine"], "native")
         self.assertEqual(completion.attributes["n_note.prompt.draft_version"], prompts.get().draft.version)
         self.assertEqual(completion.attributes["n_note.llm.tool_rounds"], 2)
         self.assertEqual(completion.attributes["n_note.llm.tool_calls"], 1)
-        self.assertEqual([item.attributes["n_note.phase"] for item in requests], ["tools", "tools", "structured_output"])
-        self.assertEqual(requests[0].attributes["gen_ai.usage.input_tokens"], 100)
-        self.assertEqual(requests[0].attributes["n_note.llm.tool_calls_requested"], 1)
+        # 도구 단계 2번 + 구조화 출력 1번이다. 모델 요청 span은 Pydantic AI가 만든다(토큰 수 포함).
+        self.assertEqual(len(model_requests), 3)
+        self.assertTrue(all("gen_ai.usage.input_tokens" in item.attributes for item in model_requests))
         self.assertEqual(tool.attributes["gen_ai.tool.name"], "dictionary__lookup")
-        for item in (*requests, tool):
-            self.assertEqual(item.parent.span_id, completion.context.span_id)
+        for item in (*model_requests, tool):
+            self.assertEqual(item.context.trace_id, completion.context.trace_id)
         text = all_attribute_text(spans)
         self.assertNotIn(PRIVATE, text)
         self.assertNotIn("흉통", text)

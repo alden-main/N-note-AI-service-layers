@@ -82,3 +82,21 @@ class FakeGateway:
         else:
             result = self.tool(message["params"]["name"], message["params"]["arguments"])
         return 200, echo, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}, ensure_ascii=False).encode()
+
+
+class StaticCompletion:
+    """``StructuredCompletion`` 대역이다. 받은 인자를 남기고 정해 둔 응답 텍스트를 돌려준다(HTTP 없음)."""
+
+    def __init__(self, *texts: Any) -> None:
+        self.texts = list(texts)
+        self.calls: list[dict[str, Any]] = []
+
+    @property
+    def output(self) -> Any:
+        return self.calls[-1]["output"]
+
+    def complete(self, instructions, user_content, output, tools=None, tool_instruction="", accept_unconstrained=None):
+        self.calls.append({"instructions": instructions, "user_content": user_content, "output": output, "tools": tools,
+                           "tool_instruction": tool_instruction, "accept_unconstrained": accept_unconstrained})
+        text = self.texts.pop(0) if len(self.texts) > 1 else (self.texts[0] if self.texts else "")
+        return text(self.calls[-1]) if callable(text) else text

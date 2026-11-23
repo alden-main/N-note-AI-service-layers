@@ -3,12 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
+from n_note_ai_service_layers.adapters.draft_generation import DraftGenerationAdapter
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
-from support import sample_form_schema
+from support import StaticCompletion, sample_form_schema
 from n_note_ai_service_layers.services.context_assembler import ClinicalContextAssembler
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayConnectionError
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
@@ -27,11 +27,7 @@ class _FakeTranscriptions:
         return SimpleNamespace(text="간호 기록", languages=[])
 
 
-class _FakeResponses:
-    def __init__(self): self.request = None
-    def create(self, **kwargs):
-        self.request = kwargs
-        return SimpleNamespace(output_text='{"proposed_fields":{"assessment.pain_score":2,"summary.derived_level":"HIGH_RISK"},"evidence_refs":{"assessment.pain_score":["transcript:1"]},"needs_confirmation":false}')
+DRAFT_TEXT = '{"proposed_fields":{"assessment.pain_score":2,"summary.derived_level":"HIGH_RISK"},"evidence_refs":{"assessment.pain_score":["transcript:1"]},"needs_confirmation":false}'
 
 
 class OpenAiAdapterTests(unittest.TestCase):
@@ -46,26 +42,23 @@ class OpenAiAdapterTests(unittest.TestCase):
         self.assertEqual(transcriptions.request["file"].name, "note.wav")
 
     def test_draft_adapter_uses_structured_output_and_drops_deterministic_fields(self):
-        responses = _FakeResponses()
-        client = SimpleNamespace(responses=responses)
+        completion = StaticCompletion(DRAFT_TEXT)
         schema = sample_form_schema(SchemaStatus.ACTIVE)
-        result = OpenAiDraftGenerationAdapter(client).generate({"facts": []}, schema)
+        result = DraftGenerationAdapter(completion, "m").generate({"facts": []}, schema)
         self.assertEqual(result.proposed_fields, {"assessment.pain_score": 2})
         self.assertEqual(result.evidence_refs["assessment.pain_score"], ("transcript:1",))
-        self.assertEqual(responses.request["text"]["format"]["type"], "json_schema")
+        self.assertEqual(completion.output.name, "nursing_draft")
         self.assertNotIn("summary.derived_level", result.proposed_fields)
 
     def test_evidence_is_requested_only_for_filled_fields(self):
-        evidence = OpenAiDraftGenerationAdapter._output_format(sample_form_schema(SchemaStatus.ACTIVE))["schema"]["properties"]["evidence_refs"]
+        evidence = DraftGenerationAdapter._output_format(sample_form_schema(SchemaStatus.ACTIVE))["schema"]["properties"]["evidence_refs"]
         self.assertEqual(evidence["type"], "array")
         self.assertEqual(evidence["items"]["required"], ["field_id", "refs"])
         self.assertNotIn("summary.derived_level", evidence["items"]["properties"]["field_id"]["enum"])
 
     def test_array_evidence_is_merged_by_field_and_filtered(self):
-        class Responses:
-            def create(self, **kwargs):
-                return SimpleNamespace(output_text='{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":[{"field_id":"assessment.pain_score","refs":["transcript"]},{"field_id":"assessment.pain_score","refs":["fact:f1"]},{"field_id":"summary.derived_level","refs":["x"]}],"needs_confirmation":false}')
-        result = OpenAiDraftGenerationAdapter(SimpleNamespace(responses=Responses())).generate({}, sample_form_schema(SchemaStatus.ACTIVE))
+        text = '{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":[{"field_id":"assessment.pain_score","refs":["transcript"]},{"field_id":"assessment.pain_score","refs":["fact:f1"]},{"field_id":"summary.derived_level","refs":["x"]}],"needs_confirmation":false}'
+        result = DraftGenerationAdapter(StaticCompletion(text), "m").generate({}, sample_form_schema(SchemaStatus.ACTIVE))
         self.assertEqual(result.evidence_refs, {"assessment.pain_score": ("transcript", "fact:f1")})
 
     def test_provider_neutral_flow_connects_stt_to_draft_generation(self):

@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from jsonschema import Draft202012Validator
+from pydantic import BaseModel, ConfigDict, StrictStr, StringConstraints, TypeAdapter, ValidationError, model_validator
 
 from n_note_ai_service_layers import prompts
 from n_note_ai_service_layers.adapters import model_providers
@@ -29,7 +30,6 @@ MAX_EVIDENCE = 3
 MAX_SENTENCE_CHARS = 200
 _SENTENCE_BREAK = re.compile(r"(?<=[.?!。])\s+|\n+")
 _CLAUSE_BREAK = re.compile(r"(?<=,)\s+")
-_FIELD_TYPES = frozenset({"text", "radio", "checkbox"})
 _logger = get_logger("api.internal_stt")
 
 
@@ -38,40 +38,65 @@ def instructions() -> str:
     return prompts.render(prompts.get().form_extraction.instructions, max_evidence=MAX_EVIDENCE)
 
 
+class _TemplateField(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    field_id: Annotated[StrictStr, StringConstraints(min_length=1)]
+    field_type: Literal["text", "radio", "checkbox"]
+    options: list[StrictStr] | None = None
+    # 구술에 값이 없을 때 채울 기본값(선택)이다. 녹음 시각은 text 필드에만 쓴다.
+    default_from: Literal["recording_time"] | None = None
+
+    @model_validator(mode="after")
+    def _check_kind(self) -> _TemplateField:
+        if self.default_from is not None and self.field_type != "text":
+            raise ValueError("default_from is only allowed on text fields")
+        if self.field_type != "text" and self.options is None:
+            raise ValueError("radio and checkbox fields need options")
+        return self
+
+
+class _TemplateSection(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    fields: list[_TemplateField]
+
+
+class _SchemaDefinition(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    sections: list[_TemplateSection]
+
+    @model_validator(mode="after")
+    def _unique_field_ids(self) -> _SchemaDefinition:
+        ids = [field.field_id for section in self.sections for field in section.fields]
+        if len(ids) != len(set(ids)):
+            raise ValueError("field_id must be unique within a template")
+        return self
+
+
+class _Template(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    templateType: Annotated[StrictStr, StringConstraints(min_length=1)]
+    templateName: Annotated[StrictStr, StringConstraints(min_length=1)]
+    schemaDefinition: _SchemaDefinition
+
+
+_TEMPLATES = TypeAdapter(list[_Template])
+
+
 def parse_templates(raw: str) -> list[dict]:
-    """서식 목록 JSON을 읽고 구조를 검사한다. 형식이 틀리면 ``ValueError``다."""
+    """서식 목록 JSON을 읽고 구조를 검사한다. 형식이 틀리면 ``ValueError``다.
+
+    검사만 모델로 하고, LLM에 그대로 넘길 원본 사전(라벨 등 추가 키 포함)을 돌려준다.
+    """
     try:
         templates = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError("templates is not JSON") from exc
-    if not isinstance(templates, list):
-        raise ValueError("templates must be a list")
-    for template in templates:
-        _check_template(template)
+        _TEMPLATES.validate_python(templates)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise ValueError("invalid templates JSON or schema") from exc
     return templates
-
-
-def _check_template(template: Any) -> None:
-    if not isinstance(template, dict) or not all(isinstance(template.get(key), str) and template[key] for key in ("templateType", "templateName")):
-        raise ValueError("template needs templateType and templateName")
-    schema = template.get("schemaDefinition")
-    if not isinstance(schema, dict) or not isinstance(schema.get("sections"), list):
-        raise ValueError("template needs schemaDefinition.sections")
-    ids: set[str] = set()
-    for section in schema["sections"]:
-        if not isinstance(section, dict) or not isinstance(section.get("fields"), list):
-            raise ValueError("section needs fields")
-        for field in section["fields"]:
-            if not isinstance(field, dict) or not isinstance(field.get("field_id"), str) or not field["field_id"] or field["field_id"] in ids:
-                raise ValueError("field_id must be a unique non-empty string")
-            ids.add(field["field_id"])
-            if field.get("field_type") not in _FIELD_TYPES:
-                raise ValueError("unsupported field_type")
-            # 구술에 값이 없을 때 채울 기본값(선택)이다. 녹음 시각은 text 필드에만 쓴다.
-            if "default_from" in field and (field["default_from"] != "recording_time" or field["field_type"] != "text"):
-                raise ValueError("default_from is only recording_time on text fields")
-            if field["field_type"] != "text" and (not isinstance(field.get("options"), list) or not all(isinstance(x, str) for x in field["options"])):
-                raise ValueError("radio and checkbox fields need string options")
 
 
 def template_fields(template: dict) -> list[dict]:

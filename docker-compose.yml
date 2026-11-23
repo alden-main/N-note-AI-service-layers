@@ -58,8 +58,6 @@ services:
       N_NOTE_LLM_EXTRA_BODY: ${N_NOTE_LLM_EXTRA_BODY:-}
       N_NOTE_LLM_MAX_TOKENS: ${N_NOTE_LLM_MAX_TOKENS:-}
       N_NOTE_LLM_TEMPERATURE: ${N_NOTE_LLM_TEMPERATURE:-}
-      # LLM 호출 계층: native(OpenAI SDK 직접) 또는 pydantic_ai(Pydantic AI Agent). eval로 비교한 뒤 바꾼다.
-      N_NOTE_LLM_ENGINE: ${N_NOTE_LLM_ENGINE:-native}
       # OpenTelemetry 추적(OTLP/HTTP). 개발·평가용 화면은 docker-compose.observability.yml(Phoenix)을 함께 띄운다.
       # 본문 기록(CAPTURE_CONTENT)은 합성 데이터 환경에서만 켠다.
       N_NOTE_OTEL_ENABLED: ${N_NOTE_OTEL_ENABLED:-false}

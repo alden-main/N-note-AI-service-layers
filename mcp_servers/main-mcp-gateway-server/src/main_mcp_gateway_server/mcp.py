@@ -27,6 +27,10 @@ REDISCOVERY_INTERVAL_SECONDS = 5.0
 DEFAULT_CATALOG_TTL_SECONDS = 30.0
 
 
+class McpSessionExpired(OSError):
+    """세션 ID를 보낸 요청에 upstream이 404로 답했다(upstream 재시작 등). 다시 초기화해야 한다."""
+
+
 class Transport(Protocol):
     """HTTP 구현을 교체할 수 있도록 MCP 및 health 요청을 추상화한다."""
 
@@ -75,6 +79,9 @@ class HttpTransport:
             # initialize 뒤의 모든 요청에는 합의한 프로토콜 버전을 붙인다(MCP 2025-06-18).
             headers["MCP-Protocol-Version"] = PROTOCOL_VERSION
         response = self._send("POST", url, json.dumps(payload).encode("utf-8"), headers)
+        if response.status_code == 404 and session_id:
+            # MCP Streamable HTTP: 서버가 세션을 잊으면 404로 답한다. 호출자가 다시 초기화하고 재시도한다.
+            raise McpSessionExpired("upstream MCP session expired")
         if response.status_code >= 400:
             raise OSError(f"upstream MCP가 HTTP {response.status_code}를 반환했습니다")
         try:
@@ -257,12 +264,14 @@ class GatewayCatalog:
             state.status = "unhealthy"
             return self._finish_call(state, upstream_name, request_id, started_at, _tool_error("upstream_unavailable", "upstream 서비스가 준비되지 않았습니다", True))
         try:
-            response = self._transport.request_json(
-                state.config.mcp_url,
-                _request("tools/call", {"name": upstream_name, "arguments": arguments}),
-                request_id,
-                state.session_id,
-            )
+            try:
+                response = self._send_call(state, upstream_name, arguments, request_id)
+            except McpSessionExpired:
+                # upstream이 재시작해 세션이 사라졌다. 그 서비스만 다시 discovery하고 한 번 재시도한다.
+                state = self._rediscover(state)
+                if state.status != "active" or upstream_name not in state.tools:
+                    raise
+                response = self._send_call(state, upstream_name, arguments, request_id)
         except OSError:
             state.status = "unhealthy"
             state.healthy_until = 0.0
@@ -285,6 +294,22 @@ class GatewayCatalog:
         if len(calls) <= 1:
             return [run(item) for item in calls]
         return list(self._batch_executor.map(run, calls))
+
+    def _send_call(self, state: ServiceState, upstream_name: str, arguments: dict[str, Any], request_id: str | None) -> McpResponse:
+        return self._transport.request_json(
+            state.config.mcp_url, _request("tools/call", {"name": upstream_name, "arguments": arguments}), request_id, state.session_id,
+        )
+
+    def _rediscover(self, state: ServiceState) -> ServiceState:
+        """서비스 하나를 바로 다시 discovery한다(세션 만료). 다른 스레드가 먼저 새 세션을 받았으면 그것을 쓴다."""
+        with self._discovery_lock:
+            current = self._snapshot()[state.config.service_id]
+            if current.session_id != state.session_id and current.status == "active":
+                return current
+            discovered = self._discover(current.config)
+            with self._lock:
+                self._services[current.config.service_id] = discovered
+            return discovered
 
     def _rediscover_if_stale(self, state: ServiceState) -> ServiceState:
         """연결되지 않은 서비스 하나를 ``REDISCOVERY_INTERVAL_SECONDS``에 한 번까지만 다시 discovery한다."""

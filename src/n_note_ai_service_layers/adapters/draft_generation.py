@@ -1,9 +1,7 @@
 """구조화 출력으로 간호기록 초안을 생성하는 어댑터다.
 
-LLM 호출(API 형식·도구 왕복)은 ``llm_completion``이 맡고, 여기에는 초안에만 해당하는 출력 스키마·결과 검증만 있다.
+LLM 호출(API 형식·도구 왕복)은 ``pydantic_ai_completion``이 맡고, 여기에는 초안에만 해당하는 출력 스키마·결과 검증만 있다.
 지침 문장은 ``prompts/prompts.toml``의 ``[draft]``에 있다.
-``OpenAiDraftGenerationAdapter``(Responses API)와 ``OpenAiChatDraftGenerationAdapter``(Chat Completions)는 어떤 API로
-보낼지만 다르다.
 """
 
 from __future__ import annotations
@@ -14,18 +12,9 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from n_note_ai_service_layers import prompts
-from n_note_ai_service_layers.adapters.llm_completion import (
-    ChatCompletion,
-    GenerationOptions,
-    ResponsesCompletion,
-    StructuredCompletion,
-    StructuredOutput,
-    ToolExecutor,
-    json_text,
-)
+from n_note_ai_service_layers.adapters.llm_completion import StructuredCompletion, StructuredOutput, ToolExecutor, json_text
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema
-from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
 
 class DraftGenerationAdapter:
@@ -175,45 +164,6 @@ class DraftGenerationAdapter:
         if field_type in ("integer", "number", "boolean"):
             return {"type": field_type}
         return {"type": "string"}
-
-
-
-class OpenAiDraftGenerationAdapter(DraftGenerationAdapter):
-    """OpenAI Responses API로 초안을 만든다(``store=False``)."""
-
-    completion_class: type = ResponsesCompletion
-
-    def __init__(
-        self,
-        client: Any | None = None,
-        model: str = "gpt-4o-mini",
-        prompt_version: str | None = None,
-        gateway_client: McpGatewayClient | None = None,
-        max_tool_calls: int = 6,
-        tool_timeout_seconds: float = 30.0,
-        max_tool_rounds: int = 2,
-        max_gateway_retries: int = 1,
-        allowed_tool_names: tuple[str, ...] | None = None,
-        options: GenerationOptions | None = None,
-    ) -> None:
-        if client is None:
-            from openai import OpenAI
-            client = OpenAI()
-        tools = ToolExecutor(gateway_client, allowed_tool_names, max_tool_calls, max_tool_rounds, tool_timeout_seconds, max_gateway_retries)
-        super().__init__(self.completion_class(client, model, options), model, tools, prompt_version)
-
-
-class OpenAiChatDraftGenerationAdapter(OpenAiDraftGenerationAdapter):
-    """OpenAI 호환 Chat Completions 서버(vLLM 등 로컬 모델)로 초안을 만든다. 생성자 인자는 Responses와 같다."""
-
-    completion_class = ChatCompletion
-
-    def __init__(
-        self, client: Any | None = None, model: str = "local-llm", *, extra_body: dict[str, Any] | None = None,
-        max_tokens: int | None = None, temperature: float | None = None, **kwargs: Any,
-    ) -> None:
-        kwargs.setdefault("options", GenerationOptions(max_tokens, temperature, dict(extra_body or {})))
-        super().__init__(client, model, **kwargs)
 
 
 def _evidence_by_field(evidence: Any) -> dict[str, tuple[str, ...]]:

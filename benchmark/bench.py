@@ -127,7 +127,7 @@ def run(args):
                'llm_extra_body_hash':hashlib.sha256(json.dumps(config.llm_extra_body,sort_keys=True).encode()).hexdigest(),
                'service_code_hash':tree_digest((ROOT/'src/n_note_ai_service_layers').rglob('*.py')),
                'benchmark_code_hash':tree_digest((ROOT/'benchmark').glob('*.py')),
-               'prompt_source_hash':digest(ROOT/'src/n_note_ai_service_layers/adapters/openai_draft_generation.py'),
+               'prompt_source_hash':digest(ROOT/'src/n_note_ai_service_layers/prompts/prompts.toml'),
                'reference_review_status':manifest['review_status']})
     write_jsonl(out/'results.jsonl',records); write_json(out/'summary.json',stats(records))
     print(out)

@@ -102,9 +102,6 @@ class Settings(BaseSettings):
     llm_api_key: str | None = None
     # 초안 생성 API 형식이다. 미설정이면 ``base_url``이 있을 때 ``chat``, 없으면 ``responses``다.
     llm_api_override: Literal["responses", "chat"] | None = Field(None, validation_alias="N_NOTE_LLM_API")
-    # LLM 호출 계층이다. ``native``는 OpenAI SDK 직접 호출, ``pydantic_ai``는 Pydantic AI Agent다.
-    # 두 계층은 같은 요청 형식(지침·스키마·도구 상한)을 쓰므로 eval로 비교한 뒤 바꾼다.
-    llm_engine: Literal["native", "pydantic_ai"] = "native"
     # tool call을 지원하지 않는 모델은 끈다.
     llm_tool_calling_enabled: bool = Field(True, validation_alias="N_NOTE_LLM_TOOL_CALLING")
     # 초안 생성 중 사전 도구 결과를 LLM에 돌려주는 왕복 횟수 상한이다. LLM 호출은 최대 ``1 + 이 값``번이다.

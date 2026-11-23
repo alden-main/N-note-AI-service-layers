@@ -1,7 +1,6 @@
-"""Pydantic AI 엔진(``N_NOTE_LLM_ENGINE=pydantic_ai``)이 native와 같은 요청을 보내는지 검증한다.
+"""LLM 호출 계층(Pydantic AI)이 보내는 요청 본문을 검증한다.
 
-실제 AsyncOpenAI SDK가 가짜 HTTP 서버(httpx2 MockTransport)로 보내는 JSON 본문을 확인한다.
-native 대응 테스트: test_local_model_providers(Chat)·test_openai_mcp_tool_loop(Responses).
+실제 AsyncOpenAI SDK가 가짜 HTTP 서버(httpx2 MockTransport, ``llm_support``)로 보내는 JSON 본문을 확인한다.
 """
 
 from __future__ import annotations
@@ -13,77 +12,19 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx2
-from openai import AsyncOpenAI
 
 from tracing_support import all_attribute_text, by_name, recorded_spans
 
 from n_note_ai_service_layers import prompts, settings
 from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions, ToolExecutor
-from n_note_ai_service_layers.adapters.openai_draft_generation import DraftGenerationAdapter
 from n_note_ai_service_layers.adapters.pydantic_ai_completion import PydanticAiCompletion
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
+from llm_support import FakeServer, adapter, chat, responses
 from support import LOOKUP_TOOL, FakeGateway, sample_form_schema
 
 FINAL = {"proposed_fields": {"assessment.pain_score": 2}, "evidence_refs": [{"field_id": "assessment.pain_score", "refs": ["transcript"]}], "needs_confirmation": False}
 PRIVATE = "환자가 오늘 흉통을 호소함"
-
-
-class FakeServer:
-    """OpenAI 호환 서버 흉내다. 받은 요청 본문을 ``requests``에 남기고 ``replies``를 차례로 돌려준다."""
-
-    def __init__(self, *replies: dict[str, Any] | int) -> None:
-        self.replies = list(replies)
-        self.requests: list[dict[str, Any]] = []
-        self.clients = 0
-
-    def handle(self, request: httpx2.Request) -> httpx2.Response:
-        self.requests.append(json.loads(request.content))
-        reply = self.replies.pop(0)
-        if isinstance(reply, int):
-            return httpx2.Response(reply, json={"error": {"message": "tool choice is not enabled", "type": "BadRequestError"}})
-        return httpx2.Response(200, json=reply)
-
-    def client(self) -> AsyncOpenAI:
-        self.clients += 1
-        transport = httpx2.MockTransport(self.handle)
-        return AsyncOpenAI(base_url="http://local-llm/v1", api_key="EMPTY", max_retries=0, http_client=httpx2.AsyncClient(transport=transport))
-
-
-def chat(content: str | None = None, *tool_calls: tuple[str, str, dict[str, Any]]) -> dict[str, Any]:
-    message: dict[str, Any] = {"role": "assistant", "content": content}
-    if tool_calls:
-        message["tool_calls"] = [
-            {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}}
-            for call_id, name, arguments in tool_calls
-        ]
-    return {
-        "id": "chatcmpl", "object": "chat.completion", "created": 0, "model": "qwen",
-        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-    }
-
-
-def responses(text: str | None = None, *calls: tuple[str, str, dict[str, Any]]) -> dict[str, Any]:
-    output: list[dict[str, Any]] = [
-        {"type": "function_call", "id": f"fc_{call_id}", "call_id": call_id, "name": name, "arguments": json.dumps(arguments, ensure_ascii=False), "status": "completed"}
-        for call_id, name, arguments in calls
-    ]
-    if text is not None:
-        output.append({"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
-                       "content": [{"type": "output_text", "text": text, "annotations": []}]})
-    return {
-        "id": "resp_1", "object": "response", "created_at": 0, "model": "gpt-4o-mini", "status": "completed",
-        "output": output, "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
-        "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12,
-                  "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}},
-    }
-
-
-def adapter(server: FakeServer, api: str = "chat", gateway: FakeGateway | None = None, max_tool_rounds: int = 2,
-            options: GenerationOptions | None = None) -> DraftGenerationAdapter:
-    tools = ToolExecutor(McpGatewayClient(transport=gateway), None, max_tool_rounds=max_tool_rounds) if gateway else None
-    return DraftGenerationAdapter(PydanticAiCompletion(api, server.client, "qwen", options), "qwen", tools)
 
 
 def roles(request: dict[str, Any]) -> list[str]:
@@ -223,19 +164,37 @@ class EngineConcurrencyTests(unittest.TestCase):
 
 
 class EngineWiringTests(unittest.TestCase):
-    def test_engine_setting_selects_pydantic_ai_for_drafts_and_form_extraction(self):
-        env = {"N_NOTE_LLM_ENGINE": "pydantic_ai", "N_NOTE_LLM_BASE_URL": "http://local-llm/v1", "N_NOTE_LLM_MODEL": "qwen"}
+    def test_drafts_and_form_extraction_use_pydantic_ai(self):
+        # 예전 엔진 선택 변수가 .env에 남아 있어도 무시한다.
+        env = {"N_NOTE_LLM_ENGINE": "native", "N_NOTE_LLM_BASE_URL": "http://local-llm/v1", "N_NOTE_LLM_MODEL": "qwen"}
         with patch.dict(os.environ, env):
             draft = model_providers.draft_generator(None)
             self.assertIsInstance(draft.completion, PydanticAiCompletion)
             self.assertEqual(draft.completion.api, "chat")
             self.assertIsInstance(model_providers.structured_completion(), PydanticAiCompletion)
-        with patch.dict(os.environ, {"N_NOTE_LLM_ENGINE": ""}):
-            self.assertEqual(settings.get().llm_engine, "native")
+        with patch.dict(os.environ, {"N_NOTE_LLM_BASE_URL": ""}):
+            self.assertEqual(model_providers.draft_generator(None).completion.api, "responses")
 
-    def test_async_client_is_reused_within_a_thread(self):
+    def test_async_client_is_shared_across_threads(self):
+        from concurrent.futures import ThreadPoolExecutor
+
         endpoint = settings.ModelEndpoint("qwen", "http://local-llm/v1")
-        self.assertIs(model_providers.async_openai_client(endpoint, 30.0, 0), model_providers.async_openai_client(endpoint, 30.0, 0))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = pool.map(lambda _: model_providers.async_openai_client(endpoint, 30.0, 0), range(2))
+        self.assertIs(first, second)
+
+    def test_all_threads_run_llm_requests_on_one_event_loop(self):
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+
+        from n_note_ai_service_layers.adapters.pydantic_ai_completion import run_sync
+
+        async def current_loop():
+            return asyncio.get_running_loop()
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            loops = set(pool.map(lambda _: run_sync(current_loop()), range(6)))
+        self.assertEqual(len(loops), 1)
 
 
 class EngineTracingTests(unittest.TestCase):
@@ -244,7 +203,6 @@ class EngineTracingTests(unittest.TestCase):
         with recorded_spans() as spans:
             adapter(server, gateway=FakeGateway(), max_tool_rounds=1).generate({"transcript": PRIVATE}, sample_form_schema())
         completion = by_name(spans, "n_note.llm.completion")[0]
-        self.assertEqual(completion.attributes["n_note.llm.engine"], "pydantic_ai")
         self.assertEqual(completion.attributes["n_note.llm.tool_rounds"], 1)
         tool = by_name(spans, "n_note.llm.tool")[0]
         self.assertEqual(tool.context.trace_id, completion.context.trace_id)

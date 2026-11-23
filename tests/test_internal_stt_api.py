@@ -14,6 +14,7 @@ from n_note_ai_service_layers.api import deps
 from n_note_ai_service_layers.services import form_extraction
 from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.services import nursing_note_workflow
+from llm_support import FakeServer, chat, responses
 
 
 def fake_review(verify):
@@ -95,16 +96,17 @@ VALID = {
 }
 
 
+def llm_server(monkeypatch, reply):
+    """LLM 서버를 가짜 HTTP 서버로 바꾼다. 받은 요청 본문 목록을 돌려준다(모든 요청에 같은 응답)."""
+    server = FakeServer(lambda request: reply)
+    monkeypatch.setattr(model_providers, "async_openai_client", lambda *args: server.client())
+    return server.requests
+
+
 def chat_client(monkeypatch, content):
     monkeypatch.setenv("N_NOTE_LLM_API", "chat")
     monkeypatch.setenv("N_NOTE_LLM_BASE_URL", "http://local-llm/v1")
-    calls = []
-    def create(**request):
-        calls.append(request)
-        return {"choices": [{"message": {"content": content}}]}
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    monkeypatch.setattr(form_extraction.model_providers, "openai_client", lambda *args: client)
-    return calls
+    return llm_server(monkeypatch, chat(content))
 
 
 def test_output_schema_is_flat_and_matches_response_contract():
@@ -131,12 +133,9 @@ def test_chat_extraction_requests_structured_output_with_correction_rules(monkey
 def test_responses_extraction_requests_structured_output(monkeypatch):
     monkeypatch.setenv("N_NOTE_LLM_API", "responses")
     monkeypatch.delenv("N_NOTE_LLM_BASE_URL", raising=False)
-    seen = {}
-    def create(**request):
-        seen.update(request)
-        return SimpleNamespace(output_text=json.dumps(VALID, ensure_ascii=False))
-    monkeypatch.setattr(form_extraction.model_providers, "openai_client", lambda *args: SimpleNamespace(responses=SimpleNamespace(create=create)))
+    requests = llm_server(monkeypatch, responses(json.dumps(VALID, ensure_ascii=False)))
     assert form_extraction.extract(["전사문"], FORM, ()) == VALID
+    seen = requests[0]
     assert seen["text"]["format"]["strict"] is True and seen["text"]["format"]["schema"] == form_extraction.output_schema(FORM, 1)
     # 전사문을 OpenAI 쪽에 보관하지 않는다.
     assert seen["store"] is False
@@ -428,3 +427,23 @@ def test_extraction_payload_carries_reference_time_and_prompt_rules(monkeypatch)
     assert json.loads(calls[0]["messages"][1]["content"])["reference_time"] == "2026-11-18T08:00+09:00"
     instructions = calls[0]["messages"][0]["content"]
     assert "never drop a measurement" in instructions and "Do not add clinical interpretations" in instructions
+
+
+def test_parse_templates_rejects_each_contract_violation():
+    import pytest
+
+    field = {"field_id": "a", "field_type": "text"}
+    def template(*fields, **extra):
+        return {"templateType": "T", "templateName": "N", "schemaDefinition": {"sections": [{"fields": list(fields)}]}, **extra}
+    assert form_extraction.parse_templates(json.dumps([template(field, label="x")]))[0]["label"] == "x"  # 추가 키는 그대로 둔다
+    bad = [
+        "not json", json.dumps({}), json.dumps([template(field, templateType="")]),
+        json.dumps([template(field, field)]),  # field_id 중복
+        json.dumps([template({"field_id": "a", "field_type": "date"})]),
+        json.dumps([template({"field_id": "a", "field_type": "radio"})]),  # options 없음
+        json.dumps([template({"field_id": "a", "field_type": "radio", "options": ["x"], "default_from": "recording_time"})]),
+        json.dumps([template({"field_id": "a", "field_type": "text", "default_from": "now"})]),
+    ]
+    for raw in bad:
+        with pytest.raises(ValueError):
+            form_extraction.parse_templates(raw)

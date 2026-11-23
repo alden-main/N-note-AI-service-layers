@@ -14,14 +14,9 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from typing import TypeVar
 
 from n_note_ai_service_layers.observability import ContextThreadPoolExecutor
-
-T = TypeVar("T")
-R = TypeVar("R")
 
 _executors: dict[str, ThreadPoolExecutor] = {}
 _lock = threading.Lock()
@@ -36,12 +31,6 @@ def shared(name: str, max_workers: int) -> ThreadPoolExecutor:
             executor = ContextThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix=name)
             _executors[name] = executor
         return executor
-
-
-def map_ordered(executor: ThreadPoolExecutor, function: Callable[[T], R], items: Iterable[T]) -> list[R]:
-    """``items``를 ``executor``에서 동시에 처리하고 입력 순서대로 결과를 돌려준다(예외는 그대로 올린다)."""
-    futures = [executor.submit(function, item) for item in items]
-    return [future.result() for future in futures]
 
 
 def worker_parallelism() -> int:

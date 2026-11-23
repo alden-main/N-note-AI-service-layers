@@ -81,6 +81,27 @@ class GatewayCatalogTest(unittest.TestCase):
         tool_call = [item for item in self.transport.calls if item[1]["method"] == "tools/call"][-1]
         self.assertEqual(tool_call[3], "session-from-initialize")
 
+    def test_expired_upstream_session_is_reinitialized_and_the_call_retried_once(self) -> None:
+        """upstream이 재시작해 세션을 잊으면(404) 그 서비스만 다시 초기화하고 같은 호출을 한 번 다시 보낸다."""
+        from main_mcp_gateway_server.mcp import McpSessionExpired
+
+        original = self.transport.request_json
+        sessions = iter(["session-2", "session-3"])
+
+        def restarted(url, payload, request_id=None, session_id=None):
+            if payload["method"] == "tools/call" and session_id == "session-from-initialize":
+                self.transport.calls.append((url, payload, request_id, session_id))
+                raise McpSessionExpired("expired")
+            response = original(url, payload, request_id, session_id)
+            return McpResponse(response.body, next(sessions)) if payload["method"] == "initialize" else response
+
+        self.transport.request_json = restarted
+        result = self.catalog.call("a__lookup", {}, "request-1")
+        self.assertFalse(result["isError"])
+        tool_calls = [item for item in self.transport.calls if item[1]["method"] == "tools/call"]
+        self.assertEqual([item[3] for item in tool_calls], ["session-from-initialize", "session-2"])
+        self.assertTrue(all(item[2] == "request-1" for item in tool_calls))
+
     def test_invalid_protocol_or_tool_contract_is_not_registered(self) -> None:
         """버전 불일치와 description 없는 도구는 해당 서비스만 unhealthy로 만든다."""
         self.transport.protocol_version = "2024-11-05"
@@ -380,6 +401,23 @@ class UpstreamConfigTest(unittest.TestCase):
                     os.environ.pop("UPSTREAM_CONFIG_PATH", None)
                 else:
                     os.environ["UPSTREAM_CONFIG_PATH"] = previous
+
+
+
+
+class HttpTransportSessionTest(unittest.TestCase):
+    def test_404_with_a_session_is_session_expiry_and_without_one_is_a_plain_error(self) -> None:
+        import httpx2
+        from main_mcp_gateway_server.mcp import McpSessionExpired
+
+        transport = HttpTransport()
+        transport._client = httpx2.Client(transport=httpx2.MockTransport(lambda request: httpx2.Response(404)))
+        payload = {"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": {}}
+        with self.assertRaises(McpSessionExpired):
+            transport.request_json("http://a/mcp", payload, session_id="old")
+        with self.assertRaises(OSError) as raised:
+            transport.request_json("http://a/mcp", payload)
+        self.assertNotIsInstance(raised.exception, McpSessionExpired)
 
 
 if __name__ == "__main__":

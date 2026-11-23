@@ -5,7 +5,8 @@ from __future__ import annotations
 import unittest
 
 from n_note_ai_service_layers import prompts
-from n_note_ai_service_layers.adapters.openai_draft_generation import OpenAiDraftGenerationAdapter
+from n_note_ai_service_layers.adapters.draft_generation import DraftGenerationAdapter
+from support import StaticCompletion
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
@@ -118,7 +119,7 @@ class PromptTests(unittest.TestCase):
         self.assertNotIn("immutable", BASE_INSTRUCTIONS)
 
     def test_default_prompt_version_is_bumped(self) -> None:
-        adapter = OpenAiDraftGenerationAdapter(client=object())
+        adapter = DraftGenerationAdapter(StaticCompletion(), "m")
         self.assertEqual(adapter._prompt_version, "draft-v3")
 
     def test_prompt_guards_measurements_placement_and_interpretation(self) -> None:

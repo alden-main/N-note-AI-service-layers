@@ -79,7 +79,7 @@ def build_services() -> AppServices:
         timezone=str(config.local_timezone), require_local_stt=config.require_local_stt,
         ner_model=config.ner_model, job_concurrency=config.job_concurrency,
         prompts_file=str(catalog.source), draft_prompt=catalog.draft.version, form_extraction_prompt=catalog.form_extraction.version,
-        tracing=tracing, llm_engine=config.llm_engine,
+        tracing=tracing,
     )
     return AppServices(
         documents,

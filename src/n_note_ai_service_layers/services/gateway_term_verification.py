@@ -6,7 +6,10 @@ import re
 from dataclasses import replace
 from typing import Any
 
+from pydantic import ValidationError
+
 from n_note_ai_service_layers.settings import DEFAULT_TERM_REVIEW_CHUNK_CHARS, DEFAULT_TERM_REVIEW_TOOLS
+from n_note_ai_service_layers.contracts.gateway_payloads import KOREAN_FINDINGS, MEDICAL_CANDIDATES, MEDICAL_SUGGESTIONS, MedicalTermName
 from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN
 from n_note_ai_service_layers.contracts.term_verification import (
     GatewaySuggestion,
@@ -178,77 +181,74 @@ class GatewayTermVerificationFlow:
         return None
 
     def _parse_korean_findings(self, findings: list[Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
+        # 형태소 분석기가 복원해 원문에 없는 형태소다. 교정할 구간이 없을 뿐 응답 오류가 아니다.
+        findings = [item for item in findings if not (isinstance(item, dict) and item.get("start") == item.get("end") and item.get("source_text") == "")]
+        try:
+            parsed_findings = KOREAN_FINDINGS.validate_python(findings)
+        except ValidationError:
+            return None
         parsed: list[GatewayTermOccurrence] = []
-        for finding in findings:
-            if not isinstance(finding, dict):
+        for finding in parsed_findings:
+            if not self._valid_span(finding.start, finding.end, finding.source_text, source_text):
                 return None
-            start, end = finding.get("start"), finding.get("end")
-            # 형태소 분석기가 복원해 원문에 없는 형태소다. 교정할 구간이 없을 뿐 응답 오류가 아니다.
-            if start == end and finding.get("source_text") == "":
-                continue
-            input_text, analysis_form, candidates = finding.get("source_text"), finding.get("analysis_form"), finding.get("candidates")
-            if not self._valid_span(start, end, input_text, source_text) or not isinstance(analysis_form, str) or not isinstance(candidates, list):
-                return None
-            suggestions: list[GatewaySuggestion] = []
-            for candidate in candidates:
-                if not isinstance(candidate, dict) or not isinstance(candidate.get("replacement"), str):
-                    return None
-                confidence = candidate.get("confidence")
-                if confidence is not None and (not isinstance(confidence, (int, float)) or isinstance(confidence, bool)):
-                    return None
-                reason = candidate.get("reason") if isinstance(candidate.get("reason"), str) else None
-                suggestions.append(GatewaySuggestion(candidate["replacement"], float(confidence) if confidence is not None else None, reason))
+            suggestions = [
+                GatewaySuggestion(item.replacement, float(item.confidence) if item.confidence is not None else None, item.reason)
+                for item in finding.candidates
+            ]
             # 사전과 정확히 일치한 표기(matched)나 근거 없는 미등재어는 수정 후보가 아니다.
-            suggestions = self._distinct(suggestions, input_text)
+            suggestions = self._distinct(suggestions, finding.source_text)
             if suggestions:
-                parsed.append(self._occurrence(phase, tool_name, start, end, input_text, analysis_form, suggestions, "standard_korean"))
+                parsed.append(self._occurrence(
+                    phase, tool_name, finding.start, finding.end, finding.source_text, finding.analysis_form, suggestions, "standard_korean",
+                ))
         return parsed
 
     def _parse_medical_candidates(self, candidates: list[Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
+        try:
+            parsed_candidates = MEDICAL_CANDIDATES.validate_python(candidates)
+        except ValidationError:
+            return None
         parsed: list[GatewayTermOccurrence] = []
-        for candidate in candidates:
-            if not isinstance(candidate, dict) or candidate.get("automatic_correction") is not False:
+        for candidate in parsed_candidates:
+            if not self._valid_span(candidate.start_offset, candidate.end_offset, candidate.source_text, source_text):
                 return None
-            start, end, input_text, terms = candidate.get("start_offset"), candidate.get("end_offset"), candidate.get("source_text"), candidate.get("terms")
-            if not self._valid_span(start, end, input_text, source_text) or not isinstance(terms, list):
-                return None
-            if candidate.get("candidate_type") == "exact_match":
+            if candidate.candidate_type == "exact_match":
                 continue
-            suggestions: list[GatewaySuggestion] = []
-            for term in terms:
-                if not isinstance(term, dict) or not isinstance(term.get("kor_name"), str) or not isinstance(term.get("eng_name"), str):
-                    return None
-                suggestions.append(GatewaySuggestion(self._term_text(term, input_text), reason=candidate.get("candidate_type")))
-            suggestions = self._distinct(suggestions, input_text, "medical_term")
+            suggestions = [GatewaySuggestion(self._term_text(term, candidate.source_text), reason=candidate.candidate_type) for term in candidate.terms]
+            suggestions = self._distinct(suggestions, candidate.source_text, "medical_term")
             if suggestions:
-                parsed.append(self._occurrence(phase, tool_name, start, end, input_text, input_text, suggestions, "medical_term"))
+                parsed.append(self._occurrence(
+                    phase, tool_name, candidate.start_offset, candidate.end_offset, candidate.source_text, candidate.source_text, suggestions, "medical_term",
+                ))
         return parsed
 
     def _parse_medical_suggestions(self, suggestions: list[Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
+        try:
+            parsed_suggestions = MEDICAL_SUGGESTIONS.validate_python(suggestions)
+        except ValidationError:
+            return None
         parsed: list[GatewayTermOccurrence] = []
-        for suggestion in suggestions:
-            if not isinstance(suggestion, dict):
+        for suggestion in parsed_suggestions:
+            if not self._valid_span(suggestion.start_offset, suggestion.end_offset, suggestion.source_text, source_text):
                 return None
-            start, end, input_text, term = suggestion.get("start_offset"), suggestion.get("end_offset"), suggestion.get("source_text"), suggestion.get("recommended_term")
-            if not self._valid_span(start, end, input_text, source_text):
-                return None
-            if suggestion.get("review_status") == "no_change" or term is None:
+            term = suggestion.recommended_term
+            if suggestion.review_status == "no_change" or term is None:
                 continue
-            if not isinstance(term, dict) or not isinstance(term.get("kor_name"), str) or not isinstance(term.get("eng_name"), str):
-                return None
-            items = self._distinct([GatewaySuggestion(self._term_text(term, input_text), reason=suggestion.get("reason"))], input_text, "medical_term")
+            items = self._distinct([GatewaySuggestion(self._term_text(term, suggestion.source_text), reason=suggestion.reason)], suggestion.source_text, "medical_term")
             if items:
-                parsed.append(self._occurrence(phase, tool_name, start, end, input_text, input_text, items, "medical_term"))
+                parsed.append(self._occurrence(
+                    phase, tool_name, suggestion.start_offset, suggestion.end_offset, suggestion.source_text, suggestion.source_text, items, "medical_term",
+                ))
         return parsed
 
     def _occurrence(self, phase: str, tool_name: str, start: int, end: int, input_text: str, normalized: str, suggestions: list[GatewaySuggestion], category: TermCategory) -> GatewayTermOccurrence:
         return GatewayTermOccurrence(phase, tool_name, start, end, input_text, normalized, tuple(suggestions[:self.MAX_SUGGESTIONS]), category=category)
 
     @staticmethod
-    def _term_text(term: dict[str, Any], input_text: str) -> str:
+    def _term_text(term: MedicalTermName, input_text: str) -> str:
         """원문이 한글이면 한글 용어를, 영문 약어·용어이면 영문 용어를 우선 제안한다."""
-        preferred, fallback = ("kor_name", "eng_name") if _HANGUL.search(input_text) else ("eng_name", "kor_name")
-        return term[preferred] or term[fallback]
+        preferred, fallback = (term.kor_name, term.eng_name) if _HANGUL.search(input_text) else (term.eng_name, term.kor_name)
+        return preferred or fallback
 
     @staticmethod
     def _same_term(input_text: str, suggestion: str) -> bool:
@@ -271,9 +271,8 @@ class GatewayTermVerificationFlow:
 
     @staticmethod
     def _valid_span(start: Any, end: Any, input_text: Any, source_text: str) -> bool:
+        """``[start, end)``가 원문 안에 있고 그 구간이 ``input_text``와 같은지다(정수는 bool 제외)."""
         return (
-            isinstance(start, int) and not isinstance(start, bool)
-            and isinstance(end, int) and not isinstance(end, bool)
-            and 0 <= start < end <= len(source_text)
+            type(start) is int and type(end) is int and 0 <= start < end <= len(source_text)
             and isinstance(input_text, str) and source_text[start:end] == input_text
         )

@@ -217,3 +217,35 @@ class GatewayTermVerificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GatewayPayloadContractTests(unittest.TestCase):
+    """upstream 결과 계약(contracts/gateway_payloads.py)의 경계 사례다."""
+
+    def setUp(self) -> None:
+        self.flow = GatewayTermVerificationFlow(gateway=None)  # type: ignore[arg-type]
+
+    def _korean(self, **finding):
+        item = {"start": 0, "end": 2, "source_text": "통즁", "analysis_form": "통즁", "candidates": [{"replacement": "통증"}], **finding}
+        return self.flow._parse_korean_findings([item], "transcript", "통즁 있음", "korean__review")
+
+    def test_korean_finding_rejects_bool_offsets_and_bool_confidence(self) -> None:
+        self.assertEqual(len(self._korean()), 1)
+        self.assertIsNone(self._korean(start=False))
+        self.assertIsNone(self._korean(candidates=[{"replacement": "통증", "confidence": True}]))
+
+    def test_non_text_reason_is_dropped_not_rejected(self) -> None:
+        parsed = self._korean(candidates=[{"replacement": "통증", "reason": 3, "confidence": 1}])
+        self.assertEqual((parsed[0].suggestions[0].reason, parsed[0].suggestions[0].score), (None, 1.0))
+
+    def test_restored_morpheme_without_span_is_skipped(self) -> None:
+        restored = {"start": 3, "end": 3, "source_text": ""}
+        self.assertEqual(self.flow._parse_korean_findings([restored], "transcript", "통즁 있음", "korean__review"), [])
+
+    def test_medical_candidate_must_not_be_an_automatic_correction(self) -> None:
+        candidate = {"start_offset": 0, "end_offset": 3, "source_text": "당뇨뼝", "automatic_correction": False,
+                     "candidate_type": "unknown_or_possible_typo", "terms": [{"kor_name": "당뇨병", "eng_name": "Diabetes"}]}
+        parse = lambda item: self.flow._parse_medical_candidates([item], "draft", "당뇨뼝 있음", "medic__analyze")
+        self.assertEqual(parse(candidate)[0].suggestions[0].text, "당뇨병")
+        self.assertIsNone(parse({**candidate, "automatic_correction": True}))
+        self.assertIsNone(parse({**candidate, "terms": [{"kor_name": "당뇨병"}]}))

@@ -37,18 +37,18 @@ docker compose ps                 # 5개 서비스가 healthy인지 확인
 
 `docker compose` 하나로 다음 서비스가 함께 뜹니다. 네트워크는 Compose가 만들므로 `docker network create`가 필요 없습니다.
 
-### 외부 API 테스트
+### API 포트 공개
 
-테스트 시 다음 명령으로 API 포트만 공개할 수 있습니다. Gateway, MCP 서버와 로컬 모델 서버의 포트는 공개하지 않습니다.
+호스트에 공개되는 포트는 ai-service API 하나뿐입니다. [docker-compose.override.yml](docker-compose.override.yml)이 이 포트를 열고, `docker compose`가 이 파일을 자동으로 함께 읽습니다. Gateway, MCP 서버, 로컬 모델 서버의 포트는 공개하지 않습니다. 배포 번들에도 같은 파일이 들어가며, `install.sh --from`으로 업그레이드하면 이전 설치의 파일을 그대로 씁니다.
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.api-test.yml up -d --build
-curl http://127.0.0.1:8100/healthz
-# 다른 컴퓨터에서: curl http://<서버-IP>:8100/healthz
-# API 문서: http://<서버-IP>:8100/docs
+docker compose up -d --build
+curl http://127.0.0.1:8400/healthz
+# 다른 컴퓨터에서: curl http://<서버-IP>:8400/healthz
+# API 문서: http://<서버-IP>:8400/docs
 ```
 
-기본적으로 모든 호스트 인터페이스의 8100 포트에 바인딩합니다. `N_NOTE_API_BIND_ADDRESS`와 `N_NOTE_API_PORT` 환경 변수 또는 `.env`로 변경할 수 있습니다(예: 로컬에서만 접근하려면 `N_NOTE_API_BIND_ADDRESS=127.0.0.1`). 원격 접속에는 서버 방화벽과 네트워크의 해당 포트 허용이 필요합니다. 테스트 종료 후 기본 설정으로 되돌리려면 `docker compose -f docker-compose.yml -f docker-compose.api-test.yml down` 후 `docker compose up -d`를 실행합니다.
+기본값은 모든 호스트 인터페이스의 8400 포트입니다. `.env`의 `N_NOTE_API_BIND_ADDRESS`·`N_NOTE_API_PORT`로 바꿉니다(예: 로컬에서만 접근하려면 `N_NOTE_API_BIND_ADDRESS=127.0.0.1`). 원격 접속에는 서버 방화벽과 네트워크의 해당 포트 허용이 필요합니다. 포트를 열지 않으려면 `docker compose -f docker-compose.yml up -d`처럼 override 파일을 빼고 실행합니다.
 
 이 설정은 API 앱 전체(`/internal/v1`, `/docs` 포함)를 공개하며 별도의 인증을 추가하지 않습니다. `X-Authenticated-User` 헤더는 인증 프록시가 검증한 값을 신뢰하는 용도이므로 직접 공개된 API의 인증 수단이 아닙니다. 신뢰할 수 있는 테스트 네트워크에서 합성 데이터만 사용하고, 인터넷에 공개하려면 인증 프록시와 접근 제한을 먼저 구성하세요.
 
@@ -70,9 +70,12 @@ MCP 서버 하나가 기동에 실패해도 Gateway와 ai-service는 뜨고, 해
 
 ```bash
 scripts/bundle.sh --version 1.0.0        # 모든 이미지(linux/amd64)와 실행 파일을 tar.gz 하나로
+scripts/bundle.sh --version 1.0.0 --with-observability   # LLM 추적 화면(Phoenix)까지 포함
 # 서버로 옮긴 뒤
 tar -xzf n-note-1.0.0-linux-amd64.tar.gz && cd n-note-1.0.0-linux-amd64 && ./scripts/install.sh
 ```
+
+`--with-observability` 번들이면 `install.sh`가 Phoenix 비밀값(`PHOENIX_SECRET`·`PHOENIX_ADMIN_SECRET`·`PHOENIX_ADMIN_PASSWORD`)을 만들어 `.env`에 넣고 Phoenix를 함께 띄웁니다. 이후 `docker compose ps`·`logs`·`down`도 Phoenix를 포함하도록 `.env`의 `COMPOSE_FILE`에 기록합니다. 화면은 서버의 `127.0.0.1:6006`에만 열리므로 다른 PC에서는 `ssh -L 6006:127.0.0.1:6006 <서버>`로 접속합니다. 로그인 ID는 `admin@localhost`이고 첫 비밀번호는 `.env`의 `PHOENIX_ADMIN_PASSWORD`입니다. Phoenix를 띄우지 않으려면 `.env`에 `N_NOTE_OBSERVABILITY=false`를 두고 `./scripts/install.sh --skip-load`를 실행합니다. Phoenix가 없는 번들로 업그레이드하면 overlay 설정은 자동으로 빠지고, Phoenix 데이터 volume은 남습니다.
 
 업그레이드·롤백·포트 공개·로컬 GPU 모델 포함 방법은 [docs/linux_docker_model_deployment.md](docs/linux_docker_model_deployment.md)에 있습니다.
 
@@ -112,6 +115,23 @@ done
 uv run python -m n_note_ai_service_layers.run_model_eval compare   # 핵심어 포함률·금지어·처리 시간 비교
 ```
 
+### 프롬프트·LLM 호출 계층·추적
+
+**프롬프트**는 [src/n_note_ai_service_layers/prompts/prompts.toml](src/n_note_ai_service_layers/prompts/prompts.toml) 한 파일에 있습니다(초안 생성·서식 추출·Chat 공통 문구·STT 문맥). 코드에는 지침 문장이 없습니다. 문장을 바꾸면 해당 섹션의 `version`을 올리고 같은 eval 사례로 이전 판과 비교합니다. `version`은 초안 결과(`prompt_version`), 추적 span, `run_model_eval compare` 표에 함께 남습니다. 파일을 바꾸지 않고 실험하려면 `N_NOTE_PROMPTS_FILE`로 다른 파일을 지정합니다. 파일이 없거나 키가 빠지면 서비스가 기동하지 않습니다.
+
+**LLM 호출 계층**은 [Pydantic AI](https://ai.pydantic.dev) Agent 하나입니다([adapters/pydantic_ai_completion.py](src/n_note_ai_service_layers/adapters/pydantic_ai_completion.py)). Responses API는 `store=False`로 보내고, Chat(vLLM 등 로컬)은 도구 단계와 구조화 출력 단계를 나눕니다. 예전 OpenAI SDK 직접 호출 계층(`N_NOTE_LLM_ENGINE=native`)은 삭제했습니다. `.env`에 이 변수가 남아 있어도 무시됩니다. `run_model_eval compare` 표의 `llm_engine` 열은 예전 결과와 구분하려고 남겨 두었습니다.
+
+> 로컬 GPU 모델(vLLM·Gemma·Qwen)에서는 이 계층을 아직 실제 서버로 확인하지 않았습니다. 배포 전에 `scripts/smoke-test.sh <profile>`과 `run_model_eval run --profile <profile>`로 확인하고, 예전 native 결과(`eval/results/`)와 비교합니다.
+
+**추적**(OpenTelemetry)은 기본으로 꺼져 있습니다. 개발·평가 환경에서는 Phoenix 화면을 함께 띄웁니다. `.env`에 넣을 비밀값은 [docker-compose.observability.yml](docker-compose.observability.yml) 머리말에 있습니다.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
+# http://127.0.0.1:6006 → 프로젝트 n-note
+```
+
+화면에는 작업 → 단계 → 양식별 초안 → LLM 호출(엔진·프롬프트 판·도구 왕복 수) → 모델 요청(토큰 수)·사전 도구 호출 순서로 나옵니다. 추적에도 로그와 같은 원칙이 적용되어, 기본으로 식별자·개수·시간·오류 유형만 남기고 예외 메시지는 남기지 않습니다. 프롬프트·LLM 응답·도구 인자는 `N_NOTE_OTEL_CAPTURE_CONTENT=true`일 때만 남기므로 **합성 데이터 환경에서만** 켭니다. 로그 한 줄의 `otel_trace_id`로 해당 추적을 찾을 수 있습니다. 사내 Collector나 Langfuse 같은 다른 수신기로 보내려면 `OTEL_EXPORTER_OTLP_ENDPOINT`·`OTEL_EXPORTER_OTLP_HEADERS`만 바꿉니다.
+
 양식 7종은 `forms/` 아래에 디렉터리로 추가합니다. 형식과 PDF 배치 방법은 [forms/README.md](forms/README.md)에 있습니다.
 
 | 환경 변수 | 기본값 | 설명 |
@@ -149,6 +169,9 @@ uv run python -m n_note_ai_service_layers.run_model_eval compare   # 핵심어 �
 | `N_NOTE_NER_MODEL` | 없음(규칙만) | 로컬 NER 비식별화 모델. 예: `Leo97/KoELECTRA-small-v3-modu-ner`. `uv sync --extra ner`(Docker는 `N_NOTE_INSTALL_NER=true` 빌드) 필요. 설정했는데 못 올리면 기동 실패 |
 | `N_NOTE_NER_MIN_SCORE` / `N_NOTE_NER_LABELS` / `N_NOTE_NER_THREADS` | `0.8` / `PS,PER,PERSON` / `2` | NER 최소 신뢰도 / 사람 라벨 / CPU 스레드 |
 | `N_NOTE_LOG_LEVEL` | `INFO` | JSON 구조화 로그 수준. 로그에는 추적 ID·단계·소요 시간·오류 유형만 남기고 전사문·필드 값은 남기지 않는다 |
+| `N_NOTE_PROMPTS_FILE` | 패키지의 `prompts.toml` | 실험용 프롬프트 파일(같은 키를 모두 갖춰야 함) |
+| `N_NOTE_OTEL_ENABLED` | `false` | OpenTelemetry 추적. `OTEL_EXPORTER_OTLP_ENDPOINT`(필수)·`OTEL_EXPORTER_OTLP_HEADERS`로 OTLP/HTTP 전송 |
+| `N_NOTE_OTEL_CAPTURE_CONTENT` | `false` | span에 프롬프트·LLM 응답·도구 인자를 남김. 합성 데이터 환경 전용 |
 
 ## API 흐름
 
@@ -211,5 +234,7 @@ N_NOTE_TEST_NER_MODEL=Leo97/KoELECTRA-small-v3-modu-ner uv run python -m unittes
 ## 검증
 
 ```bash
-uv run python -m unittest discover -s tests -v
+uv run pytest            # 루트 테스트 전체(unittest 형식과 pytest fixture 형식 모두)
 ```
+
+`python -m unittest`는 pytest fixture(`monkeypatch`)를 쓰는 테스트(`tests/test_internal_stt_api.py` 등)를 실행하지 않으므로 `pytest`를 씁니다. MCP 서버는 각 디렉터리에서 `uv run python -m unittest discover -s tests`로 실행합니다.

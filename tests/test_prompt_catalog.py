@@ -7,9 +7,9 @@ from pathlib import Path
 from unittest import mock
 
 from n_note_ai_service_layers import prompts
-from n_note_ai_service_layers.adapters.openai_draft_generation import DraftGenerationAdapter, OpenAiDraftGenerationAdapter
+from n_note_ai_service_layers.adapters.draft_generation import DraftGenerationAdapter
 from n_note_ai_service_layers.services import form_extraction
-from support import sample_form_schema
+from support import StaticCompletion, sample_form_schema
 
 
 class PromptCatalogTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class PromptCatalogTests(unittest.TestCase):
         self.assertIn(f"The form is '{schema.display_title}'.", instructions)
 
     def test_default_prompt_version_comes_from_catalog(self) -> None:
-        adapter = OpenAiDraftGenerationAdapter(client=object())
+        adapter = DraftGenerationAdapter(StaticCompletion(), "m")
         self.assertEqual(adapter._prompt_version, prompts.get().draft.version)
 
     def test_prompts_file_override_and_missing_key_failure(self) -> None:

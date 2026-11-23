@@ -212,8 +212,8 @@ def summarize(profile: str, records: list[dict[str, Any]]) -> dict[str, Any]:
         "stt_model": config.stt_endpoint.model,
         "llm_model": next((item["model_version"] for item in ok), config.llm_endpoint.model),
         "llm_api": config.llm_api,
-        # 같은 사례로 LLM 호출 계층(native·pydantic_ai)과 프롬프트 판을 비교할 수 있게 함께 남긴다.
-        "llm_engine": config.llm_engine,
+        # 예전 결과(native 엔진)와 구분할 수 있도록 엔진 열을 남긴다. 지금은 Pydantic AI 하나다.
+        "llm_engine": "pydantic_ai",
         "prompt_version": next((item["prompt_version"] for item in ok if item.get("prompt_version")), prompts.get().draft.version),
         "tool_calling": config.llm_tool_calling_enabled,
         "cases": len(records),
