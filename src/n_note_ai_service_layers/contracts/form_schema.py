@@ -7,7 +7,6 @@ PDF 배치 위치)을 검사하고, 어기면 ``pydantic.ValidationError``(``Val
 
 from __future__ import annotations
 
-from dataclasses import field
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -74,7 +73,6 @@ class FormField:
     type: FieldType = "text"
     required: bool = False
     llm_allowed: bool = True
-    fact_id: Text | None = None
     conditional_required_when: Text | None = None
     label: Text | None = None
     display_order: DisplayOrder | None = None
@@ -133,7 +131,6 @@ class FormSchema:
     status: SchemaStatus = SchemaStatus.DRAFT
     approved_by: str | None = None
     approved_at: IsoDatetime | None = None
-    freshness_windows_minutes: dict[str, int] = field(default_factory=dict)
     title: Text | None = None
     instructions: Text | None = None
     pdf_template: str | None = None
@@ -162,10 +159,6 @@ class FormSchema:
     @property
     def fields(self) -> tuple[FormField, ...]:
         return tuple(field for section in self.sections for field in section.fields)
-
-    @property
-    def requested_fact_ids(self) -> set[str]:
-        return {field.fact_id for field in self.fields if field.fact_id}
 
 
 @dataclass(frozen=True)

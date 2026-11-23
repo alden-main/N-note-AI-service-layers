@@ -41,6 +41,8 @@ class EvalCase:
     audio_path: Path | None
     reference_transcript: str | None
     expected: dict[str, Any]
+    # 선택: bridge가 음성과 함께 보내는 EMR JSON(``emr.json``)이다.
+    emr: dict[str, Any] | None = None
 
 
 class FixedTranscriptProvider:
@@ -82,6 +84,7 @@ def load_cases(root: Path) -> list[EvalCase]:
         meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
         transcript_path = directory / "transcript.txt"
         reference_path = directory / "reference_transcript.txt"
+        emr_path = directory / "emr.json"
         audio = next((path for path in sorted(directory.iterdir()) if path.stem == "audio" and path.suffix.lower() in AUDIO_TYPES), None)
         if audio is None and not transcript_path.is_file():
             continue
@@ -93,6 +96,7 @@ def load_cases(root: Path) -> list[EvalCase]:
             audio_path=audio,
             reference_transcript=reference_path.read_text().strip() if reference_path.is_file() else None,
             expected=meta.get("expected", {}),
+            emr=json.loads(emr_path.read_text()) if emr_path.is_file() else None,
         ))
     return cases
 
@@ -161,16 +165,16 @@ def run_case(case: EvalCase, stt_provider: Any | None = None) -> dict[str, Any]:
     schema_id, purpose = api.resolve_workflow_form(case.schema_id, None)
     trace_id = str(uuid4())
     context_flow = api.get_workflow_context_flow()
-    snapshot = context_flow.build(ClinicalContextQuery("EVAL-PATIENT", "EVAL-ENCOUNTER", purpose, now_utc(), schema_id, trace_id, None))
+    context = context_flow.build(ClinicalContextQuery("EVAL-PATIENT", "EVAL-ENCOUNTER", purpose, now_utc(), schema_id, trace_id, None))
     schema = context_flow.registry.resolve_active(schema_id, purpose, None)
     if case.audio_path is not None:
-        audio = AudioInput(case.audio_path.read_bytes(), case.audio_path.name, AUDIO_TYPES[case.audio_path.suffix.lower()], trace_id, case.language_hint)
+        audio = AudioInput(case.audio_path.read_bytes(), case.audio_path.name, AUDIO_TYPES[case.audio_path.suffix.lower()], trace_id, case.language_hint, emr=case.emr)
     else:
-        audio = AudioInput(b"transcript-fixture", "transcript.txt", "audio/wav", trace_id, case.language_hint)
+        audio = AudioInput(b"transcript-fixture", "transcript.txt", "audio/wav", trace_id, case.language_hint, emr=case.emr)
     started = time.perf_counter()
-    record: dict[str, Any] = {"case_id": case.case_id, "schema_id": schema_id, "input": "audio" if uses_audio else "transcript"}
+    record: dict[str, Any] = {"case_id": case.case_id, "schema_id": schema_id, "input": "audio" if uses_audio else "transcript", "emr": case.emr is not None}
     try:
-        result = workflow.generate(snapshot, audio, schema)
+        result = workflow.generate(context, audio, schema)
     except Exception as exc:  # 모델별 실패 유형(구조화 출력 불가, 시간 초과 등)을 결과에 남긴다.
         record.update({"status": "error", "error": f"{type(exc).__name__}: {exc}", "total_seconds": round(time.perf_counter() - started, 2)})
         return record

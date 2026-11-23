@@ -25,7 +25,7 @@ from fastapi.responses import StreamingResponse
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.audio_preprocessing import audio_creation_time
 from n_note_ai_service_layers.api import mappers
-from n_note_ai_service_layers.api.deps import get_nursing_note_workflow, get_workflow_context_flow, read_validated_audio
+from n_note_ai_service_layers.api.deps import get_nursing_note_workflow, get_workflow_context_flow, parse_request_emr, read_validated_audio
 from n_note_ai_service_layers.api.schemas import WorkflowJob
 from n_note_ai_service_layers.api.state import get_services
 from n_note_ai_service_layers.contracts.audio import AudioInput, PreTranscribedAudio
@@ -115,18 +115,19 @@ def _save_draft(result: NursingNoteWorkflowResult, schema: FormSchema, trace_id:
         result.numeric_sources,
         result.reference_time,
         result.llm_applied_term_hints,
+        result.emr_context,
     )
     return mappers.workflow_result_response(result, review, schema, trace_id)
 
 
 def _workflow_job(
-    workflow: NursingNoteWorkflow, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, patient_id: str, encounter_id: str,
+    workflow: NursingNoteWorkflow, context, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, patient_id: str, encounter_id: str,
 ):
     """작업 루프에서 실행할 함수다: 초안 생성 → 초안 검토 레코드 저장 → 결과 사전."""
     async def work(progress: Progress) -> dict[str, Any]:
         try:
             result = await _call_workflow(
-                workflow, "generate", snapshot, audio, schema, known_identifiers=(patient_id, encounter_id), progress=progress,
+                workflow, "generate", context, audio, schema, known_identifiers=(patient_id, encounter_id), progress=progress,
             )
         except WorkflowStageError as exc:
             raise JobFailure(*stage_failure(exc)) from exc
@@ -223,6 +224,10 @@ async def create_nursing_note_workflow(
         default=None, max_length=64,
         description="녹음 시작 시각(ISO 8601, 예: 2026-11-18T09:00:00+09:00). 생략하면 음성 파일 메타데이터의 생성 시각, 그것도 없으면 접수 시각을 쓴다",
     ),
+    emr: str | None = Form(
+        default=None,
+        description="bridge가 보낸 EMR JSON 객체 문자열(선택). 중첩·배열을 받으며, 식별 정보 키는 빼고 비식별화한 뒤 모든 양식 초안의 참고 문맥으로 쓴다",
+    ),
     x_trace_id: str | None = Header(default=None),
     idempotency_key: str | None = Header(default=None, max_length=128, description="같은 키로 다시 보내면 새 작업을 만들지 않고 기존 작업을 반환한다"),
     context_flow: ClinicalContextFlow = Depends(get_workflow_context_flow),
@@ -233,12 +238,15 @@ async def create_nursing_note_workflow(
     check_form_selection(schema_id, schema_ids, schema_version)
     received_at = now_local()
     requested_time = _parse_recorded_at(recorded_at)
+    emr_data = parse_request_emr(emr)
     content = await read_validated_audio(audio)
     plan = await prepare_workflow_forms(patient_id, encounter_id, purpose, schema_id, schema_ids, schema_version, x_trace_id, context_flow)
     metadata_time = None if requested_time else await run_in_threadpool(audio_creation_time, content)
     recording = resolve_recording_time(requested_time, metadata_time, received_at)
     log_event(_logger, "recording_time_resolved", trace_id=plan.trace_id, source=recording.source)
-    source = AudioInput(content, audio.filename or "audio", audio.content_type, plan.trace_id, language_hint, recorded_at=recording.value)
+    source = AudioInput(
+        content, audio.filename or "audio", audio.content_type, plan.trace_id, language_hint, recorded_at=recording.value, emr=emr_data,
+    )
     job = await run_in_threadpool(submit_workflow_job, plan, source, workflow, idempotency_key)
     response.headers["Location"] = f"/v1/nursing-note-jobs/{job['job_id']}"
     return job_response(job)
@@ -255,7 +263,7 @@ def _parse_recorded_at(value: str | None):
 
 @dataclass(frozen=True)
 class WorkflowPlan:
-    """접수 전에 확인한 양식·임상 문맥이다. ``multi``면 여러 양식 작업(``forms``가 양식별 진행을 가진다)이다."""
+    """접수 전에 확인한 양식·요청 문맥이다. ``multi``면 여러 양식 작업(``forms``가 양식별 진행을 가진다)이다."""
 
     trace_id: str
     patient_id: str
@@ -269,7 +277,7 @@ async def prepare_workflow_forms(
     patient_id: str, encounter_id: str, purpose: str | None, schema_id: str | None, schema_ids: list[str] | None,
     schema_version: str | None, trace_id: str | None, context_flow: ClinicalContextFlow,
 ) -> WorkflowPlan:
-    """요청한 양식의 활성 버전과 임상 문맥을 준비한다. 쓸 수 없는 양식은 작업을 만들기 전에 422로 거부한다."""
+    """요청한 양식의 활성 버전과 요청 문맥(접근 검사)을 준비한다. 쓸 수 없는 양식은 작업을 만들기 전에 422로 거부한다."""
     trace_id = trace_id or str(uuid4())
     check_form_selection(schema_id, schema_ids, schema_version)
     requested: list[tuple[str | None, str | None]]
@@ -284,14 +292,14 @@ async def prepare_workflow_forms(
         form_id, form_purpose = resolve_workflow_form(form_id, purpose)
         query = ClinicalContextQuery(patient_id, encounter_id, form_purpose, now_utc(), form_id, trace_id, version)
         try:
-            snapshot = context_flow.build(query)
-            return context_flow.registry.resolve_active(form_id, form_purpose, version), snapshot, form_purpose
+            context = context_flow.build(query)
+            return context_flow.registry.resolve_active(form_id, form_purpose, version), context, form_purpose
         except (PermissionError, LookupError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="workflow schema or context is not available") from exc
 
     for form_id, version in requested:
-        selected_schema, snapshot, resolved_purpose = await run_in_threadpool(resolve, form_id, version)
-        forms.append((selected_schema, snapshot))
+        selected_schema, context, resolved_purpose = await run_in_threadpool(resolve, form_id, version)
+        forms.append((selected_schema, context))
     return WorkflowPlan(trace_id, patient_id, encounter_id, tuple(forms), bool(schema_ids), resolved_purpose)
 
 
@@ -317,10 +325,10 @@ def submit_workflow_job(
         job, created = services.jobs.create(JOB_KIND, plan.trace_id, request, idempotency_key, {"forms": initial_forms})
         work = _multi_form_workflow_job(workflow, forms, source, plan.patient_id, plan.encounter_id, job["job_id"]) if created else None
     else:
-        schema, snapshot = plan.forms[0]
+        schema, context = plan.forms[0]
         request = {"schema_id": schema.schema_id, "schema_version": schema.version, "purpose": plan.purpose}
         job, created = services.jobs.create(JOB_KIND, plan.trace_id, request, idempotency_key)
-        work = _workflow_job(workflow, snapshot, source, schema, plan.patient_id, plan.encounter_id) if created else None
+        work = _workflow_job(workflow, context, source, schema, plan.patient_id, plan.encounter_id) if created else None
     if work is not None:
         try:
             services.job_runner.submit(job["job_id"], work)

@@ -49,10 +49,10 @@ class TranscriptRedactor:
     def __init__(self, recognizer: NamedEntityRecognizer | None = None) -> None:
         self.recognizer = recognizer
 
-    def redact(self, text: str, known_identifiers: Iterable[str] = ()) -> RedactedText:
+    def redact(self, text: str, known_identifiers: Iterable[str] = (), known_names: Iterable[str] = ()) -> RedactedText:
         """명시적 식별자만 순차적으로 치환하고 임상 용어는 보존한다.
 
-        입력: 원문 전사 문자열과 그대로 가려야 할 식별자(환자 ID·내원 ID 등)이다.
+        입력: 원문 전사 문자열, 그대로 가려야 할 식별자(환자 ID·내원 ID 등), 사람 이름으로 확인된 값(EMR의 환자·의사 이름 등)이다.
         출력: ``[[TYPE_n]]`` 보호 토큰을 포함한 비식별 문자열이다.
         """
         counts: dict[str, int] = {}
@@ -68,6 +68,9 @@ class TranscriptRedactor:
             return lambda match: f"{match.group('label')}{token(kind)}"
 
         redacted = text
+        # 출처(EMR)가 사람 이름이라고 알려 준 값은 길이와 관계없이 가린다(2자 이상, 긴 이름부터).
+        for name in sorted({item.strip() for item in known_names if item and len(item.strip()) >= 2}, key=len, reverse=True):
+            redacted = re.sub(re.escape(name), lambda _: token("PERSON"), redacted)
         # 짧은 값은 일반 수치와 겹치므로 4자 이상인 식별자만 가린다.
         for identifier in sorted({item.strip() for item in known_identifiers if item and len(item.strip()) >= 4}, key=len, reverse=True):
             redacted = re.sub(rf"(?<![0-9A-Za-z]){re.escape(identifier)}(?![0-9A-Za-z])", lambda _: token("KNOWN_ID"), redacted)

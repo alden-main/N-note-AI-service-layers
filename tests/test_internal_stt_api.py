@@ -446,3 +446,20 @@ def test_parse_templates_rejects_each_contract_violation():
     for raw in bad:
         with pytest.raises(ValueError):
             form_extraction.parse_templates(raw)
+
+
+def test_internal_stt_sends_deidentified_emr_with_the_form_request(monkeypatch):
+    from test_emr_context import EMR
+
+    app = create_app()
+    setup_review(app, monkeypatch)
+    app.dependency_overrides[get_speech_to_text_provider] = lambda: SimpleNamespace(transcribe=lambda audio: Transcript("식후 혈당 확인함.", "fake", "fake-stt"))
+    requests = chat_client(monkeypatch, json.dumps(VALID, ensure_ascii=False))
+    response = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM]), "emr": json.dumps(EMR, ensure_ascii=False)})
+    assert response.status_code == 200, response.text
+    user = json.loads(requests[0]["messages"][-1]["content"])
+    assert {"key": "bloodSugarList[0]", "value": "measuredAt=2026-09-02 09:34:42, timingType=식후, glucoseValue=200"} in user["emr_context"]
+    assert "홍길동" not in requests[0]["messages"][-1]["content"]
+    assert "emr_context" in requests[0]["messages"][0]["content"]  # 지침이 EMR 사용 규칙을 담는다
+    bad = TestClient(app).post("/internal/v1", files={"file": ("a.wav", b"x")}, data={"templates": json.dumps([FORM]), "emr": "[1]"})
+    assert bad.status_code == 422

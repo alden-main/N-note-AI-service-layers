@@ -131,6 +131,7 @@ def draft_review_response(record: DraftReviewRecord, schema: FormSchema, numeric
         "candidate_decisions": latest.candidate_decisions,
         "applied_suggestions": {key: value for revision in record.revisions for key, value in revision.applied_suggestions.items()},
         "llm_applied_term_hints": [dict(item) for item in record.llm_applied_term_hints],
+        "emr_context": [dict(item) for item in record.emr_context],
         "edited_by": latest.edited_by,
         "created_at": latest.created_at,
         "finalized_note_id": record.finalized_note_id,

@@ -12,14 +12,13 @@ from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.note_artifact_store import FileNursingNoteStore
 from n_note_ai_service_layers.adapters.pdf_renderer import NursingNotePdfRenderer
-from n_note_ai_service_layers.adapters.transcript_only_repository import TranscriptOnlyRepository
 from n_note_ai_service_layers.api.state import get_services
 from n_note_ai_service_layers.contracts.ai_provider import SpeechToTextProvider
 from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
 from n_note_ai_service_layers.observability import get_logger, log_event
 from n_note_ai_service_layers.services.access_policy import PurposeAccessPolicy
-from n_note_ai_service_layers.services.context_assembler import ClinicalContextAssembler
 from n_note_ai_service_layers.services.context_flow import ClinicalContextFlow
+from n_note_ai_service_layers.services.emr_context import EmrInputError, parse_emr
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow, TranscriptPreparation
@@ -127,15 +126,15 @@ def get_transcript_preparation(
     gateway: McpGatewayClient = Depends(get_gateway_client),
 ) -> TranscriptPreparation:
     """STT → 비식별화 → 전사문 용어 검토 공통 단계다(동기 서식 추출 API가 쓴다)."""
-    return TranscriptPreparation(stt, get_term_verification(gateway), redactor, settings.get().term_hint_budget_seconds)
+    config = settings.get()
+    return TranscriptPreparation(stt, get_term_verification(gateway), redactor, config.term_hint_budget_seconds, config.emr_identifier_keys)
 
 
 def get_workflow_context_flow() -> ClinicalContextFlow:
-    """임상 문맥 흐름을 만든다. 전사문만으로 초안을 만들며, 운영 EMR repository는 별도 adapter로 주입한다."""
+    """요청 문맥 흐름을 만든다(목적·식별자 접근 검사와 활성 양식 확인). EMR은 요청에 함께 오는 JSON으로 받는다."""
     registry = get_services().template_registry
-    repository = TranscriptOnlyRepository()
     purposes = {schema.purpose for schema in registry.list_versions() if schema.status is SchemaStatus.ACTIVE}
-    return ClinicalContextFlow(PurposeAccessPolicy(purposes), registry, repository, ClinicalContextAssembler())
+    return ClinicalContextFlow(PurposeAccessPolicy(purposes), registry)
 
 
 def get_nursing_note_workflow(
@@ -152,7 +151,7 @@ def get_nursing_note_workflow(
     return NursingNoteWorkflow(
         stt, generator, get_term_verification(gateway),
         redactor=get_transcript_redactor(), report_validation=FormReportValidationFlow(gateway, config.report_validation_tool_name),
-        hint_budget_seconds=config.term_hint_budget_seconds,
+        hint_budget_seconds=config.term_hint_budget_seconds, emr_identifier_keys=config.emr_identifier_keys,
     )
 
 
@@ -176,3 +175,12 @@ def resolve_actor(claimed: str | None, authenticated: str | None, field_name: st
     if not claimed:
         raise HTTPException(status_code=422, detail=f"{field_name} is required")
     return claimed
+
+
+def parse_request_emr(raw: str | bytes | dict[str, Any] | None) -> dict[str, Any] | None:
+    """요청에 함께 온 EMR JSON을 검사한다(상한은 ``N_NOTE_EMR_MAX_*``). 형식이 틀리거나 상한을 넘으면 422다."""
+    config = settings.get()
+    try:
+        return parse_emr(raw, config.emr_max_bytes, config.emr_max_entries, config.emr_max_depth)
+    except EmrInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None

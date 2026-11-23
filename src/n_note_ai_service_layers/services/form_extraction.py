@@ -21,6 +21,7 @@ from n_note_ai_service_layers.contracts.numeric_verification import NumericFindi
 from n_note_ai_service_layers.observability import get_logger, stage
 from n_note_ai_service_layers.services.draft_document import is_filled
 from n_note_ai_service_layers.services.draft_token_scrub import has_content, scrub_value
+from n_note_ai_service_layers.services.emr_context import EmrContext
 from n_note_ai_service_layers.services.numeric_verification import NumericVerifier
 from n_note_ai_service_layers.services.recording_time import format_for_field
 
@@ -152,13 +153,18 @@ def output_schema(template: dict, sentence_count: int) -> dict:
     }
 
 
-def extract(sentences: list[str], template: dict, hints: tuple[dict, ...], reference_time: datetime | None = None) -> dict:
+def extract(
+    sentences: list[str], template: dict, hints: tuple[dict, ...], reference_time: datetime | None = None, emr: EmrContext | None = None,
+) -> dict:
     """LLM 한 번으로 서식을 추출한다. 구조가 스키마와 다르면 ``ValueError``다."""
     schema = output_schema(template, len(sentences))
     transcript = [{"id": index, "text": sentence} for index, sentence in enumerate(sentences)]
     request: dict[str, Any] = {"transcript_sentences": transcript, "schemaDefinition": template["schemaDefinition"], "term_review_hints": hints}
     if reference_time is not None:
         request["reference_time"] = reference_time.isoformat(timespec="minutes")
+    if emr is not None and emr.entries:
+        # bridge가 보낸 EMR 참고 문맥이다(식별 정보 제거·비식별화 후). 서식 값의 근거 문장은 전사문 문장만 쓴다.
+        request["emr_context"] = emr.payload()
     payload = json.dumps(request, ensure_ascii=False)
     # 초안 생성과 같은 요청기다(API 형식·store=False·temperature 등 옵션·Chat의 스키마 프롬프트를 공유한다).
     content = model_providers.structured_completion().complete(instructions(), payload, StructuredOutput("form_extraction", schema))
@@ -230,7 +236,9 @@ def _finding(item: NumericFinding) -> dict[str, Any]:
             "endOffset": item.end_offset, "text": item.text, "reason": item.reason}
 
 
-def numeric_verification(template: dict, fields: dict, transcript: str, recorded_at: datetime, defaulted: set[str]) -> dict:
+def numeric_verification(
+    template: dict, fields: dict, transcript: str, recorded_at: datetime, defaulted: set[str], extra_sources: tuple[str, ...] = (),
+) -> dict:
     """서식 값의 수치 대조다: 출처에 없는 수치(text 값·상세 텍스트)와 전사문에 있는데 서식에서 빠진 수치.
 
     서비스가 녹음 시각으로 채운 필드는 출처 대조에서 뺀다. 추출에 실패한 서식(빈 ``fields``)은 ``skipped``다.
@@ -246,7 +254,7 @@ def numeric_verification(template: dict, fields: dict, transcript: str, recorded
         text = value.get("detail") if isinstance(value, dict) else value if field["field_type"] == "text" else None
         values.append((key, "text", text))
     verifier = NumericVerifier()
-    findings = verifier.values_not_in_source(values, (transcript,), recorded_at) + verifier.omissions(transcript, fields)
+    findings = verifier.values_not_in_source(values, (transcript, *extra_sources), recorded_at) + verifier.omissions(transcript, fields)
     return {"status": "needs_review" if findings else "ok", "findings": [_finding(item) for item in findings]}
 
 
@@ -263,13 +271,20 @@ def empty_form(template: dict) -> dict:
 
 def extract_form(
     template: dict, sentences: list[str], transcript: str, hints: tuple[dict, ...], trace_id: str, recorded_at: datetime, hints_deferred: bool,
+    emr: EmrContext | None = None,
 ) -> dict:
-    """서식 하나의 전 단계다: 추출 → 정리 → 녹음 시각 채우기 → 수치 대조. 실패하면 빈 서식이다(작업 스레드에서 부른다)."""
+    """서식 하나의 전 단계다: 추출 → 정리 → 녹음 시각 채우기 → 수치 대조. 실패하면 빈 서식이다(작업 스레드에서 부른다).
+
+    EMR이 있으면 LLM 참고 문맥과 수치 대조 출처에 함께 쓴다(EMR에서 옮긴 수치를 출처 없는 수치로 보지 않는다).
+    """
     try:
         with stage(_logger, trace_id, "form_extraction", template_type=template["templateType"], hints=len(hints), hints_deferred=hints_deferred) as metrics:
-            extracted = normalize(template, sentences, extract(sentences, template, hints, recorded_at))
+            arguments = (sentences, template, hints, recorded_at, *((emr,) if emr is not None else ()))
+            extracted = normalize(template, sentences, extract(*arguments))
             defaulted = fill_recording_time(template, extracted, recorded_at)
-            extracted["numericVerification"] = numeric_verification(template, extracted["fields"], transcript, recorded_at, defaulted)
+            extracted["numericVerification"] = numeric_verification(
+                template, extracted["fields"], transcript, recorded_at, defaulted, emr.source_texts() if emr else (),
+            )
             metrics.update(
                 fields=len(extracted["fields"]),
                 filled=sum(_has_answer(value) for value in extracted["fields"].values()),

@@ -19,6 +19,7 @@ from n_note_ai_service_layers.api.deps import (
     get_speech_to_text_provider,
     get_transcript_redactor,
     get_workflow_context_flow,
+    parse_request_emr,
     read_validated_audio,
 )
 from n_note_ai_service_layers.api.routes.workflow_jobs import job_response, prepare_workflow_forms, submit_workflow_job
@@ -161,6 +162,7 @@ async def finish_recording_session(
     """
     services = get_services()
     session = _session(session_id)
+    emr_data = parse_request_emr(body.emr)
     job = services.jobs.get(session.job_id) if session.job_id else None
     if job is None:
         plan = await prepare_workflow_forms(
@@ -169,7 +171,7 @@ async def finish_recording_session(
         )
 
         def submit(transcript) -> str:
-            return submit_workflow_job(plan, PreTranscribedAudio(transcript, session.trace_id, recorded_at=session.started_at), workflow)["job_id"]
+            return submit_workflow_job(plan, PreTranscribedAudio(transcript, session.trace_id, recorded_at=session.started_at, emr=emr_data), workflow)["job_id"]
 
         try:
             job_id, _ = await run_in_threadpool(services.recording_sessions.start_workflow, session, submit)

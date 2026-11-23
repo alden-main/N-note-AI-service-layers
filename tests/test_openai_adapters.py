@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,10 +11,9 @@ from dotenv import load_dotenv
 from n_note_ai_service_layers.adapters.draft_generation import DraftGenerationAdapter
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
-from n_note_ai_service_layers.contracts.clinical_context import Availability, ClinicalContextQuery, ClinicalFact
+from n_note_ai_service_layers.contracts.clinical_context import AuthorizedContext
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
-from n_note_ai_service_layers.services.context_assembler import ClinicalContextAssembler
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayConnectionError
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
 from support import StaticCompletion, sample_form_schema
@@ -72,17 +70,20 @@ class OpenAiAdapterTests(unittest.TestCase):
                 self.payload = payload
                 return DraftResult({"assessment.pain_score": 2})
         schema = sample_form_schema(SchemaStatus.ACTIVE)
-        query = ClinicalContextQuery("p", "e", schema.purpose, datetime.now().astimezone(), schema.schema_id, "trace", schema.version)
-        facts = [ClinicalFact("assessment.pain_score", 2, "2", query.as_of, "test", Availability.AVAILABLE)]
-        snapshot = ClinicalContextAssembler().build(query, facts, schema)
+        context = AuthorizedContext(schema.schema_id, schema.version, "trace")
+        emr = {"patient": {"patientName": "홍길동"}, "bloodPressureList": [{"measuredAt": "2026-09-01 17:31", "sbp": 120, "dbp": 90}]}
         class OfflineGateway:
             class Client:
                 def discover(self, request_id): raise McpGatewayConnectionError("offline")
             gateway = Client()
         generator = FakeGenerator()
-        result = NursingNoteWorkflow(FakeStt(), generator, OfflineGateway()).generate(snapshot, AudioInput(b"x", "x.wav", "audio/wav", "trace"), schema)
+        result = NursingNoteWorkflow(FakeStt(), generator, OfflineGateway()).generate(context, AudioInput(b"x", "x.wav", "audio/wav", "trace", emr=emr), schema)
         self.assertEqual(result.transcript.text, "음성 전사")
         self.assertEqual(generator.payload["transcript"], "음성 전사")
+        # 실제 projector가 EMR 전체를 참고 문맥으로 넣고(식별 정보 제외), 필드 매칭용 facts는 없다.
+        self.assertEqual(generator.payload["emr_context"], [{"key": "bloodPressureList[0]", "value": "measuredAt=2026-09-01 17:31, sbp=120, dbp=90"}])
+        self.assertNotIn("facts", generator.payload)
+        self.assertEqual(result.emr_context, tuple(generator.payload["emr_context"]))
         self.assertEqual(result.draft.proposed_fields["assessment.pain_score"], 2)
         self.assertEqual(result.draft_gateway_verification.status, "unavailable")
 

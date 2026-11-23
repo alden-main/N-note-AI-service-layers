@@ -17,12 +17,13 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.audio_preprocessing import audio_creation_time
-from n_note_ai_service_layers.api.deps import get_transcript_preparation, read_audio
+from n_note_ai_service_layers.api.deps import get_transcript_preparation, parse_request_emr, read_audio
 from n_note_ai_service_layers.contracts.audio import AudioInput
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
 from n_note_ai_service_layers.observability import span
 from n_note_ai_service_layers.services import form_extraction, work_loop
 from n_note_ai_service_layers.services.clock import now_local
+from n_note_ai_service_layers.services.emr_context import EmrContext
 from n_note_ai_service_layers.services.nursing_note_workflow import TranscriptPreparation, WorkflowStageError
 from n_note_ai_service_layers.services.recording_time import parse_recorded_at, resolve_recording_time
 
@@ -55,6 +56,22 @@ _PREPARATION_FAILURES = {
     "stt": (503, "speech transcription is unavailable"),
     "redaction": (503, "transcript de-identification failed"),
 }
+
+
+async def _emr_part(form) -> str | None:
+    """선택 part ``emr``(EMR JSON 객체)다. 텍스트 part 또는 application/json 파일로 받는다."""
+    parts = form.getlist("emr")
+    if len(parts) > 1:
+        raise HTTPException(status_code=422, detail="emr must be a single JSON part")
+    if not parts:
+        return None
+    part = parts[0]
+    if isinstance(part, StarletteUploadFile):
+        try:
+            return (await part.read()).decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=422, detail="emr must be UTF-8 JSON") from None
+    return part
 
 
 def _recorded_at_part(form) -> datetime | None:
@@ -123,7 +140,8 @@ async def _internal_transcription(request: Request, preparation: TranscriptPrepa
     # 녹음 시각: 요청 recorded_at → 음성 메타데이터 생성 시각 → 접수 시각(초안 작업 API와 같은 규칙).
     metadata_time = None if requested_time else await run_in_threadpool(audio_creation_time, content)
     recording = resolve_recording_time(requested_time, metadata_time, received_at)
-    audio = AudioInput(content, file.filename or "audio", file.content_type or "application/octet-stream", trace_id, "ko", recorded_at=recording.value)
+    emr = parse_request_emr(await _emr_part(form))
+    audio = AudioInput(content, file.filename or "audio", file.content_type or "application/octet-stream", trace_id, "ko", recorded_at=recording.value, emr=emr)
     # 공통 단계·서식 추출은 서비스 작업 루프에서 돈다(API 루프는 HTTP만 처리한다).
     return await work_loop.run(_transcribe_and_extract(preparation, audio, templates, trace_id))
 
@@ -142,7 +160,7 @@ async def _transcribe_and_extract(preparation: TranscriptPreparation, audio: Aud
         _require_review(prepared.review.result())
     forms = await _extract_forms(
         templates, prepared.transcript.text, prepared.hints, trace_id, settings.get().form_concurrency,
-        hints_deferred=not reviewed_in_time, recorded_at=prepared.reference_time,
+        hints_deferred=not reviewed_in_time, recorded_at=prepared.reference_time, emr=prepared.emr,
     )
     if not reviewed_in_time:
         _require_review(await prepared.review)
@@ -157,7 +175,7 @@ def _require_review(review: GatewayTermVerificationResult) -> None:
 
 async def _extract_forms(
     templates: list[dict], transcript: str, hints: tuple[dict, ...], trace_id: str, concurrency: int, hints_deferred: bool,
-    recorded_at: datetime | None = None,
+    recorded_at: datetime | None = None, emr: EmrContext | None = None,
 ) -> list[dict]:
     """양식별 추출은 서로 독립이라 동시에 보낸다. 로컬 vLLM은 동시 요청을 묶어 처리하므로 총 시간이 가장 느린 양식 수준이 된다."""
     sentences = form_extraction.split_sentences(transcript)
@@ -168,7 +186,7 @@ async def _extract_forms(
         async with limit:
             # 추출은 동기 LLM 입구(complete)를 쓰므로 스레드에서 부른다.
             return await asyncio.to_thread(
-                form_extraction.extract_form, template, sentences, transcript, hints, trace_id, recorded_at, hints_deferred,
+                form_extraction.extract_form, template, sentences, transcript, hints, trace_id, recorded_at, hints_deferred, emr,
             )
 
     return list(await asyncio.gather(*(extract_form(template) for template in templates)))

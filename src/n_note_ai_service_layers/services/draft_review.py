@@ -83,6 +83,7 @@ class DraftReviewStore:
         numeric_sources: tuple[str, ...] = (),
         reference_time: datetime | None = None,
         llm_applied_term_hints: tuple[dict[str, str], ...] = (),
+        emr_context: tuple[dict[str, str], ...] = (),
     ) -> DraftReviewRecord:
         """초안 생성 결과를 첫 revision으로 저장한다.
 
@@ -96,7 +97,7 @@ class DraftReviewStore:
         record = DraftReviewRecord(
             draft_id, schema.schema_id, schema.version, transcript, candidate_ids, (initial,), candidates, patient_id, encounter_id,
             numeric_sources=numeric_sources or (transcript,), reference_time=reference_time,
-            llm_applied_term_hints=llm_applied_term_hints, created_at=now,
+            llm_applied_term_hints=llm_applied_term_hints, created_at=now, emr_context=emr_context,
         )
         if self.retention_hours:
             # 전사문·환자 ID가 담긴 초안을 무기한 보관하지 않는다.

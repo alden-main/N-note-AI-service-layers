@@ -216,3 +216,6 @@ class RecordingWorkflowRequest(BaseModel):
     schema_id: str | None = Field(default=None, min_length=1)
     schema_ids: list[str] | None = None
     schema_version: str | None = Field(default=None, min_length=1)
+    emr: dict[str, Any] | None = Field(
+        default=None, description="bridge가 보낸 EMR JSON 객체(선택). 식별 정보 키는 빼고 비식별화한 뒤 초안의 참고 문맥으로 쓴다",
+    )

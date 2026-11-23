@@ -120,7 +120,7 @@ class PromptTests(unittest.TestCase):
 
     def test_default_prompt_version_is_bumped(self) -> None:
         adapter = DraftGenerationAdapter(StaticCompletion(), "m")
-        self.assertEqual(adapter._prompt_version, "draft-v3")
+        self.assertEqual(adapter._prompt_version, "draft-v4")
 
     def test_prompt_guards_measurements_placement_and_interpretation(self) -> None:
         # 벤치마크(openai-baseline)에서 활력징후 누락·해석 추가·'담당의 보고'를 평가 항목에 넣던 문제에 대한 지침이다.

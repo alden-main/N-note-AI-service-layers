@@ -20,6 +20,7 @@ from n_note_ai_service_layers.services import work_loop
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.draft_document import DraftDocument, is_filled
 from n_note_ai_service_layers.services.draft_token_scrub import scrub_privacy_tokens
+from n_note_ai_service_layers.services.emr_context import EmrContext, prepare_emr
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.llm_payload import LlmPayloadProjector
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayError
@@ -27,6 +28,7 @@ from n_note_ai_service_layers.services.numeric_verification import NumericVerifi
 from n_note_ai_service_layers.services.recording_time import format_for_field
 from n_note_ai_service_layers.services.report_validation import FormReportValidationFlow
 from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
+from n_note_ai_service_layers.settings import DEFAULT_EMR_IDENTIFIER_KEYS
 
 MAX_TERM_HINTS = 50
 _logger = get_logger("workflow")
@@ -55,6 +57,8 @@ class NursingNoteWorkflowResult:
     reference_time: datetime | None = None
     # LLM이 용어 힌트를 받아 초안에 바로 반영한 교정이다. 후보 승인을 거치지 않았으므로 따로 보여준다.
     llm_applied_term_hints: tuple[dict[str, str], ...] = ()
+    # 초안에 참고 문맥으로 준 EMR({"key", "value"}, 비식별화 후)이다. EMR이 없으면 비어 있다.
+    emr_context: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,8 @@ class PreparedTranscript:
     reference_time: datetime
     # 전사문 검토다(작업 루프의 asyncio 작업). 힌트 대기 상한을 넘겼으면 아직 진행 중이며, 초안 단계가 결과를 받는다.
     review: asyncio.Future[GatewayTermVerificationResult]
+    # 함께 온 EMR을 비식별화·평탄화한 참고 문맥이다(없으면 None). 모든 양식이 함께 쓴다.
+    emr: EmrContext | None = None
 
 
 class TranscriptPreparation:
@@ -87,8 +93,10 @@ class TranscriptPreparation:
         gateway_verification: GatewayTermVerificationFlow,
         redactor: TranscriptRedactor | None = None,
         hint_budget_seconds: float | None = None,
+        emr_identifier_keys: tuple[str, ...] = DEFAULT_EMR_IDENTIFIER_KEYS,
     ) -> None:
         self.stt = stt
+        self.emr_identifier_keys = emr_identifier_keys
         self.gateway_verification = gateway_verification
         self.redactor = redactor or TranscriptRedactor()
         # None이면 전사문 검토가 끝날 때까지 기다린다.
@@ -125,11 +133,17 @@ class TranscriptPreparation:
         await notify_async(notify, "redaction")
         with stage(_logger, trace_id, "redaction") as metrics:
             try:
-                redacted = await asyncio.to_thread(self.redactor.redact, transcript.text, identifiers)
+                # EMR을 먼저 정리한다. EMR의 식별 정보 값(환자 이름 등)은 전사문에서도 가린다.
+                emr, emr_identifiers = await asyncio.to_thread(prepare_emr, audio.emr, self.redactor, identifiers, self.emr_identifier_keys)
+                redacted = await asyncio.to_thread(
+                    self.redactor.redact, transcript.text, (*identifiers, *emr_identifiers.identifiers), emr_identifiers.names,
+                )
             except Exception as exc:
-                # NER 실패 시 덜 가린 전사문을 외부로 보내지 않고 중단한다.
+                # NER 실패 시 덜 가린 전사문·EMR을 외부로 보내지 않고 중단한다.
                 raise WorkflowStageError("redaction") from exc
             metrics["replacements"] = redacted.replacement_count
+            if emr is not None:
+                metrics.update(emr_entries=len(emr.entries), emr_identifier_keys_removed=emr.removed_identifier_keys, emr_replacements=emr.replacements)
         external_transcript = Transcript(redacted.text, transcript.provider, transcript.model, transcript.language)
         await notify_async(notify, "transcript_term_review")
         catalog = await asyncio.to_thread(self._discover, trace_id)
@@ -144,7 +158,7 @@ class TranscriptPreparation:
             )
         return PreparedTranscript(
             trace_id, external_transcript, redacted.replacement_count, catalog,
-            self.hints(hint_source) if hint_source else (), audio.recorded_at or now_local(), review,
+            self.hints(hint_source) if hint_source else (), audio.recorded_at or now_local(), review, emr,
         )
 
     async def _review(self, text: str, trace_id: str, catalog: tuple[dict[str, Any], ...] | None) -> GatewayTermVerificationResult:
@@ -203,27 +217,28 @@ class NursingNoteWorkflow:
         report_validation: FormReportValidationFlow | None = None,
         projector: LlmPayloadProjector | None = None,
         hint_budget_seconds: float | None = None,
+        emr_identifier_keys: tuple[str, ...] = DEFAULT_EMR_IDENTIFIER_KEYS,
     ) -> None:
         self.generator = generator
         self.gateway_verification = gateway_verification
         self.report_validation = report_validation
         self.projector = projector or LlmPayloadProjector()
-        self.preparation = TranscriptPreparation(stt, gateway_verification, redactor, hint_budget_seconds)
+        self.preparation = TranscriptPreparation(stt, gateway_verification, redactor, hint_budget_seconds, emr_identifier_keys)
 
     def generate(
-        self, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
+        self, context, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
         progress: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
         """``agenerate``의 동기 입구다(스크립트·테스트용)."""
-        return work_loop.run_sync(self.agenerate(snapshot, audio, schema, known_identifiers, progress))
+        return work_loop.run_sync(self.agenerate(context, audio, schema, known_identifiers, progress))
 
     async def agenerate(
-        self, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
+        self, context, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
         progress: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
         """``progress``는 각 단계(stt, redaction, transcript_term_review, draft_generation, draft_review)를 시작할 때 호출된다."""
         notify = progress or _ignore
-        return await self.adraft(await self.preparation.aprepare(audio, known_identifiers, notify), snapshot, schema, notify)
+        return await self.adraft(await self.preparation.aprepare(audio, known_identifiers, notify), context, schema, notify)
 
     def generate_many(
         self,
@@ -251,7 +266,7 @@ class NursingNoteWorkflow:
         """음성 하나로 여러 양식의 초안을 만든다.
 
         STT·비식별화·전사문 용어 검토는 한 번만 하고, 양식별 초안 생성·수치 대조·초안 검토는
-        ``max_parallel``개까지 동시에 실행한다. ``forms``는 (양식, 그 양식의 임상 문맥) 목록이다.
+        ``max_parallel``개까지 동시에 실행한다. ``forms``는 (양식, 그 양식의 승인된 요청 문맥) 목록이다.
 
         공통 단계가 실패하면 ``WorkflowStageError``를 던진다. 양식 하나의 실패는 다른 양식에 영향을 주지 않고
         결과 목록의 그 자리에 예외로 남는다(초안 생성 실패는 ``WorkflowStageError``).
@@ -267,40 +282,44 @@ class NursingNoteWorkflow:
         await notify_async(notify, "draft_generation")
         limit = asyncio.Semaphore(max(1, min(len(forms), max_parallel)))
 
-        async def run(index: int, schema: FormSchema, snapshot: Any) -> NursingNoteWorkflowResult | Exception:
+        async def run(index: int, schema: FormSchema, context: Any) -> NursingNoteWorkflowResult | Exception:
             async with limit:
                 outcome: NursingNoteWorkflowResult | Exception
                 try:
-                    outcome = await self.adraft(prepared, snapshot, schema, lambda name: form_stage(index, name))
+                    outcome = await self.adraft(prepared, context, schema, lambda name: form_stage(index, name))
                 except Exception as exc:  # 한 양식의 실패가 다른 양식의 결과를 버리지 않게 결과로 돌려준다.
                     outcome = exc
                 await notify_async(form_done, index, outcome)
                 return outcome
 
-        return list(await asyncio.gather(*(run(index, schema, snapshot) for index, (schema, snapshot) in enumerate(forms))))
+        return list(await asyncio.gather(*(run(index, schema, context) for index, (schema, context) in enumerate(forms))))
 
     def draft(
-        self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None = None,
+        self, prepared: PreparedTranscript, context, schema: FormSchema, notify: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
         """``adraft``의 동기 입구다(스크립트·테스트용)."""
-        return work_loop.run_sync(self.adraft(prepared, snapshot, schema, notify))
+        return work_loop.run_sync(self.adraft(prepared, context, schema, notify))
 
     async def adraft(
-        self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None = None,
+        self, prepared: PreparedTranscript, context, schema: FormSchema, notify: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
         """양식 하나의 단계다: 검토 힌트를 포함한 초안 생성 → 수치 대조 → (초안 용어 검토 ∥ 양식 완결성 검증)."""
         # 양식별 span이다. 여러 양식을 동시에 만들 때 추적 화면에서 양식마다 한 갈래로 보인다.
         with span("form_draft", prepared.trace_id, schema_id=schema.schema_id, schema_version=schema.version):
-            return await self._draft(prepared, snapshot, schema, notify or _ignore)
+            return await self._draft(prepared, context, schema, notify or _ignore)
 
     async def _draft(
-        self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None],
+        self, prepared: PreparedTranscript, context, schema: FormSchema, notify: Callable[[str], None],
     ) -> NursingNoteWorkflowResult:
         trace_id, transcript, hints = prepared.trace_id, prepared.transcript, prepared.hints
         await notify_async(notify, "draft_generation")
         with stage(_logger, trace_id, "draft_generation", schema_id=schema.schema_id) as metrics:
             try:
-                payload = self.projector.project(snapshot, transcript.text, schema, term_review_hints=hints, reference_time=prepared.reference_time)
+                # EMR이 있을 때만 넘긴다(EMR 없는 요청은 이전과 같은 입력이다).
+                extra = {"emr": prepared.emr} if prepared.emr is not None else {}
+                payload = self.projector.project(
+                    context, transcript.text, schema, term_review_hints=hints, reference_time=prepared.reference_time, **extra,
+                )
                 draft = await self._generate(payload, schema)
             except Exception as exc:
                 raise WorkflowStageError("draft_generation") from exc
@@ -313,7 +332,7 @@ class NursingNoteWorkflow:
             metrics.update(fields=len(draft.proposed_fields), hints=len(hints))
         # 힌트 대기 상한을 넘긴 검토도 화면의 검토 후보로는 필요하다. Gateway timeout 안에 끝난다.
         transcript_gateway = await prepared.review
-        sources = self.numeric_sources(transcript.text, payload)
+        sources = self.numeric_sources(transcript.text, payload, prepared.emr)
         numeric_findings = NumericVerifier().check(schema, draft.proposed_fields, sources, prepared.reference_time, transcript=transcript.text)
         document = DraftDocument.build(schema, draft.proposed_fields)
         await notify_async(notify, "draft_review")
@@ -324,6 +343,7 @@ class NursingNoteWorkflow:
             transcript, draft, transcript_gateway, draft_gateway, prepared.redaction_count,
             report_validation=validation, numeric_findings=numeric_findings, numeric_sources=sources, reference_time=prepared.reference_time,
             llm_applied_term_hints=self.applied_hints(hints, transcript.text, document.text),
+            emr_context=tuple(prepared.emr.payload()) if prepared.emr else (),
         )
 
     async def _generate(self, payload: dict[str, Any], schema: FormSchema) -> DraftResult:
@@ -352,10 +372,9 @@ class NursingNoteWorkflow:
         return draft_gateway, validation
 
     @staticmethod
-    def numeric_sources(transcript: str, payload: dict[str, Any]) -> tuple[str, ...]:
-        """수치 대조 출처다: LLM에 준 전사문과 사용 가능한 사실 값이다."""
-        facts = tuple(str(item["value"]) for item in payload.get("facts", []) if item.get("value") is not None)
-        return (transcript, *facts)
+    def numeric_sources(transcript: str, payload: dict[str, Any], emr: EmrContext | None = None) -> tuple[str, ...]:
+        """수치 대조 출처다: LLM에 준 전사문과 EMR 참고 문맥이다."""
+        return (transcript, *(emr.source_texts() if emr else ()))
 
     @staticmethod
     def applied_hints(hints: tuple[dict[str, Any], ...], transcript: str, draft_text: str) -> tuple[dict[str, str], ...]:

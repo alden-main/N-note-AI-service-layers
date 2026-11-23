@@ -69,6 +69,9 @@ class DraftReviewRecord:
     # 후보 승인 절차를 거치지 않은 교정이므로 검토 화면과 확정본에 남긴다.
     llm_applied_term_hints: tuple[dict[str, str], ...] = ()
     created_at: IsoDatetime | None = None
+    # 초안에 참고 문맥으로 준 EMR({"key", "value"}, 식별 정보 제거·비식별화 후)이다. 근거 ``emr:<key>``를 검토 화면에서 보여 준다.
+    # 원본 EMR은 저장하지 않는다. 보관 기간은 초안과 같다.
+    emr_context: tuple[dict[str, str], ...] = ()
 
     def candidate(self, candidate_id: str) -> DraftCandidate | None:
         return next((item for item in self.candidates if item.candidate_id == candidate_id), None)

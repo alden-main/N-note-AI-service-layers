@@ -47,7 +47,7 @@ class PromptCatalogTests(unittest.TestCase):
         source = prompts.DEFAULT_PROMPTS_FILE.read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as directory:
             variant = Path(directory) / "variant.toml"
-            variant.write_text(source.replace('version = "draft-v3"', 'version = "draft-v99"'), encoding="utf-8")
+            variant.write_text(source.replace('version = "draft-v4"', 'version = "draft-v99"'), encoding="utf-8")
             broken = Path(directory) / "broken.toml"
             broken.write_text("[draft]\nversion = \"x\"\n", encoding="utf-8")
             with mock.patch.dict(os.environ, {prompts.PROMPTS_FILE_ENV: str(variant)}):

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 
 class AudioDecodeError(ValueError):
@@ -28,6 +29,8 @@ class AudioInput:
     language_hint: str | None = None
     preceding_text: str | None = None
     recorded_at: datetime | None = None
+    # 음성과 함께 온 EMR JSON(검증만 한 원본)이다. 작업 메모리로만 넘기고 저장하지 않는다(``services.emr_context``).
+    emr: dict[str, Any] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -68,3 +71,5 @@ class PreTranscribedAudio:
     transcript: Transcript
     trace_id: str
     recorded_at: datetime | None = None
+    # 함께 온 EMR JSON(검증만 한 원본)이다. ``AudioInput.emr``과 같다.
+    emr: dict[str, Any] | None = field(default=None, repr=False)

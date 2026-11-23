@@ -48,6 +48,17 @@ DEFAULT_PDF_FONT_CANDIDATES = (
     "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
 )
 DEFAULT_TIMEZONE = "Asia/Seoul"
+# EMR 식별 정보 키 기본 목록이다(``services.emr_context``와 같은 값). settings가 서비스 모듈을 import하지 않도록 여기 둔다.
+DEFAULT_EMR_IDENTIFIER_KEYS = (
+    "patientid", "patientname", "patientno", "name", "fullname", "성명", "이름", "환자명", "환자이름", "환자번호",
+    "doctorid", "doctorname", "physicianname", "nurseid", "nursename", "staffid", "staffname", "의사명", "담당의", "간호사명",
+    "guardianname", "guardianphone", "보호자", "보호자명", "보호자이름", "보호자연락처",
+    "residentnumber", "residentregistrationnumber", "rrn", "ssn", "주민등록번호", "주민번호",
+    "phone", "phonenumber", "mobile", "mobilenumber", "cellphone", "tel", "telephone", "연락처", "전화번호", "휴대폰", "휴대전화",
+    "address", "addr", "zipcode", "postalcode", "주소", "우편번호", "email", "이메일",
+    "birthdate", "dateofbirth", "dob", "생년월일",
+    "chartno", "chartnumber", "mrn", "medicalrecordnumber", "등록번호", "병록번호", "encounterid", "visitid", "admissionid",
+)
 # tzdata가 없는 최소 이미지에서도 병동 시각을 잃지 않도록 고정 오프셋을 둔다(서머타임 없는 지역만).
 _FIXED_OFFSET_ZONES = {"Asia/Seoul": timezone(timedelta(hours=9), "KST")}
 # 비우면 '사용하지 않음'을 뜻하는 환경 변수다. 나머지는 빈 값을 미설정(기본값)으로 본다.
@@ -171,6 +182,13 @@ class Settings(BaseSettings):
     state_db_path: Path | None = Field(None, validation_alias="N_NOTE_STATE_DB")
     # 확정 전 초안(전사문·환자 ID 포함)을 보관하는 시간이다. 지나면 삭제한다.
     draft_retention_hours: PositiveFloat = 72.0
+
+    # bridge가 음성과 함께 보내는 EMR JSON의 상한이다(넘으면 422). 원본은 저장하지 않는다.
+    emr_max_bytes: PositiveInt = 64 * 1024
+    emr_max_entries: PositiveInt = 500
+    emr_max_depth: PositiveInt = 6
+    # 값을 LLM에 보내지 않을 EMR 식별 정보 키다(쉼표 구분, 대소문자·_·-·공백 무시). 비우면 기본 목록을 쓴다.
+    emr_identifier_keys: Names = Field(DEFAULT_EMR_IDENTIFIER_KEYS, validation_alias="N_NOTE_EMR_IDENTIFIER_KEYS")
 
     # 앞단(브리지·인증 프록시)이 인증한 사용자 ID를 전달하는 헤더 이름이다.
     user_header: str = "X-Authenticated-User"
