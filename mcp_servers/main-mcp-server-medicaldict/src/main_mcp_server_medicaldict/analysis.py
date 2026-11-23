@@ -121,7 +121,8 @@ class DocumentAnalyzer:
             raise ValidationError("text는 비어 있지 않은 문자열이어야 합니다.")
         if len(text) > 100_000:
             raise ValidationError("text는 100,000자 이하여야 합니다.")
-        suggestions, truncated = self._exact_suggestions(text)
+        # 겹치는 n-gram이 같은 표현을 반복 조회하므로 이 분석 안에서만 결과를 재사용한다.
+        suggestions, truncated = self._exact_suggestions(text, _memoized_lookup(self._dictionary.find_exact))
         result = AnalysisResult(
             str(uuid4()),
             self._dictionary.version,
@@ -155,12 +156,13 @@ class DocumentAnalyzer:
         for (start, end), terms in by_range.items():
             candidates.append(DocumentTermCandidate(str(uuid4()), start + document_offset, end + document_offset, CandidateType.EXACT_MATCH, terms))
             seen_ranges.add((start, end))
-        for start, end, source, base in self._variant_expressions(text, find_exact):
+        tokens = self._token_expressions(text)
+        for start, end, source, base in self._variant_expressions(tokens, find_exact):
             terms = find_exact(base)
             if terms:
                 candidates.append(DocumentTermCandidate(str(uuid4()), start + document_offset, end + document_offset, CandidateType.VARIANT_MATCH, terms))
                 seen_ranges.add((start, end))
-        for start, end, source in self._token_expressions(text):
+        for start, end, source in tokens:
             if (start, end) in seen_ranges:
                 continue
             base, similar = self._typo_terms(source, find_exact)
@@ -196,10 +198,9 @@ class DocumentAnalyzer:
         return source != name and len(source) == len(name) and jamo_similarity(source, name) >= MIN_TYPO_JAMO_SIMILARITY
 
     def _exact_suggestions(
-        self, text: str, find_exact: Callable[[str], list[DictionaryTerm]] | None = None,
+        self, text: str, find_exact: Callable[[str], list[DictionaryTerm]],
     ) -> tuple[list[Suggestion], bool]:
         """정확 일치 결과를 상한까지 만들고, 초과 여부를 함께 반환한다."""
-        find_exact = find_exact or self._dictionary.find_exact
         suggestions: list[Suggestion] = []
         seen: set[tuple[int, int, str, str, str]] = set()
         truncated = False
@@ -251,10 +252,13 @@ class DocumentAnalyzer:
         pattern = r"[가-힣]{2,}|[A-Za-z][A-Za-z0-9()/.+\-]*(?:\s+[A-Za-z][A-Za-z0-9()/.+\-]*)*(?:은|는|을|를|이|가|의|와|과|도|에|에서|으로|로)?"
         return [(match.start(), match.end(), match.group()) for match in re.finditer(pattern, text)]
 
-    def _variant_expressions(self, text: str, find_exact: Callable[[str], list[DictionaryTerm]]) -> list[tuple[int, int, str, str]]:
+    @staticmethod
+    def _variant_expressions(
+        tokens: list[tuple[int, int, str]], find_exact: Callable[[str], list[DictionaryTerm]],
+    ) -> list[tuple[int, int, str, str]]:
         """조사·어미가 결합했으나 기본 표기가 사전에 있는 후보를 만든다."""
         variants: list[tuple[int, int, str, str]] = []
-        for start, end, source in self._token_expressions(text):
+        for start, end, source in tokens:
             for suffix in _PARTICLES:
                 if source.endswith(suffix) and len(source) > len(suffix) + 1:
                     base = source[:-len(suffix)]

@@ -6,6 +6,9 @@ import sqlite3
 import threading
 import unittest
 import asyncio
+import json
+import logging
+from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -18,7 +21,7 @@ from main_mcp_server_medicaldict.analysis import DocumentAnalyzer, SuggestionVal
 from main_mcp_server_medicaldict.dictionary import DictionaryRepository
 from main_mcp_server_medicaldict.models import AnalysisStatus, CandidateType, DecisionStatus, IssueType, MatchType
 from main_mcp_server_medicaldict.store import AnalysisStore, StoreError
-from main_mcp_server_medicaldict.server import create_server
+from main_mcp_server_medicaldict.server import SERVICE_VERSION, create_server
 
 
 ROOT = Path(__file__).parents[1]
@@ -191,19 +194,19 @@ class MedicalDictionaryTests(unittest.TestCase):
 
             success = asyncio.run(call({"text": "당뇨병"}))
             self.assertFalse(success.isError)
-            self.assertIn("result", success.structuredContent or {})
-            candidate = success.structuredContent["result"]["candidates"][0]
+            self.assertNotIn("result", success.structuredContent or {})  # {"result": ...}로 감싸지 않는다
+            candidate = success.structuredContent["candidates"][0]
             self.assertTrue({"start_offset", "end_offset", "candidate_type"}.issubset(candidate))
 
             too_large = asyncio.run(call({"text": "가나다라마바사"}))
             self.assertTrue(too_large.isError)
-            self.assertEqual(too_large.structuredContent["result"]["error"], {
+            self.assertEqual(too_large.structuredContent["error"], {
                 "code": "request_too_large", "message": "text는 3자 이하여야 합니다.", "retryable": False,
             })
 
             invalid = asyncio.run(call({"text": 1}))
             self.assertTrue(invalid.isError)
-            self.assertEqual(invalid.structuredContent["result"]["error"]["code"], "invalid_input")
+            self.assertEqual(invalid.structuredContent["error"]["code"], "invalid_input")
 
     def test_unready_dictionary_returns_503_health_and_tool_error(self) -> None:
         """활성 사전이 없으면 health와 도구가 준비되지 않음만 노출한다."""
@@ -224,7 +227,7 @@ class MedicalDictionaryTests(unittest.TestCase):
                 params=types.CallToolRequestParams(name="analyze_document_terms", arguments={"text": "당뇨병"}),
             ))).root
             self.assertTrue(result.isError)
-            self.assertEqual(result.structuredContent["result"]["error"]["code"], "dictionary_unavailable")
+            self.assertEqual(result.structuredContent["error"]["code"], "dictionary_unavailable")
 
     def test_installed_mcp_supports_gateway_protocol_version(self) -> None:
         """사용 중인 MCP 런타임이 Gateway의 2025-06-18 세션 협상을 지원한다."""
@@ -320,3 +323,112 @@ class MedicalDictionaryTests(unittest.TestCase):
             status, still_running = asyncio.run(scenario())
         self.assertEqual(status, 200)
         self.assertTrue(still_running)
+
+    def test_exact_analysis_looks_up_each_expression_once(self) -> None:
+        """정확 일치 분석도 겹치는 n-gram의 같은 표현을 한 번만 조회한다."""
+        with patch.object(self.repository, "find_exact", wraps=self.repository.find_exact) as find_exact:
+            DocumentAnalyzer(self.repository).analyze("당뇨병 당뇨병 당뇨병 고혈압 당뇨병")
+        counts = Counter(call.args[0] for call in find_exact.call_args_list)
+        self.assertTrue(counts)
+        self.assertEqual(max(counts.values()), 1)
+
+    def test_store_reuses_one_connection_per_thread_and_rolls_back_failures(self) -> None:
+        """이력 저장소는 thread별 연결을 재사용하고, 실패한 쓰기는 트랜잭션 단위로 되돌린다."""
+        result = DocumentAnalyzer(self.repository).analyze("당뇨병")
+        with TemporaryDirectory() as directory:
+            store = AnalysisStore(Path(directory) / "history.sqlite")
+            with patch("main_mcp_server_medicaldict.store.sqlite3.connect", wraps=sqlite3.connect) as connect:
+                store.save(result)
+                store.get(result.analysis_id)
+                store.check_ready()
+            self.assertEqual(connect.call_count, 0)
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.save(result)  # 같은 analysis_id 재저장은 전체가 롤백된다.
+            self.assertEqual(len(store.get(result.analysis_id).suggestions), len(result.suggestions))
+            other: list[int] = []
+            thread = threading.Thread(target=lambda: other.append(id(store._connect())))
+            thread.start()
+            thread.join()
+            self.assertNotEqual(other[0], id(store._connect()))
+            # 다른 thread의 연결에서도 커밋된 쓰기가 보인다.
+            seen: list[bool] = []
+            thread = threading.Thread(target=lambda: seen.append(store.get(result.analysis_id) is not None))
+            thread.start()
+            thread.join()
+            self.assertEqual(seen, [True])
+
+    def test_tool_calls_do_not_recheck_readiness_after_initialization(self) -> None:
+        """준비 확인(DB 질의)은 /healthz에서만 하고 도구 호출은 초기화된 구성 요소를 재사용한다."""
+        with TemporaryDirectory() as directory, \
+                patch.object(DictionaryRepository, "check_ready") as dictionary_ready, \
+                patch.object(AnalysisStore, "check_ready") as store_ready, \
+                patch.object(AnalysisStore, "__init__", side_effect=AnalysisStore.__init__, autospec=True) as store_init:
+            server = create_server(ROOT / "data/dictionary-snapshots", Path(directory) / "history.sqlite")
+            handler = server._mcp_server.request_handlers[types.CallToolRequest]
+
+            async def calls() -> list[types.CallToolResult]:
+                return [
+                    (await handler(types.CallToolRequest(params=types.CallToolRequestParams(name=name, arguments=arguments)))).root
+                    for name, arguments in (
+                        ("analyze_document_terms", {"text": "당뇨병"}),
+                        ("search_medical_terms", {"query": "당뇨병"}),
+                        ("get_analysis", {"analysis_id": "missing"}),
+                    )
+                ]
+
+            results = asyncio.run(calls())
+        self.assertFalse(results[0].isError)
+        self.assertFalse(results[1].isError)
+        self.assertEqual(results[2].structuredContent["error"]["code"], "analysis_not_found")
+        self.assertEqual((dictionary_ready.call_count, store_ready.call_count, store_init.call_count), (0, 0, 1))
+
+    def test_error_envelope_matches_gateway_contract(self) -> None:
+        """오류는 kodict·document-analysis와 같이 structuredContent와 content text 모두 최상위 ``error``다."""
+        with TemporaryDirectory() as directory:
+            server = create_server(ROOT / "data/dictionary-snapshots", Path(directory) / "history.sqlite")
+            handler = server._mcp_server.request_handlers[types.CallToolRequest]
+            result = asyncio.run(handler(types.CallToolRequest(
+                params=types.CallToolRequestParams(name="get_analysis", arguments={"analysis_id": "missing"}),
+            ))).root
+        self.assertTrue(result.isError)
+        expected = {"code": "analysis_not_found", "message": "분석을 찾을 수 없습니다.", "retryable": False}
+        self.assertEqual(result.structuredContent, {"error": expected})
+        self.assertEqual(json.loads(result.content[0].text), {"error": expected})
+
+    def test_tools_publish_no_output_schema_and_success_is_not_wrapped(self) -> None:
+        """도구는 출력 스키마를 공개하지 않고(structured_output=False), 성공 결과를 그대로 structuredContent에 담는다."""
+        with TemporaryDirectory() as directory:
+            server = create_server(ROOT / "data/dictionary-snapshots", Path(directory) / "history.sqlite")
+            tools = asyncio.run(server.list_tools())
+            handler = server._mcp_server.request_handlers[types.CallToolRequest]
+            result = asyncio.run(handler(types.CallToolRequest(
+                params=types.CallToolRequestParams(name="search_medical_terms", arguments={"query": "당뇨", "limit": 2}),
+            ))).root
+        self.assertEqual({tool.name: tool.outputSchema for tool in tools if tool.outputSchema is not None}, {})
+        self.assertFalse(result.isError)
+        self.assertTrue({"search_result_id", "dictionary_version", "results"}.issubset(result.structuredContent))
+        self.assertEqual(json.loads(result.content[0].text), result.structuredContent)
+
+    def test_audit_log_uses_gateway_request_id_header(self) -> None:
+        """감사 로그는 Gateway의 X-Request-ID를 JSON-RPC id보다 우선하고 패키지 버전을 남긴다."""
+        with TemporaryDirectory() as directory:
+            server = create_server(ROOT / "data/dictionary-snapshots", Path(directory) / "history.sqlite")
+
+            async def call() -> httpx.Response:
+                app = server.streamable_http_app()
+                async with server.session_manager.run():
+                    transport = httpx.ASGITransport(app=app)
+                    # 기본 DNS rebinding 보호가 localhost Host만 허용한다.
+                    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8000") as client:
+                        return await client.post(
+                            "/mcp",
+                            json={"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "get_analysis", "arguments": {"analysis_id": "missing"}}},
+                            headers={"Accept": "application/json, text/event-stream", "X-Request-ID": "gw-123\nforged", "MCP-Protocol-Version": "2025-06-18"},
+                        )
+
+            with self.assertLogs("medical_term_review.audit", level=logging.INFO) as logs:
+                response = asyncio.run(call())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("request_id=gw-123forged tool=get_analysis result_code=analysis_not_found", logs.output[0])
+        self.assertIn(f"service_version={SERVICE_VERSION}", logs.output[0])
+        self.assertNotEqual(SERVICE_VERSION, "unknown")

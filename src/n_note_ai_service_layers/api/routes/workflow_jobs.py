@@ -120,15 +120,25 @@ def _save_draft(result: NursingNoteWorkflowResult, schema: FormSchema, trace_id:
 def _workflow_job(
     workflow: NursingNoteWorkflow, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, patient_id: str, encounter_id: str,
 ):
-    """작업 스레드에서 실행할 함수다: 초안 생성 → 초안 검토 레코드 저장 → 결과 사전."""
-    def work(progress: Progress) -> dict[str, Any]:
+    """작업 루프에서 실행할 함수다: 초안 생성 → 초안 검토 레코드 저장 → 결과 사전."""
+    async def work(progress: Progress) -> dict[str, Any]:
         try:
-            result = workflow.generate(snapshot, audio, schema, known_identifiers=(patient_id, encounter_id), progress=progress)
+            result = await _call_workflow(
+                workflow, "generate", snapshot, audio, schema, known_identifiers=(patient_id, encounter_id), progress=progress,
+            )
         except WorkflowStageError as exc:
             raise JobFailure(*stage_failure(exc)) from exc
-        progress("saving_draft")
-        return _save_draft(result, schema, audio.trace_id, patient_id, encounter_id)
+        await asyncio.to_thread(progress, "saving_draft")
+        return await asyncio.to_thread(_save_draft, result, schema, audio.trace_id, patient_id, encounter_id)
     return work
+
+
+async def _call_workflow(workflow: Any, name: str, *args: Any, **kwargs: Any) -> Any:
+    """async 워크플로(``agenerate``·``agenerate_many``)는 작업 루프에서 기다리고, 동기 대역(테스트)은 스레드에서 부른다."""
+    asynchronous = getattr(workflow, f"a{name}", None)
+    if asynchronous is not None:
+        return await asynchronous(*args, **kwargs)
+    return await asyncio.to_thread(getattr(workflow, name), *args, **kwargs)
 
 
 def _multi_form_workflow_job(
@@ -146,7 +156,7 @@ def _multi_form_workflow_job(
             states[index] = {**states[index], **changes}
             jobs.update(job_id, forms=states)
 
-    def work(progress: Progress) -> dict[str, Any]:
+    async def work(progress: Progress) -> dict[str, Any]:
         def notify(stage: str) -> None:
             with lock:
                 progress(stage)
@@ -169,16 +179,15 @@ def _multi_form_workflow_job(
             update_form(index, status="failed", stage=None, error={"code": code, "message": message})
 
         try:
-            workflow.generate_many(
-                audio, forms, known_identifiers=(patient_id, encounter_id), progress=notify,
+            await _call_workflow(
+                workflow, "generate_many", audio, forms, known_identifiers=(patient_id, encounter_id), progress=notify,
                 on_form_stage=on_stage, on_form_done=on_done, max_parallel=settings.get().form_concurrency,
             )
         except WorkflowStageError as exc:
             raise JobFailure(*stage_failure(exc)) from exc
         if not any(responses):
             raise JobFailure("all_forms_failed", "every selected form failed; see forms[].error")
-        with lock:
-            states = (jobs.get(job_id) or {}).get("forms") or []
+        states = await asyncio.to_thread(lambda: (jobs.get(job_id) or {}).get("forms") or [])
         return {
             "trace_id": audio.trace_id,
             "forms": [
@@ -266,15 +275,18 @@ async def prepare_workflow_forms(
         requested = [(schema_id, schema_version)]
     forms: list[tuple[FormSchema, Any]] = []
     resolved_purpose = purpose
-    for form_id, version in requested:
+    def resolve(form_id: str | None, version: str | None) -> tuple[FormSchema, Any, str]:
+        # 양식 레지스트리는 저장소(SQLite) 변경을 확인하므로 API 이벤트 루프가 아니라 스레드에서 부른다.
         form_id, form_purpose = resolve_workflow_form(form_id, purpose)
-        resolved_purpose = form_purpose
         query = ClinicalContextQuery(patient_id, encounter_id, form_purpose, now_utc(), form_id, trace_id, version)
         try:
-            snapshot = await run_in_threadpool(context_flow.build, query)
-            selected_schema = context_flow.registry.resolve_active(form_id, form_purpose, version)
+            snapshot = context_flow.build(query)
+            return context_flow.registry.resolve_active(form_id, form_purpose, version), snapshot, form_purpose
         except (PermissionError, LookupError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="workflow schema or context is not available") from exc
+
+    for form_id, version in requested:
+        selected_schema, snapshot, resolved_purpose = await run_in_threadpool(resolve, form_id, version)
         forms.append((selected_schema, snapshot))
     return WorkflowPlan(trace_id, patient_id, encounter_id, tuple(forms), bool(schema_ids), resolved_purpose)
 

@@ -112,8 +112,12 @@ class SqliteDocumentStore:
 
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
+        # 쓰기는 연결 하나를 lock으로 직렬화한다(조건부 UPDATE의 원자성). 읽기는 스레드마다 연결을 따로 둬 WAL의
+        # 동시 읽기를 쓴다(작업 루프의 여러 스레드가 작업 상태를 읽어도 쓰기 lock에 줄 서지 않는다).
         self._connection = sqlite3.connect(str(path), check_same_thread=False, timeout=30, isolation_level=None)
         self._lock = threading.Lock()
+        self._readers = threading.local()
         with self._lock:
             self._initialize()
 
@@ -134,9 +138,16 @@ class SqliteDocumentStore:
                     raise
                 time.sleep(0.1 + 0.05 * attempt)
 
+    def _reader(self) -> sqlite3.Connection:
+        connection = getattr(self._readers, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(str(self._path), timeout=30, isolation_level=None)
+            self._readers.connection = connection
+        return connection
+
     def _rows(self, sql: str, params: tuple[Any, ...]) -> Iterator[tuple[Any, ...]]:
-        with self._lock:
-            return iter(self._connection.execute(sql, params).fetchall())
+        """읽기 전용 질의다. 자동 커밋 모드라 문장마다 최신 커밋을 본다."""
+        return iter(self._reader().execute(sql, params).fetchall())
 
     def get(self, collection: str, key: str) -> StoredDocument | None:
         row = next(self._rows("SELECT key, version, payload, updated_at FROM documents WHERE collection = ? AND key = ?", (collection, key)), None)

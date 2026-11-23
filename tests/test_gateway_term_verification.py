@@ -249,3 +249,48 @@ class GatewayPayloadContractTests(unittest.TestCase):
         self.assertEqual(parse(candidate)[0].suggestions[0].text, "당뇨병")
         self.assertIsNone(parse({**candidate, "automatic_correction": True}))
         self.assertIsNone(parse({**candidate, "terms": [{"kor_name": "당뇨병"}]}))
+
+
+class MedicEnvelopeCompatibilityTests(unittest.TestCase):
+    """medic의 새 봉투(감싸지 않음)와 예전 봉투(``{"result": ...}``)를 모두 받는다(배포 순서와 무관하게 동작)."""
+
+    CANDIDATE = {"start_offset": 0, "end_offset": 3, "source_text": "당뇨뼝", "automatic_correction": False,
+                 "candidate_type": "unknown_or_possible_typo", "terms": [{"kor_name": "당뇨병", "eng_name": "Diabetes"}]}
+    ERROR = {"code": "dictionary_unavailable", "message": "x", "retryable": False}
+
+    def _shapes(self, payload):
+        return {"current": payload, "legacy": {"result": payload}}
+
+    def test_document_candidates_parse_in_both_shapes(self) -> None:
+        flow = GatewayTermVerificationFlow(gateway=None)  # type: ignore[arg-type]
+        for name, structured in self._shapes({"analysis_id": "a", "candidates": [self.CANDIDATE]}).items():
+            with self.subTest(shape=name):
+                parsed = flow._parse_result({"structuredContent": structured, "isError": False}, "draft", "당뇨뼝 있음", "medic__analyze_document_terms")
+                self.assertEqual([item.suggestions[0].text for item in parsed], ["당뇨병"])
+
+    def test_llm_tool_output_compacts_search_results_in_both_shapes(self) -> None:
+        from n_note_ai_service_layers.adapters.llm_completion import model_tool_output
+
+        term = {"source_id": "s", "term_code": "1", "concept_code": "1", "eng_name": "DM", "kor_name": "당뇨병", "description": None}
+        payload = {"search_result_id": "x", "dictionary_version": "v", "results": [{"term": term, "match_type": "exact", "score": 1.0}]}
+        for name, structured in self._shapes(payload).items():
+            with self.subTest(shape=name):
+                self.assertEqual(model_tool_output({"structuredContent": structured, "isError": False}),
+                                 {"results": [{"kor_name": "당뇨병", "eng_name": "DM", "match_type": "exact", "score": 1.0}]})
+
+    def test_error_code_is_read_from_every_envelope(self) -> None:
+        import json as _json
+
+        from n_note_ai_service_layers.services.mcp_gateway_client import _tool_error_details
+
+        text = [{"type": "text", "text": _json.dumps({"error": self.ERROR})}]
+        envelopes = {
+            "current": {"isError": True, "structuredContent": {"error": self.ERROR}, "content": text},
+            "legacy": {"isError": True, "structuredContent": {"result": {"error": self.ERROR}}, "content": text},
+            "text_only": {"isError": True, "content": text},
+            "gateway_compact": {"isError": True, "code": "dictionary_unavailable", "retryable": False},
+        }
+        for name, result in envelopes.items():
+            with self.subTest(shape=name):
+                self.assertEqual(_tool_error_details(result), ("dictionary_unavailable", False))
+        self.assertEqual(_tool_error_details({"isError": True, "content": [{"type": "text", "text": "[1]"}]}), ("tool_error", False))

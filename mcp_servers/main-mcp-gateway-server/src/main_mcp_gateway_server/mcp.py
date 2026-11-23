@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 import json
+from importlib import metadata
 import uuid
 import logging
 from threading import Lock
@@ -16,8 +17,18 @@ from .config import UpstreamConfig
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def package_version() -> str:
+    """설치된 패키지 버전이다. 소스에서 바로 실행해 메타데이터가 없으면 ``unknown``이다."""
+    try:
+        return metadata.version("main-mcp-gateway-server")
+    except metadata.PackageNotFoundError:
+        return "unknown"
+
+
 PROTOCOL_VERSION = "2025-06-18"
-GATEWAY_CLIENT_INFO = {"name": "mcp-gateway", "version": "0.1.0"}
+GATEWAY_CLIENT_INFO = {"name": "mcp-gateway", "version": package_version()}
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_IDLE_CONNECTIONS = 16
 DEFAULT_BATCH_MAX_CONCURRENCY = 8

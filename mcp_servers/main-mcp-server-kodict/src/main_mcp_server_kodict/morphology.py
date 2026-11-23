@@ -15,15 +15,6 @@ class MorphToken:
     start: int
     end: int
 
-    @property
-    def surface(self) -> str:
-        """기존 호출부 호환용 분석형 별칭이다.
-
-        표면형처럼 보이는 이 값은 Kiwi 분석형이므로, 사용자 원문을 표시할 때는
-        반드시 ``source_text``를 사용해야 한다.
-        """
-        return self.analysis_form
-
 
 class MorphologyAnalyzer:
     """Kiwi 직접 호출을 한 곳에 한정하는 형태소 분석 Adapter다."""

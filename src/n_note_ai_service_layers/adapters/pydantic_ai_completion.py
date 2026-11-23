@@ -11,15 +11,13 @@ API 형식별 흐름:
   구조화 출력 단계를 나눈다. 도구 단계에서 모델이 바로 낸 답이 스키마를 만족하면(``accept_unconstrained``) 그대로 쓴다.
   서버가 도구 호출을 지원하지 않으면(400) 도구 없이 진행한다.
 
-동기 호출자(스레드 풀)는 프로세스 공유 이벤트 루프 하나(``run_sync``)에 요청을 넘기고, 모든 요청이 AsyncOpenAI
-클라이언트 하나(연결 풀 하나)를 함께 쓴다.
+모든 요청은 서비스 작업 루프(``services/work_loop``) 하나에서 돌고 AsyncOpenAI 클라이언트 하나(연결 풀 하나)를 함께 쓴다.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -49,7 +47,7 @@ from n_note_ai_service_layers.adapters.llm_completion import (
     record_budget,
 )
 from n_note_ai_service_layers.observability import set_attributes
-from n_note_ai_service_layers.services import executors
+from n_note_ai_service_layers.services import work_loop
 
 # Pydantic AI는 관측이 꺼져 있으면 stdout에 안내 배너를 찍는다. 서비스 로그(JSON 한 줄)를 깨뜨리므로 끈다.
 pydantic_ai.BANNER_ENABLED = False
@@ -94,15 +92,14 @@ class GatewayToolset(AbstractToolset[None]):
             return {"error": "tool_limit_reached"}
         self.budget.calls += 1
         async with self._parallel:
-            # 공유 풀은 제출한 쪽의 문맥을 이어받으므로 Gateway 호출 span이 Pydantic AI의 도구 span 아래에 놓인다.
-            pool = executors.shared("llm-tool", executors.worker_parallelism() * MAX_PARALLEL_TOOL_CALLS)
-            return await asyncio.get_running_loop().run_in_executor(pool, self.executor.call, name, tool_args)
+            # Gateway 클라이언트는 동기 HTTP다. to_thread는 현재 문맥을 넘기므로 Gateway 호출 span이 도구 span 아래에 놓인다.
+            return await asyncio.to_thread(self.executor.call, name, tool_args)
 
 
 class PydanticAiCompletion:
     """Pydantic AI Agent로 구조화 출력 요청 한 번(도구 왕복 포함)을 보낸다. ``StructuredCompletion``이다.
 
-    ``client_factory``는 공유 이벤트 루프에서 쓸 AsyncOpenAI 클라이언트를 돌려준다(프로세스에 하나).
+    ``client_factory``는 작업 루프에서 쓸 AsyncOpenAI 클라이언트를 돌려준다(프로세스에 하나).
     """
 
     def __init__(
@@ -118,15 +115,28 @@ class PydanticAiCompletion:
         tools: ToolExecutor | None = None, tool_instruction: str = "",
         accept_unconstrained: Callable[[Any], str | None] | None = None,
     ) -> Any:
-        """모델이 낸 JSON 텍스트를 돌려준다. 스키마 검증은 호출자가 한다(파싱 실패도 원문을 돌려준다)."""
+        """``acomplete``의 동기 입구다(스크립트·테스트용). 작업 루프 안에서는 ``acomplete``를 기다린다."""
+        return work_loop.run_sync(self.acomplete(instructions, user_content, output, tools, tool_instruction, accept_unconstrained))
+
+    async def acomplete(
+        self, instructions: str, user_content: str, output: StructuredOutput,
+        tools: ToolExecutor | None = None, tool_instruction: str = "",
+        accept_unconstrained: Callable[[Any], str | None] | None = None,
+    ) -> Any:
+        """모델이 낸 JSON 텍스트를 돌려준다. 스키마 검증은 호출자가 한다(파싱 실패도 원문을 돌려준다).
+
+        AsyncOpenAI 클라이언트는 작업 루프에 묶여 있으므로 작업 루프에서 기다린다(``work_loop.run``이 옮겨 준다).
+        """
+        if not work_loop.on_work_loop():
+            return await work_loop.run(self.acomplete(instructions, user_content, output, tools, tool_instruction, accept_unconstrained))
         with completion_span(self.api, self.model, output, instructions, user_content) as current:
-            model_tools = tools.model_tools() if tools else []
+            # catalog 조회는 동기 HTTP(Gateway)다.
+            model_tools = await asyncio.to_thread(tools.model_tools) if tools else []
             set_attributes(current, {"llm.tools_offered": len(model_tools)})
             if self.api == "chat":
-                coroutine = self._chat(current, instructions, user_content, output, tools, model_tools, tool_instruction, accept_unconstrained)
+                text = await self._chat(current, instructions, user_content, output, tools, model_tools, tool_instruction, accept_unconstrained)
             else:
-                coroutine = self._responses(current, instructions, user_content, output, tools, model_tools, tool_instruction)
-            text = run_sync(coroutine)
+                text = await self._responses(current, instructions, user_content, output, tools, model_tools, tool_instruction)
             observability.set_content(current, "llm.output", text)
             return text
 
@@ -276,45 +286,3 @@ def _last_text(messages: list[ModelMessage]) -> Any:
             text = "".join(part.content for part in message.parts if isinstance(part, TextPart))
             return json_text(text) if text else None
     return None
-
-
-class _SharedLoop:
-    """프로세스가 함께 쓰는 이벤트 루프 하나다(데몬 스레드에서 돈다).
-
-    동기 호출자(작업 스레드 풀)는 ``run_sync``로 코루틴을 이 루프에 넘기고 결과를 기다린다. 모든 LLM 요청이 한 루프와
-    한 AsyncOpenAI 연결 풀을 쓰므로 스레드마다 루프·클라이언트를 만들지 않는다. 호출한 스레드의 contextvars(현재
-    추적 span)는 ``run_coroutine_threadsafe``가 넘기므로 span이 호출한 양식의 추적 아래에 놓인다.
-    """
-
-    def __init__(self) -> None:
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._lock = threading.Lock()
-
-    def get(self) -> asyncio.AbstractEventLoop:
-        with self._lock:
-            if self._loop is None or self._loop.is_closed():
-                loop = asyncio.new_event_loop()
-                threading.Thread(target=loop.run_forever, name="llm-event-loop", daemon=True).start()
-                self._loop = loop
-            return self._loop
-
-
-_shared_loop = _SharedLoop()
-
-
-def event_loop() -> asyncio.AbstractEventLoop:
-    """LLM 요청이 도는 공유 이벤트 루프다(AsyncOpenAI 클라이언트는 이 루프에서만 쓴다)."""
-    return _shared_loop.get()
-
-
-def run_sync(coroutine: Any) -> Any:
-    """코루틴을 공유 이벤트 루프에서 끝까지 실행하고 결과를 돌려준다. 공유 루프 스레드 안에서는 부르지 않는다."""
-    loop = event_loop()
-    try:
-        running = asyncio.get_running_loop()
-    except RuntimeError:
-        running = None
-    if running is loop:
-        coroutine.close()
-        raise RuntimeError("run_sync must not be called from the shared LLM event loop")
-    return asyncio.run_coroutine_threadsafe(coroutine, loop).result()

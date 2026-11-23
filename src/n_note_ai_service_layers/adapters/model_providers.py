@@ -58,7 +58,7 @@ _async_clients_lock = threading.Lock()
 def async_openai_client(endpoint: settings.ModelEndpoint, timeout_seconds: float | None = None, max_retries: int | None = None) -> Any:
     """LLM 호출용 AsyncOpenAI 클라이언트다. 같은 접속 정보면 프로세스에서 하나를 공유한다(동시에 처음 불려도 하나).
 
-    비동기 HTTP 연결은 처음 쓴 이벤트 루프에 묶인다. 모든 LLM 요청은 ``pydantic_ai_completion``의 공유 루프 하나에서
+    비동기 HTTP 연결은 처음 쓴 이벤트 루프에 묶인다. 모든 LLM 요청은 서비스 작업 루프(``services/work_loop``) 하나에서
     돌므로 스레드 사이에 공유해도 된다.
     """
     key = (endpoint, timeout_seconds, max_retries)

@@ -28,7 +28,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import configured_upstreams
-from .mcp import DEFAULT_BATCH_MAX_CONCURRENCY, DEFAULT_CATALOG_TTL_SECONDS, DEFAULT_UPSTREAM_TIMEOUT_SECONDS, GatewayCatalog, HttpTransport
+from .mcp import DEFAULT_BATCH_MAX_CONCURRENCY, DEFAULT_CATALOG_TTL_SECONDS, DEFAULT_UPSTREAM_TIMEOUT_SECONDS, GatewayCatalog, HttpTransport, package_version
 
 
 DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576
@@ -39,7 +39,7 @@ BATCH_CALL_PATH = "/v1/tools/batch-call"
 MCP_PATH = "/mcp"
 KEEP_ALIVE_SECONDS = 60
 SERVER_NAME = "mcp-gateway"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = package_version()
 
 
 class GatewayService:

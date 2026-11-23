@@ -420,5 +420,21 @@ class HttpTransportSessionTest(unittest.TestCase):
         self.assertNotIsInstance(raised.exception, McpSessionExpired)
 
 
+class UpstreamErrorEnvelopeTest(unittest.TestCase):
+    """medic의 새 봉투(최상위 error)·예전 봉투(content text만 최상위 error)를 모두 같은 오류로 읽는다."""
+
+    def test_error_code_is_read_from_current_and_legacy_medic_results(self) -> None:
+        from main_mcp_gateway_server.mcp import _is_valid_tool_result, _result_code
+
+        error = {"code": "dictionary_unavailable", "message": "x", "retryable": False}
+        text = [{"type": "text", "text": json.dumps({"error": error})}]
+        current = {"isError": True, "structuredContent": {"error": error}, "content": text}
+        legacy = {"isError": True, "structuredContent": {"result": {"error": error}}, "content": text}
+        for result in (current, legacy):
+            self.assertTrue(_is_valid_tool_result(result))
+            self.assertEqual(_result_code(result), "dictionary_unavailable")
+        self.assertEqual(_result_code({"isError": False, "structuredContent": {"results": []}}), "ok")
+
+
 if __name__ == "__main__":
     unittest.main()

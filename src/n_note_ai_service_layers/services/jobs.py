@@ -1,22 +1,25 @@
 """음성 → 초안 생성처럼 오래 걸리는 작업을 비동기로 실행하고 상태를 저장소에 남긴다.
 
-작업은 요청을 받은 worker 프로세스의 스레드 풀에서 실행되고, 상태는 문서 저장소(SQLite)에
+작업은 요청을 받은 worker 프로세스의 서비스 작업 루프(asyncio)에서 실행되고, 상태는 문서 저장소(SQLite)에
 기록되므로 어느 worker로 조회하든 같은 상태를 본다. 음성 바이트는 저장하지 않는다.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from typing import Any
 from uuid import uuid4
 
 from opentelemetry.trace import Status, StatusCode
 
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, VersionConflict
-from n_note_ai_service_layers.observability import ContextThreadPoolExecutor, get_logger, log_event, mark_failed, span
+from n_note_ai_service_layers.observability import get_logger, log_event, mark_failed, span
+from n_note_ai_service_layers.services import work_loop
 from n_note_ai_service_layers.services.clock import now_utc
 
 JOB_COLLECTION = "workflow_jobs"
@@ -118,22 +121,24 @@ class JobStore:
 
 
 class JobRunner:
-    """작업을 스레드 풀에서 실행하고 결과·오류를 ``JobStore``에 기록한다.
+    """작업을 서비스 작업 루프(``work_loop``)의 asyncio 작업으로 실행하고 결과·오류를 ``JobStore``에 기록한다.
 
     입력: 작업 저장소, 동시 실행 수, 대기열 상한이다.
     출력: ``submit``은 즉시 반환하고, 작업 함수는 ``progress(stage)``로 진행 단계를 알린다.
+    작업 함수는 async(``async def work(progress)``)면 작업 루프에서 기다리고, 동기면 스레드에서 실행한다.
+    동시 실행 수를 넘은 작업은 세마포어에서 기다린다(대기 중인 작업은 스레드를 붙잡지 않는다).
     """
 
     def __init__(self, jobs: JobStore, concurrency: int, max_pending: int) -> None:
         self.jobs = jobs
         self.concurrency = concurrency
         self.max_pending = max_pending
-        self._executor = self._new_executor()
+        self._slots = asyncio.Semaphore(concurrency)
         self._futures: dict[str, Future] = {}
+        # 동시 실행 수가 차서 자리를 기다리는 작업이다. 종료할 때 이 작업들만 실패(server_shutdown)로 남긴다.
+        self._waiting: set[str] = set()
+        self._closing = False
         self._lock = threading.Lock()
-
-    def _new_executor(self) -> ContextThreadPoolExecutor:
-        return ContextThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="workflow-job")
 
     @property
     def pending(self) -> int:
@@ -144,45 +149,78 @@ class JobRunner:
         if self.pending >= self.max_pending:
             raise JobQueueFull("workflow job queue is full")
 
-    def submit(self, job_id: str, work: Callable[[Progress], dict[str, Any]]) -> None:
+    def submit(self, job_id: str, work: Callable[[Progress], Any]) -> None:
+        """어느 스레드에서든 부를 수 있다. 작업은 제출한 쪽의 추적 문맥을 이어받는다."""
         self.ensure_capacity()
-        future = self._executor.submit(self._run, job_id, work)
+        future = work_loop.submit(self._run(job_id, work))
         with self._lock:
             self._futures = {key: value for key, value in self._futures.items() if not value.done()}
             self._futures[job_id] = future
 
-    def _run(self, job_id: str, work: Callable[[Progress], dict[str, Any]]) -> None:
-        # 작업 span이다. 단계·양식별 초안·LLM 호출 span이 이 아래에 놓인다. 제출한 요청의 문맥을 이어받으므로
-        # 추적 화면에서는 작업을 만든 API 요청(POST) span 아래에 보인다(요청은 먼저 끝나고 작업이 이어진다).
-        with span("workflow_job", job_id=job_id) as current:
-            self._run_traced(job_id, work, current)
-
-    def _run_traced(self, job_id: str, work: Callable[[Progress], dict[str, Any]], current: Any) -> None:
-        started = time.perf_counter()
-        self.jobs.update(job_id, status="running", started_at=_now())
+    async def _run(self, job_id: str, work: Callable[[Progress], Any]) -> None:
+        if self._slots.locked():
+            with self._lock:
+                if self._closing:
+                    self._mark_shutdown(job_id)
+                    return
+                self._waiting.add(job_id)
         try:
-            result = work(lambda stage: self.jobs.stage(job_id, stage))
+            await self._slots.acquire()
+        finally:
+            with self._lock:
+                self._waiting.discard(job_id)
+        try:
+            # 작업 span이다. 단계·양식별 초안·LLM 호출 span이 이 아래에 놓인다. 제출한 요청의 문맥을 이어받으므로
+            # 추적 화면에서는 작업을 만든 API 요청(POST) span 아래에 보인다(요청은 먼저 끝나고 작업이 이어진다).
+            with span("workflow_job", job_id=job_id) as current:
+                await self._run_traced(job_id, work, current)
+        finally:
+            self._slots.release()
+
+    async def _run_traced(self, job_id: str, work: Callable[[Progress], Any], current: Any) -> None:
+        started = time.perf_counter()
+        await asyncio.to_thread(self.jobs.update, job_id, status="running", started_at=_now())
+        progress: Progress = lambda stage: self.jobs.stage(job_id, stage)
+        try:
+            if inspect.iscoroutinefunction(work):
+                result = await work(progress)
+            else:
+                result = await asyncio.to_thread(work, progress)
         except JobFailure as exc:
-            self.jobs.update(job_id, status="failed", finished_at=_now(), error={"code": exc.code, "message": exc.message})
+            await asyncio.to_thread(self.jobs.update, job_id, status="failed", finished_at=_now(), error={"code": exc.code, "message": exc.message})
             log_event(_logger, "job_failed", job_id=job_id, code=exc.code, seconds=round(time.perf_counter() - started, 3))
             current.set_status(Status(StatusCode.ERROR, exc.code))
             return
         except Exception as exc:
-            self.jobs.update(job_id, status="failed", finished_at=_now(), error={"code": "internal_error", "message": "nursing note workflow failed"})
+            await asyncio.to_thread(
+                self.jobs.update, job_id, status="failed", finished_at=_now(), error={"code": "internal_error", "message": "nursing note workflow failed"},
+            )
             log_event(_logger, "job_failed", job_id=job_id, code="internal_error", error=type(exc).__name__)
             mark_failed(current, exc)
             return
-        completed = _with_current_stage(self.jobs.get(job_id) or {})
-        self.jobs.update(job_id, status="succeeded", stage=None, completed_stages=completed, finished_at=_now(), result=result)
+        await asyncio.to_thread(self._succeed, job_id, result)
         log_event(_logger, "job_succeeded", job_id=job_id, seconds=round(time.perf_counter() - started, 3))
 
+    def _succeed(self, job_id: str, result: dict[str, Any]) -> None:
+        completed = _with_current_stage(self.jobs.get(job_id) or {})
+        self.jobs.update(job_id, status="succeeded", stage=None, completed_stages=completed, finished_at=_now(), result=result)
+
+    def _mark_shutdown(self, job_id: str) -> None:
+        self.jobs.update(job_id, status="failed", finished_at=_now(), error={"code": "server_shutdown", "message": "server stopped before the job started"})
+
     def shutdown(self) -> None:
-        """대기 중인 작업은 취소해 실패로 남기고, 실행 중인 작업은 끝날 때까지 기다린다."""
+        """자리를 기다리던 작업은 취소해 실패로 남기고, 실행 중인(또는 바로 시작할 수 있는) 작업은 끝날 때까지 기다린다."""
         with self._lock:
+            self._closing = True
             futures = dict(self._futures)
-        for job_id, future in futures.items():
-            if future.cancel():
-                self.jobs.update(job_id, status="failed", finished_at=_now(), error={"code": "server_shutdown", "message": "server stopped before the job started"})
-        self._executor.shutdown(wait=True)
-        # 같은 프로세스에서 앱을 다시 띄우는 경우(테스트 등)를 위해 새 풀로 교체한다.
-        self._executor = self._new_executor()
+            waiting = set(self._waiting)
+        try:
+            for job_id in waiting:
+                if futures[job_id].cancel():
+                    self._mark_shutdown(job_id)
+            wait([future for future in futures.values() if not future.cancelled()])
+        finally:
+            with self._lock:
+                # 같은 프로세스에서 앱을 다시 띄우는 경우(테스트 등)를 위해 다시 받을 수 있게 한다.
+                self._closing = False
+                self._futures = {key: value for key, value in self._futures.items() if not value.done()}

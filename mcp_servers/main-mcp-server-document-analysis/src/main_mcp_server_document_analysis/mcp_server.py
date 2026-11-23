@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from time import perf_counter
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import anyio
@@ -19,64 +20,35 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+from . import validation
 from .contracts import InputError, ToolError
-from .hmd_standard import HmdAnalysisRequirementSetV1Interpreter
-from .observability import SafeAuditLog
-from .standards import ReportValidationStandardV1Interpreter, StandardInterpreterRegistry
-from .validation import ReportValidationService
+from .observability import AUDIT_LOGGER, SERVICE_ID, SERVICE_VERSION, SafeAuditLog
 
 EVALUATE_TOOL = "evaluate_report_against_standard"
 GUIDANCE_TOOL = "get_validation_guidance"
 EVIDENCE_SEARCH_TOOL = "find_evidence_candidates"
-SERVICE_ID = "report"
 MAX_REQUEST_BYTES = 1_048_576
 MAX_TEXT_CHARS = 100_000
-SERVICE_VERSION = "0.1.0"
 
 
 class McpApplication:
     """MCP JSON-RPC와 도구 계약을 연결하는 상태 없는 애플리케이션이다(HTTP 계층은 `create_asgi_app`)."""
 
-    def __init__(self, service: ReportValidationService | None = None, audit: SafeAuditLog | None = None) -> None:
-        """기본 검증 서비스와 민감 원문 없는 감사 저장소를 구성한다."""
-        registry = StandardInterpreterRegistry((ReportValidationStandardV1Interpreter(), HmdAnalysisRequirementSetV1Interpreter()))
-        self._service = service or ReportValidationService(registry)
+    def __init__(self, audit: SafeAuditLog | None = None) -> None:
+        """입력 한도 설정과 민감 원문 없는 감사 저장소를 구성한다. 한도 설정이 잘못되면 준비되지 않은 상태로 둔다."""
         self._audit = audit or SafeAuditLog()
-        self._configuration_ready = True
-        try:
-            self._max_request_bytes = _positive_limit("MCP_MAX_REQUEST_BYTES", MAX_REQUEST_BYTES)
-            self._max_text_chars = _positive_limit("MCP_MAX_TEXT_CHARS", MAX_TEXT_CHARS)
-        except ValueError:
-            self._configuration_ready = False
-            self._max_request_bytes = MAX_REQUEST_BYTES
-            self._max_text_chars = MAX_TEXT_CHARS
+        max_request_bytes = _positive_limit("MCP_MAX_REQUEST_BYTES", MAX_REQUEST_BYTES)
+        max_text_chars = _positive_limit("MCP_MAX_TEXT_CHARS", MAX_TEXT_CHARS)
+        self._configuration_ready = max_request_bytes is not None and max_text_chars is not None
+        self._max_request_bytes = max_request_bytes or MAX_REQUEST_BYTES
+        self._max_text_chars = max_text_chars or MAX_TEXT_CHARS
 
     def evaluate(self, arguments: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         """전용 Gateway network에서 전달된 평가 요청을 처리한다."""
-        started_at = perf_counter()
-        result_code = "internal_error"
-        try:
-            _enforce_text_limit(arguments, self._max_text_chars)
-            report = arguments.get("report")
-            result = self._service.evaluate(report, arguments.get("validation_standard"), arguments.get("semantic_assessment"))
-            result_code = "ok"
-            return result.as_dict()
-        except RequestTooLarge:
-            result_code = "request_too_large"
-            return ToolError("request_too_large", "text input exceeds configured size limit").as_dict()
-        except InputError:
-            result_code = "invalid_input"
-            return ToolError("invalid_input", "request does not satisfy the tool contract").as_dict()
-        except (RuntimeError, TypeError):
-            return ToolError("internal_error", "evaluation could not be completed", True).as_dict()
-        finally:
-            self._audit.record(
-                request_id=request_id,
-                tool_name=EVALUATE_TOOL,
-                result_code=result_code,
-                standard_version=arguments.get("validation_standard", {}).get("standard_version") if isinstance(arguments.get("validation_standard"), dict) else None,
-                started_at=started_at,
-            )
+        return self._run_tool(
+            EVALUATE_TOOL, arguments, request_id, "evaluation could not be completed",
+            lambda: validation.evaluate(arguments.get("report"), arguments.get("validation_standard"), arguments.get("semantic_assessment")).as_dict(),
+        )
 
     def guidance(self, arguments: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         """LLM용 검토 정책을 반환하고 호출 metadata만 감사한다.
@@ -84,29 +56,10 @@ class McpApplication:
         Args:
             arguments: `validation_standard`만 포함하는 도구 인자다.
         """
-        started_at = perf_counter()
-        result_code = "internal_error"
-        try:
-            _enforce_text_limit(arguments, self._max_text_chars)
-            guidance = self._service.guidance(arguments.get("validation_standard"))
-            result_code = "ok"
-            return guidance
-        except RequestTooLarge:
-            result_code = "request_too_large"
-            return ToolError("request_too_large", "text input exceeds configured size limit").as_dict()
-        except InputError:
-            result_code = "invalid_input"
-            return ToolError("invalid_input", "request does not satisfy the tool contract").as_dict()
-        except (RuntimeError, TypeError):
-            return ToolError("internal_error", "guidance could not be prepared", True).as_dict()
-        finally:
-            self._audit.record(
-                request_id=request_id,
-                tool_name=GUIDANCE_TOOL,
-                result_code=result_code,
-                standard_version=arguments.get("validation_standard", {}).get("standard_version") if isinstance(arguments.get("validation_standard"), dict) else None,
-                started_at=started_at,
-            )
+        return self._run_tool(
+            GUIDANCE_TOOL, arguments, request_id, "guidance could not be prepared",
+            lambda: validation.guidance(arguments.get("validation_standard")),
+        )
 
     def find_evidence_candidates(self, arguments: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         """외부 AI의 검색어에 맞는 원문 후보 문장을 찾아 반환한다.
@@ -114,14 +67,23 @@ class McpApplication:
         이 도구는 문자 일치 검색만 수행한다. 반환된 후보가 기준을 충족하는지의
         의미 판단은 외부 AI와 평가 도구의 역할이다.
         """
+        return self._run_tool(
+            EVIDENCE_SEARCH_TOOL, arguments, request_id, "evidence candidates could not be found",
+            lambda: validation.find_evidence_candidates(arguments.get("report"), arguments.get("validation_standard"), arguments.get("queries")),
+        )
+
+    def _run_tool(
+        self, tool_name: str, arguments: dict[str, Any], request_id: str | None, failure_message: str,
+        operation: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """입력 크기 검사·오류 변환·감사 기록을 모든 도구에 같은 방식으로 적용한다."""
         started_at = perf_counter()
         result_code = "internal_error"
         try:
             _enforce_text_limit(arguments, self._max_text_chars)
-            report = arguments.get("report")
-            result = self._service.find_evidence_candidates(report, arguments.get("validation_standard"), arguments.get("queries"))
+            payload = operation()
             result_code = "ok"
-            return result
+            return payload
         except RequestTooLarge:
             result_code = "request_too_large"
             return ToolError("request_too_large", "text input exceeds configured size limit").as_dict()
@@ -129,13 +91,14 @@ class McpApplication:
             result_code = "invalid_input"
             return ToolError("invalid_input", "request does not satisfy the tool contract").as_dict()
         except (RuntimeError, TypeError):
-            return ToolError("internal_error", "evidence candidates could not be found", True).as_dict()
+            return ToolError("internal_error", failure_message, True).as_dict()
         finally:
+            standard = arguments.get("validation_standard")
             self._audit.record(
                 request_id=request_id,
-                tool_name=EVIDENCE_SEARCH_TOOL,
+                tool_name=tool_name,
                 result_code=result_code,
-                standard_version=arguments.get("validation_standard", {}).get("standard_version") if isinstance(arguments.get("validation_standard"), dict) else None,
+                standard_version=standard.get("standard_version") if isinstance(standard, dict) else None,
                 started_at=started_at,
             )
 
@@ -143,21 +106,17 @@ class McpApplication:
         """도구 하나를 실행하고 MCP tool result(``structuredContent``·``isError``)를 돌려준다.
 
         Gateway가 해석하는 오류 형식(``structuredContent.error``의 code·message·retryable)을 유지한다.
-        잘못된 이름·인자는 예외 대신 ``invalid_input`` tool result다.
+        잘못된 이름·인자는 예외 대신 ``invalid_input`` tool result다. Gateway는 catalog 접두사(``report__``)를
+        떼고 호출하므로 내부 도구명만 받는다.
         """
-        tool_name = _canonical_tool_name(name)
-        if not isinstance(arguments, dict):
+        handlers = {GUIDANCE_TOOL: self.guidance, EVIDENCE_SEARCH_TOOL: self.find_evidence_candidates, EVALUATE_TOOL: self.evaluate}
+        handler = handlers.get(name) if isinstance(name, str) else None
+        if handler is None or not isinstance(arguments, dict):
             payload = ToolError("invalid_input", "unknown tool or invalid arguments").as_dict()
         elif not self.is_ready():
             payload = ToolError("upstream_unavailable", "service is not ready", True).as_dict()
-        elif tool_name == GUIDANCE_TOOL:
-            payload = self.guidance(arguments, request_id)
-        elif tool_name == EVIDENCE_SEARCH_TOOL:
-            payload = self.find_evidence_candidates(arguments, request_id)
-        elif tool_name == EVALUATE_TOOL:
-            payload = self.evaluate(arguments, request_id)
         else:
-            payload = ToolError("invalid_input", "unknown tool or invalid arguments").as_dict()
+            payload = handler(arguments, request_id)
         return {"structuredContent": payload, "isError": "error" in payload}
 
     def tools(self) -> list[dict[str, Any]]:
@@ -203,10 +162,8 @@ class McpApplication:
         return self._audit.health(ready)
 
     def is_ready(self) -> bool:
-        """필수 설정과 기준 interpreter가 준비된 경우에만 true를 반환한다."""
-        registry = getattr(self._service, "_registry", None)
-        interpreters = getattr(registry, "_interpreters", None)
-        return self._configuration_ready and isinstance(interpreters, dict) and bool(interpreters)
+        """입력 한도 환경 설정이 유효하면 true다. 그 밖의 준비 조건은 생성 성공으로 충족된다."""
+        return self._configuration_ready
 
 
 def create_mcp_server(app: McpApplication) -> Server:
@@ -297,6 +254,12 @@ def main() -> None:
 
     host = os.getenv("MCP_HOST", "0.0.0.0")
     port = int(os.getenv("MCP_PORT", "8000"))
+    # 감사 이벤트(본문 없는 metadata)만 stderr로 내보낸다. SDK의 요청별 INFO 로그는 켜지 않는다.
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
+    AUDIT_LOGGER.addHandler(handler)
+    AUDIT_LOGGER.setLevel(logging.INFO)
+    AUDIT_LOGGER.propagate = False
     # 접근 로그는 남기지 않는다(감사는 SafeAuditLog가 본문 없이 기록한다).
     uvicorn.run(create_asgi_app(), host=host, port=port, access_log=False)
 
@@ -305,12 +268,16 @@ class RequestTooLarge(ValueError):
     """도구 인자의 개별 문자열이 허용 한도를 넘었음을 나타낸다."""
 
 
-def _positive_limit(environment_name: str, default: int) -> int:
-    """양의 정수 환경 설정만 입력 한도로 허용한다."""
-    value = int(os.getenv(environment_name, str(default)))
-    if value <= 0:
-        raise ValueError(f"{environment_name} must be positive")
-    return value
+def _positive_limit(environment_name: str, default: int) -> int | None:
+    """환경 설정의 입력 한도다. 미설정이면 `default`를, 양의 정수가 아니면 None을 반환한다."""
+    raw = os.getenv(environment_name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def _enforce_text_limit(value: Any, maximum: int) -> None:
@@ -465,18 +432,3 @@ def _semantic_assessment_schema(maximum_text_chars: int) -> dict[str, Any]:
         },
         "additionalProperties": True,
     }
-
-
-def _canonical_tool_name(name: Any) -> str | None:
-    """Gateway catalog가 붙이는 이 서비스 접두사를 내부 도구명으로 되돌린다."""
-    if not isinstance(name, str):
-        return None
-    if name in {GUIDANCE_TOOL, EVIDENCE_SEARCH_TOOL, EVALUATE_TOOL}:
-        return name
-    for separator in ("__", ":", "/", "."):
-        prefix = SERVICE_ID + separator
-        if name.startswith(prefix):
-            candidate = name.removeprefix(prefix)
-            if candidate in {GUIDANCE_TOOL, EVIDENCE_SEARCH_TOOL, EVALUATE_TOOL}:
-                return candidate
-    return None

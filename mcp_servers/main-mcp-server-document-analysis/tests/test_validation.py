@@ -3,9 +3,9 @@
 import unittest
 
 from main_mcp_server_document_analysis.contracts import InputError
-from main_mcp_server_document_analysis.hmd_standard import HmdAnalysisRequirementSetV1Interpreter
-from main_mcp_server_document_analysis.standards import ReportValidationStandardV1Interpreter, StandardInterpreterRegistry
-from main_mcp_server_document_analysis.validation import ReportValidationService
+from main_mcp_server_document_analysis import validation
+from main_mcp_server_document_analysis.hmd_standard import interpret_hmd_analysis_requirement_set_v1
+from main_mcp_server_document_analysis.standards import interpret_report_validation_standard_v1
 
 
 def standard() -> dict:
@@ -29,9 +29,9 @@ def hmd_standard() -> dict:
     }
 
 
-def service() -> ReportValidationService:
-    """범용 및 HMD interpreter가 등록된 검증 서비스를 만든다."""
-    return ReportValidationService(StandardInterpreterRegistry((ReportValidationStandardV1Interpreter(), HmdAnalysisRequirementSetV1Interpreter())))
+def service():
+    """범용 및 HMD 기준을 해석하는 검증 함수 모듈을 반환한다."""
+    return validation
 
 
 class ValidationTest(unittest.TestCase):
@@ -43,7 +43,7 @@ class ValidationTest(unittest.TestCase):
         raw["status"] = {"shared": "metadata"}
         raw["usage"] = "ignored"
         raw["analysis_requirements"][0]["evidence_rules"] = {"unrelated": "ignored"}
-        result = HmdAnalysisRequirementSetV1Interpreter().interpret(raw)
+        result = interpret_hmd_analysis_requirement_set_v1(raw)
         self.assertEqual((result.status, len(result.criteria)), ("unclassified", 7))
         self.assertEqual(result.criteria[0].required_elements[-1].element_id, "p_value")
 
@@ -52,7 +52,7 @@ class ValidationTest(unittest.TestCase):
         raw = standard()
         raw["criteria"][0]["required_elements"].append({"element_id": "p_value"})
         with self.assertRaises(InputError):
-            ReportValidationStandardV1Interpreter().interpret(raw)
+            interpret_report_validation_standard_v1(raw)
 
     def test_no_candidate_is_uncertain_not_missing(self) -> None:
         """의미 분석 후보가 없으면 세부 요소를 missing으로 단정하지 않는다."""

@@ -9,15 +9,16 @@ import logging
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Literal, ParamSpec, TypeVar
+from typing import Any, Literal, NamedTuple, ParamSpec, TypeVar
 
 import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent
-from pydantic import ValidationError as PydanticValidationError
+from pydantic import BaseModel, ValidationError as PydanticValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -46,6 +47,23 @@ DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 audit_logger = logging.getLogger("medical_term_review.audit")
+try:
+    SERVICE_VERSION = version("main-mcp-server-medicaldict")
+except PackageNotFoundError:
+    SERVICE_VERSION = "unknown"
+
+
+class _Components(NamedTuple):
+    """도구가 공유하는 사전·분석기·검증기·이력 저장소다."""
+
+    dictionary: DictionaryRepository
+    analyzer: DocumentAnalyzer
+    validator: SuggestionValidator
+    store: AnalysisStore
+
+
+class _DependenciesUnavailable(RuntimeError):
+    """사전 또는 이력 저장소를 열 수 없음을 도구 본문에서 공통 오류로 알린다."""
 
 
 class GatewayFastMCP(FastMCP):
@@ -99,11 +117,9 @@ def create_server(
     # 모두 막는다. 도구는 worker thread에서 실행하고 이 limiter로 동시 실행 수를 제한한다.
     tool_limiter = anyio.CapacityLimiter(max_concurrent_requests)
     # 여러 thread가 동시에 첫 요청을 받아도 사전·이력 저장소를 한 번만 연다.
+    # 준비된 뒤에는 잠금 없이 읽으므로 도구 호출이 서로 직렬화되지 않는다.
     dependencies_lock = Lock()
-    dictionary: DictionaryRepository | None = None
-    analyzer: DocumentAnalyzer | None = None
-    validator: SuggestionValidator | None = None
-    store: AnalysisStore | None = None
+    components: _Components | None = None
     server = GatewayFastMCP(
         "medic",
         host=host,
@@ -116,28 +132,55 @@ def create_server(
         max_request_body_size=max_request_body_bytes,
     )
 
-    def dependencies() -> tuple[DictionaryRepository, DocumentAnalyzer, SuggestionValidator, AnalysisStore] | None:
-        """사전과 이력 저장소의 준비 상태를 확인하고 필요하면 다시 연다."""
-        with dependencies_lock:
-            return _ensure_dependencies()
+    def dependencies() -> _Components:
+        """준비된 구성 요소를 반환한다. 아직 없으면 한 번만 연다(double-checked).
 
-    def _ensure_dependencies() -> tuple[DictionaryRepository, DocumentAnalyzer, SuggestionValidator, AnalysisStore] | None:
-        nonlocal dictionary, analyzer, validator, store
-        try:
-            if dictionary is None:
-                dictionary = DictionaryRepository(root)
+        준비 상태 확인(DB 질의)은 /healthz에서만 한다.
+
+        Raises:
+            _DependenciesUnavailable: 사전 또는 이력 저장소를 열 수 없을 때 발생한다.
+        """
+        nonlocal components
+        ready = components
+        if ready is not None:
+            return ready
+        with dependencies_lock:
+            if components is None:
+                try:
+                    dictionary = DictionaryRepository(root)
+                    store = AnalysisStore(history)
+                except (DictionaryConfigurationError, StoreError, OSError, sqlite3.Error) as error:
+                    raise _DependenciesUnavailable() from error
                 # 첫 요청이 Gateway upstream 제한 시간에 걸리지 않도록 색인을 미리 만든다.
                 Thread(target=dictionary.load_phonetic_index, name="medic-phonetic-index", daemon=True).start()
-                analyzer = DocumentAnalyzer(dictionary)
-                validator = SuggestionValidator(dictionary)
-            dictionary.check_ready()
-            if store is None:
-                store = AnalysisStore(history)
-            store.check_ready()
+                components = _Components(dictionary, DocumentAnalyzer(dictionary), SuggestionValidator(dictionary), store)
+            return components
+
+    def check_health() -> bool:
+        """구성 요소를 열고 사전·이력 DB가 질의 가능한지 확인한다. 실패하면 다음 요청에서 다시 연다."""
+        nonlocal components
+        try:
+            ready = dependencies()
+            ready.dictionary.check_ready()
+            ready.store.check_ready()
+        except _DependenciesUnavailable:
+            return False
         except (DictionaryConfigurationError, StoreError, OSError, sqlite3.Error):
-            dictionary = analyzer = validator = store = None
-            return None
-        return dictionary, analyzer, validator, store
+            with dependencies_lock:
+                if components is ready:
+                    components = None
+            return False
+        return True
+
+    def tool_body(function: Callable[_P, _R]) -> Callable[_P, Awaitable[_R]]:
+        """도구 본문을 worker thread에서 실행하고 준비 실패를 공통 오류 결과로 바꾼다."""
+        @functools.wraps(function)
+        def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            try:
+                return function(*args, **kwargs)
+            except _DependenciesUnavailable:
+                return _error("dictionary_unavailable", "활성 사전 또는 이력 저장소를 준비할 수 없습니다.", False)
+        return _in_worker_thread(tool_limiter)(guarded)
 
     @server.custom_route("/healthz", methods=["GET"], include_in_schema=False)
     async def healthz(_: Request) -> JSONResponse:
@@ -147,15 +190,15 @@ def create_server(
             사전과 이력 저장소 초기화가 완료된 서버의 비민감 상태 응답이다.
         """
         # 도구 호출과 다른 limiter(anyio 기본값)를 써서 긴 분석이 밀려 있어도 health가 대기열에 묶이지 않는다.
-        ready = await anyio.to_thread.run_sync(dependencies) is not None
+        ready = await anyio.to_thread.run_sync(check_health)
         return JSONResponse(
             {"status": "ok" if ready else "unavailable", "service_id": "medic"},
             status_code=200 if ready else 503,
         )
 
-    @server.tool(title="사전 기반 의학 용어 분석", description="먼저 호출하세요. 원문을 저장하지 않고 활성 사전의 정확 일치 용어와 문자 범위를 반환합니다. 호스트 LLM은 이 결과를 근거로 추천을 만든 뒤 submit_suggestions를 호출해야 합니다.")
-    @_in_worker_thread(tool_limiter)
-    def analyze_medical_terms(text: str, document_id: str | None = None, language_hint: str | None = None) -> AnalysisOutput | ErrorOutput:
+    @server.tool(title="사전 기반 의학 용어 분석", description="먼저 호출하세요. 원문을 저장하지 않고 활성 사전의 정확 일치 용어와 문자 범위를 반환합니다. 호스트 LLM은 이 결과를 근거로 추천을 만든 뒤 submit_suggestions를 호출해야 합니다.", structured_output=False)
+    @tool_body
+    def analyze_medical_terms(text: str, document_id: str | None = None, language_hint: str | None = None) -> CallToolResult:
         """원문을 저장하지 않고 활성 사전 기준 용어 후보를 분석한다.
 
         Args:
@@ -167,16 +210,14 @@ def create_server(
             호스트 LLM의 판단 근거가 되는 분석 결과 또는 오류 본문이다.
         """
         del document_id, language_hint
-        components = dependencies()
-        if components is None:
-            return _error("dictionary_unavailable", "활성 사전 또는 이력 저장소를 준비할 수 없습니다.", False)
-        _, active_analyzer, _, active_store = components
+        deps = dependencies()
+        active_analyzer, active_store = deps.analyzer, deps.store
         if oversized := _text_too_large(text, max_text_chars):
             return oversized
         try:
             result = active_analyzer.analyze(text)
             active_store.save(result)
-            return AnalysisOutput.model_validate(result.to_dict())
+            return _ok(AnalysisOutput.model_validate(result.to_dict()))
         except ValidationError as error:
             return _error("invalid_input", str(error), False)
         except (DictionaryConfigurationError, StoreError):
@@ -184,9 +225,9 @@ def create_server(
         except Exception:
             return _error("internal_error", "의학용어 분석 중 내부 오류가 발생했습니다.", True)
 
-    @server.tool(title="호스트 LLM 추천 제출", description="analyze_medical_terms 뒤에만 호출하세요. 호스트가 판단한 추천을 서버가 원문 범위·허용 상태·활성 사전 코드로 검증해 저장합니다. 검증되지 않은 추천은 절대 저장하지 않습니다.")
-    @_in_worker_thread(tool_limiter)
-    def submit_suggestions(analysis_id: str, text: str, suggestions: list[HostSuggestionInput]) -> SuggestionSubmissionOutput | ErrorOutput:
+    @server.tool(title="호스트 LLM 추천 제출", description="analyze_medical_terms 뒤에만 호출하세요. 호스트가 판단한 추천을 서버가 원문 범위·허용 상태·활성 사전 코드로 검증해 저장합니다. 검증되지 않은 추천은 절대 저장하지 않습니다.", structured_output=False)
+    @tool_body
+    def submit_suggestions(analysis_id: str, text: str, suggestions: list[HostSuggestionInput]) -> CallToolResult:
         """호스트 LLM의 제안을 검증해 승인 대상 이력으로 저장한다.
 
         Args:
@@ -197,10 +238,8 @@ def create_server(
         Returns:
             저장된 제안 목록 또는 유효하지 않은 제출에 대한 오류 본문이다.
         """
-        components = dependencies()
-        if components is None:
-            return _error("dictionary_unavailable", "활성 사전 또는 이력 저장소를 준비할 수 없습니다.", False)
-        _, _, active_validator, active_store = components
+        deps = dependencies()
+        active_validator, active_store = deps.validator, deps.store
         if oversized := _text_too_large(text, max_text_chars):
             return oversized
         if active_store.get(analysis_id) is None:
@@ -210,13 +249,13 @@ def create_server(
             return _error("invalid_suggestion", "제안의 범위, 상태 또는 사전 코드를 검증하지 못했습니다.", False)
         try:
             active_store.append_suggestions(analysis_id, validated)
-            return SuggestionSubmissionOutput(analysis_id=analysis_id, suggestions=[SuggestionOutput.model_validate(item.to_dict()) for item in validated])
+            return _ok(SuggestionSubmissionOutput(analysis_id=analysis_id, suggestions=[SuggestionOutput.model_validate(item.to_dict()) for item in validated]))
         except StoreError as error:
             return _error("invalid_suggestion", str(error), False)
 
-    @server.tool(title="문서 단위 의학 용어 후보 분석", description="문서 전체 또는 청크에서 정확 일치, 표기 변형 및 미확인 검토 후보를 Unicode code point 범위로 반환합니다. 후보와 신뢰도는 자동 수정 지시가 아니며, 원문은 이력에 저장하지 않습니다.")
-    @_in_worker_thread(tool_limiter)
-    def analyze_document_terms(text: str, document_id: str | None = None, language_hint: str | None = None, document_offset: int = 0) -> DocumentAnalysisOutput | ErrorOutput:
+    @server.tool(title="문서 단위 의학 용어 후보 분석", description="문서 전체 또는 청크에서 정확 일치, 표기 변형 및 미확인 검토 후보를 Unicode code point 범위로 반환합니다. 후보와 신뢰도는 자동 수정 지시가 아니며, 원문은 이력에 저장하지 않습니다.", structured_output=False)
+    @tool_body
+    def analyze_document_terms(text: str, document_id: str | None = None, language_hint: str | None = None, document_offset: int = 0) -> CallToolResult:
         """확장 분석 후보를 저장 가능한 메타데이터와 함께 반환한다.
 
         Args:
@@ -229,10 +268,8 @@ def create_server(
             자동 수정이 아닌 검토 후보 또는 구분 가능한 오류 본문이다.
         """
         del document_id, language_hint
-        components = dependencies()
-        if components is None:
-            return _error("dictionary_unavailable", "활성 사전 또는 이력 저장소를 준비할 수 없습니다.", False)
-        _, active_analyzer, _, active_store = components
+        deps = dependencies()
+        active_analyzer, active_store = deps.analyzer, deps.store
         if oversized := _text_too_large(text, max_text_chars):
             return oversized
         try:
@@ -243,7 +280,7 @@ def create_server(
                 candidate.to_dict(text[candidate.start_offset - document_offset:candidate.end_offset - document_offset])
                 for candidate in result.candidates
             ]
-            return DocumentAnalysisOutput.model_validate(payload)
+            return _ok(DocumentAnalysisOutput.model_validate(payload))
         except ValidationError as error:
             return _error("invalid_input", str(error), False)
         except (DictionaryConfigurationError, StoreError):
@@ -251,9 +288,9 @@ def create_server(
         except Exception:
             return _error("internal_error", "의학용어 분석 중 내부 오류가 발생했습니다.", True)
 
-    @server.tool(title="의학 용어 사전 검색", description="정확·정규화·유사 사전 검색 결과를 제한된 수로 반환합니다. 유사도와 결과는 자동 수정 또는 의학적 판단의 근거가 아니며 검토용입니다.")
-    @_in_worker_thread(tool_limiter)
-    def search_medical_terms(query: str, language_hint: str | None = None, match_modes: list[MatchType] | None = None, limit: int = 10) -> SearchOutput | ErrorOutput:
+    @server.tool(title="의학 용어 사전 검색", description="정확·정규화·유사 사전 검색 결과를 제한된 수로 반환합니다. 유사도와 결과는 자동 수정 또는 의학적 판단의 근거가 아니며 검토용입니다.", structured_output=False)
+    @tool_body
+    def search_medical_terms(query: str, language_hint: str | None = None, match_modes: list[MatchType] | None = None, limit: int = 10) -> CallToolResult:
         """활성 사전의 색인된 정규화 키로 제한된 검색 결과를 반환한다.
 
         Args:
@@ -266,20 +303,17 @@ def create_server(
             결과 연결 검증에 쓸 search_result_id 또는 입력 오류 본문이다.
         """
         del language_hint
-        components = dependencies()
-        if components is None:
-            return _error("dictionary_unavailable", "활성 사전 또는 이력 저장소를 준비할 수 없습니다.", False)
-        active_dictionary = components[0]
+        active_dictionary = dependencies().dictionary
         try:
             result = active_dictionary.search(query, limit, set(match_modes) if match_modes else None)
-            return SearchOutput.model_validate({
+            return _ok(SearchOutput.model_validate({
                 "search_result_id": result.search_result_id,
                 "dictionary_version": result.dictionary_version,
                 "results": [
                     {"term": hit.term.to_dict(), "match_type": hit.match_type.value, "score": hit.score}
                     for hit in result.results
                 ],
-            })
+            }))
         except ValueError as error:
             return _error("invalid_input", str(error), False)
         except DictionaryConfigurationError:
@@ -287,9 +321,9 @@ def create_server(
         except Exception:
             return _error("internal_error", "의학용어 검색 중 내부 오류가 발생했습니다.", True)
 
-    @server.tool(title="검토 근거 연결 추천 제출", description="analyze_document_terms 또는 search_medical_terms 뒤에 호출하세요. 후보 또는 검색 결과에 포함된 코드만 저장합니다. 검토 후보는 자동 수정 지시가 아닙니다.")
-    @_in_worker_thread(tool_limiter)
-    def submit_review_suggestions(analysis_id: str, text: str, suggestions: list[ReviewSuggestionInput]) -> SuggestionSubmissionOutput | ErrorOutput:
+    @server.tool(title="검토 근거 연결 추천 제출", description="analyze_document_terms 또는 search_medical_terms 뒤에 호출하세요. 후보 또는 검색 결과에 포함된 코드만 저장합니다. 검토 후보는 자동 수정 지시가 아닙니다.", structured_output=False)
+    @tool_body
+    def submit_review_suggestions(analysis_id: str, text: str, suggestions: list[ReviewSuggestionInput]) -> CallToolResult:
         """범위·후보 또는 검색 근거·활성 사전 코드를 모두 검증해 제안을 저장한다.
 
         Args:
@@ -300,10 +334,8 @@ def create_server(
         Returns:
             원문 없이 저장된 제안 또는 invalid_suggestion 오류 본문이다.
         """
-        components = dependencies()
-        if components is None:
-            return _error("dictionary_unavailable", "활성 사전 또는 이력 저장소를 준비할 수 없습니다.", False)
-        active_dictionary, _, active_validator, active_store = components
+        deps = dependencies()
+        active_dictionary, active_validator, active_store = deps.dictionary, deps.validator, deps.store
         if oversized := _text_too_large(text, max_text_chars):
             return oversized
         if active_store.get(analysis_id) is None:
@@ -327,23 +359,20 @@ def create_server(
             validated.append(suggestion)
         try:
             active_store.append_suggestions(analysis_id, validated)
-            return SuggestionSubmissionOutput(analysis_id=analysis_id, suggestions=[SuggestionOutput.model_validate(item.to_dict()) for item in validated])
+            return _ok(SuggestionSubmissionOutput(analysis_id=analysis_id, suggestions=[SuggestionOutput.model_validate(item.to_dict()) for item in validated]))
         except StoreError as error:
             return _error("invalid_suggestion", str(error), False)
 
-    @server.tool(title="분석·승인 이력 조회", description="analysis_id로 저장된 제안과 사용자 결정을 조회합니다. 개인정보 보호를 위해 재조회 응답의 source_text는 null입니다.")
-    @_in_worker_thread(tool_limiter)
-    def get_analysis(analysis_id: str) -> AnalysisOutput | ErrorOutput:
+    @server.tool(title="분석·승인 이력 조회", description="analysis_id로 저장된 제안과 사용자 결정을 조회합니다. 개인정보 보호를 위해 재조회 응답의 source_text는 null입니다.", structured_output=False)
+    @tool_body
+    def get_analysis(analysis_id: str) -> CallToolResult:
         """저장된 분석과 승인 이력을 반환하며 원문은 반환하지 않는다."""
-        components = dependencies()
-        if components is None:
-            return _error("dictionary_unavailable", "활성 사전 또는 이력 저장소를 준비할 수 없습니다.", False)
-        result = components[3].get(analysis_id)
-        return AnalysisOutput.model_validate(result.to_dict()) if result else _error("analysis_not_found", "분석을 찾을 수 없습니다.", False)
+        result = dependencies().store.get(analysis_id)
+        return _ok(AnalysisOutput.model_validate(result.to_dict())) if result else _error("analysis_not_found", "분석을 찾을 수 없습니다.", False)
 
-    @server.tool(title="제안 승인 또는 거절", description="사람 또는 승인 권한을 가진 호출자가 마지막에 사용합니다. 같은 approved/rejected 요청의 재시도는 멱등적이며, pending 상태만 최초 결정할 수 있습니다.")
-    @_in_worker_thread(tool_limiter)
-    def decide_suggestions(analysis_id: str, decisions: list[DecisionInput]) -> SuggestionSubmissionOutput | ErrorOutput:
+    @server.tool(title="제안 승인 또는 거절", description="사람 또는 승인 권한을 가진 호출자가 마지막에 사용합니다. 같은 approved/rejected 요청의 재시도는 멱등적이며, pending 상태만 최초 결정할 수 있습니다.", structured_output=False)
+    @tool_body
+    def decide_suggestions(analysis_id: str, decisions: list[DecisionInput]) -> CallToolResult:
         """분석 소유권과 pending 상태를 검증해 승인 또는 거절을 기록한다.
 
         Args:
@@ -353,15 +382,12 @@ def create_server(
         Returns:
             갱신된 제안 목록 또는 상태 전이 오류다.
         """
-        components = dependencies()
-        if components is None:
-            return _error("dictionary_unavailable", "활성 사전 또는 이력 저장소를 준비할 수 없습니다.", False)
-        active_store = components[3]
+        active_store = dependencies().store
         try:
             updated = []
             for item in decisions:
                 updated.append(active_store.decide(analysis_id, item.suggestion_id, item.decision, item.selected_term_code, item.decided_by))
-            return SuggestionSubmissionOutput(analysis_id=analysis_id, suggestions=[SuggestionOutput.model_validate(item.to_dict()) for item in updated])
+            return _ok(SuggestionSubmissionOutput(analysis_id=analysis_id, suggestions=[SuggestionOutput.model_validate(item.to_dict()) for item in updated]))
         except (KeyError, ValueError, StoreError) as error:
             return _error("invalid_decision", str(error), False)
 
@@ -381,12 +407,21 @@ def _in_worker_thread(limiter: anyio.CapacityLimiter) -> Callable[[Callable[_P, 
     return decorate
 
 
+def _ok(output: BaseModel) -> CallToolResult:
+    """성공 결과다. ``structuredContent``는 출력 모델 그대로이고(``{"result": ...}``로 감싸지 않는다), content text는 같은 JSON이다."""
+    payload = output.model_dump(mode="json")
+    return CallToolResult(content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))], structuredContent=payload, isError=False)
+
+
 def _error(code: str, message: str, retryable: bool) -> CallToolResult:
-    """실패를 `isError`와 구조화 오류를 가진 MCP tool result로 만든다."""
+    """실패를 ``isError``와 최상위 ``{"error": ...}``(kodict·document-analysis와 같은 봉투)를 가진 MCP tool result로 만든다.
+
+    도구는 ``structured_output=False``라 FastMCP가 출력 스키마로 검증하거나 ``{"result": ...}``로 감싸지 않는다.
+    """
     payload = ErrorOutput(error=ErrorDetail(code=code, message=message, retryable=retryable)).model_dump(mode="json")
     return CallToolResult(
         content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
-        structuredContent={"result": payload},
+        structuredContent=payload,
         isError=True,
     )
 
@@ -398,32 +433,38 @@ def _text_too_large(text: str, max_text_chars: int) -> CallToolResult | None:
     return None
 
 
-def _audit_tool_call(name: str, result: Any, started: float) -> None:
-    """원문 없이 MCP request ID, 결과 코드와 실행 시간을 감사 로그에 남긴다."""
-    request_id = None
+def _request_id() -> str | None:
+    """Gateway가 보낸 `X-Request-ID`를 우선하고, 없으면 JSON-RPC id를 쓴다. 로그 주입을 막도록 정리한다."""
+    from mcp.server.lowlevel.server import request_ctx
     try:
-        from mcp.server.lowlevel.server import request_ctx
-        request_id = request_ctx.get().request_id
+        context = request_ctx.get()
     except LookupError:
-        pass
+        return None
+    headers = getattr(context.request, "headers", None)
+    gateway_request_id = headers.get("x-request-id") if headers is not None else None
+    candidate = str(gateway_request_id or context.request_id)
+    return candidate.replace("\r", "").replace("\n", "")[:128] or None
+
+
+def _audit_tool_call(name: str, result: Any, started: float) -> None:
+    """원문 없이 요청 ID, 결과 코드와 실행 시간을 감사 로그에 남긴다."""
     code = "ok"
     dictionary_version = "unavailable"
     structured = result.structuredContent if isinstance(result, CallToolResult) else None
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
         structured = result[1]
-    if isinstance(structured, dict):
-        payload = structured.get("result", {})
-        if isinstance(payload, dict):
-            dictionary_version = str(payload.get("dictionary_version", dictionary_version))
     if isinstance(result, CallToolResult) and result.isError:
-        code = str((structured or {}).get("result", {}).get("error", {}).get("code", "internal_error"))
+        error = (structured or {}).get("error")
+        code = str(error.get("code", "internal_error")) if isinstance(error, dict) else "internal_error"
+    elif isinstance(structured, dict):
+        dictionary_version = str(structured.get("dictionary_version", dictionary_version))
     audit_logger.info(
         "tool_call request_id=%s tool=%s result_code=%s duration_ms=%d service_version=%s dictionary_version=%s",
-        request_id,
+        _request_id(),
         name,
         code,
         round((time.perf_counter() - started) * 1000),
-        "0.1.0",
+        SERVICE_VERSION,
         dictionary_version,
     )
 

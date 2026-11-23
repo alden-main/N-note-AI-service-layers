@@ -187,7 +187,7 @@ class EngineWiringTests(unittest.TestCase):
         import asyncio
         from concurrent.futures import ThreadPoolExecutor
 
-        from n_note_ai_service_layers.adapters.pydantic_ai_completion import run_sync
+        from n_note_ai_service_layers.services.work_loop import run_sync
 
         async def current_loop():
             return asyncio.get_running_loop()

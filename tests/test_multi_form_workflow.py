@@ -125,14 +125,19 @@ class GenerateManyTests(unittest.TestCase):
         self.assertEqual(state["peak"], 2)
         self.assertTrue(all(isinstance(item, NursingNoteWorkflowResult) for item in outcomes), outcomes)
 
-    def test_shared_pools_are_reused_instead_of_created_per_call(self) -> None:
-        from n_note_ai_service_layers.services import executors
+    def test_blocking_calls_share_one_bounded_pool_instead_of_per_call_pools(self) -> None:
+        """작업마다 스레드 풀을 만들지 않는다. 블로킹 호출은 작업 루프의 기본 풀 하나(상한 고정)에서만 돈다."""
+        import threading
+
+        from n_note_ai_service_layers.services import work_loop
 
         forms = [(schema, object()) for schema in SCHEMAS.values()]
-        _workflow().generate_many(AUDIO, forms, max_parallel=3)
-        pools = {name: executors.shared(name, 1) for name in ("form-draft", "transcript-review")}
-        _workflow().generate_many(AUDIO, forms, max_parallel=3)
-        self.assertTrue(all(executors.shared(name, 1) is pool for name, pool in pools.items()))
+        for _ in range(5):
+            _workflow().generate_many(AUDIO, forms, max_parallel=3)
+        names = [thread.name for thread in threading.enumerate()]
+        self.assertFalse([name for name in names if name.startswith(("form-draft", "transcript-review", "draft-review", "llm-tool", "workflow-job"))])
+        limit = work_loop.loop()._default_executor._max_workers  # type: ignore[attr-defined]
+        self.assertLessEqual(sum(name.startswith("work-io") for name in names), limit)
 
     def test_a_crashing_transcript_review_becomes_unavailable_instead_of_failing_the_job(self) -> None:
         from n_note_ai_service_layers.services.nursing_note_workflow import TranscriptPreparation

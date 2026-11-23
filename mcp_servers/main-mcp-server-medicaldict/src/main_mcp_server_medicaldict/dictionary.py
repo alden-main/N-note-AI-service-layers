@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import sqlite3
@@ -81,9 +82,9 @@ class DictionaryRepository:
         self._thread_connections = local()
         # 분석기는 한글 연속 구간의 모든 문자 위치에서 두 글자 접두어를
         # 확인한다. 활성 스냅샷은 프로세스 수명 중 바뀌지 않으므로 결과를
-        # 제한된 LRU로 재사용해 반복 SQLite 연결·질의를 피한다.
-        self._korean_prefix_cache: OrderedDict[str, tuple[DictionaryTerm, ...]] = OrderedDict()
-        self._korean_prefix_cache_lock = RLock()
+        # 제한된 LRU로 재사용해 반복 SQLite 질의를 피한다. lru_cache는 thread 안전하며,
+        # 동시 첫 조회가 같은 접두어를 두 번 질의해도 같은 스냅샷 결과다.
+        self._korean_prefix_terms = functools.lru_cache(maxsize=KOREAN_PREFIX_CACHE_SIZE)(self._query_korean_prefix)
         # 접두어 색인으로 찾을 수 없는 첫 음절 오류용이다. 스냅샷은 읽기 전용이라 메모리에 만든다.
         self._phonetic_index: dict[str, tuple[str, ...]] | None = None
         self._phonetic_index_lock = RLock()
@@ -137,26 +138,18 @@ class DictionaryRepository:
         normalized = normalize_term(prefix)
         if len(normalized) < 2:
             return []
-        with self._korean_prefix_cache_lock:
-            cached = self._korean_prefix_cache.get(normalized)
-            if cached is not None:
-                self._korean_prefix_cache.move_to_end(normalized)
-                return list(cached)
+        # 캐시 값은 불변 tuple이고 호출부에는 새 목록을 준다.
+        return list(self._korean_prefix_terms(normalized))
+
+    def _query_korean_prefix(self, normalized: str) -> tuple[DictionaryTerm, ...]:
+        """정규화된 한글 접두어로 시작하는 사전 항목을 조회한다."""
         query = """
             SELECT source_id, term_code, concept_code, eng_name, kor_name, description
             FROM snapshot_term WHERE normalized_kor_name GLOB ?
         """
         with self._connect() as connection:
             rows = connection.execute(query, (f"{normalized}*",)).fetchall()
-        terms = tuple(DictionaryTerm(*row) for row in rows)
-        with self._korean_prefix_cache_lock:
-            # 다른 동시 요청이 같은 prefix를 먼저 채웠어도 동등한 snapshot
-            # 결과이므로 새 조회 결과를 안전하게 사용한다.
-            self._korean_prefix_cache[normalized] = terms
-            self._korean_prefix_cache.move_to_end(normalized)
-            while len(self._korean_prefix_cache) > KOREAN_PREFIX_CACHE_SIZE:
-                self._korean_prefix_cache.popitem(last=False)
-        return list(terms)
+        return tuple(DictionaryTerm(*row) for row in rows)
 
     def load_phonetic_index(self) -> dict[str, tuple[str, ...]]:
         """발음 키 → 정규화 한글 용어명 색인을 한 번만 만든다."""

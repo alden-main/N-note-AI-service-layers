@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterable, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
@@ -18,7 +18,7 @@ from n_note_ai_service_layers.contracts.term_verification import GatewayTermVeri
 from n_note_ai_service_layers.observability import get_logger, log_event, span, stage
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.draft_document import DraftDocument, is_filled
-from n_note_ai_service_layers.services import executors
+from n_note_ai_service_layers.services import work_loop
 from n_note_ai_service_layers.services.draft_token_scrub import scrub_privacy_tokens
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.llm_payload import LlmPayloadProjector
@@ -70,8 +70,8 @@ class PreparedTranscript:
     hints: tuple[dict[str, Any], ...]
     # 구술 기준 시각이다. 음성의 녹음 시각(``recorded_at``)이 있으면 그 시각, 없으면 준비 시각이다.
     reference_time: datetime
-    # 전사문 검토다. 힌트 대기 상한을 넘겼으면 아직 진행 중이며, 초안 단계가 결과를 받는다(공유 풀에서 실행).
-    review: Future[GatewayTermVerificationResult]
+    # 전사문 검토다(작업 루프의 asyncio 작업). 힌트 대기 상한을 넘겼으면 아직 진행 중이며, 초안 단계가 결과를 받는다.
+    review: asyncio.Future[GatewayTermVerificationResult]
 
 
 class TranscriptPreparation:
@@ -97,59 +97,60 @@ class TranscriptPreparation:
     def prepare(
         self, audio: AudioInput | PreTranscribedAudio, known_identifiers: Iterable[str], notify: Callable[[str], None],
     ) -> PreparedTranscript:
+        """``aprepare``의 동기 입구다(스크립트·테스트용)."""
+        return work_loop.run_sync(self.aprepare(audio, known_identifiers, notify))
+
+    async def aprepare(
+        self, audio: AudioInput | PreTranscribedAudio, known_identifiers: Iterable[str], notify: Callable[[str], None],
+    ) -> PreparedTranscript:
         """양식과 무관한 공통 단계다: STT → 비식별화 → 전사문 용어 검토 시작(힌트 대기 상한까지 기다림).
 
         ``PreTranscribedAudio``(녹음 세션에서 이미 전사한 음성)면 STT를 다시 하지 않고 비식별화부터 시작한다.
-        검토가 아직 진행 중이면 결과는 반환값의 ``review``로 받는다.
+        검토가 아직 진행 중이면 결과는 반환값의 ``review``로 받는다. STT·비식별화·Gateway는 동기 호출이라 스레드에서 부른다.
         """
         trace_id = audio.trace_id
+        identifiers = tuple(known_identifiers)
         if isinstance(audio, PreTranscribedAudio):
             transcript = audio.transcript
         else:
-            notify("stt")
+            await notify_async(notify, "stt")
             with stage(_logger, trace_id, "stt", audio_bytes=len(audio.content)) as metrics:
                 try:
-                    transcript = self.stt.transcribe(audio)
+                    transcript = await asyncio.to_thread(self.stt.transcribe, audio)
                 except AudioDecodeError as exc:
                     raise WorkflowStageError("audio_decode") from exc
                 except Exception as exc:
                     raise WorkflowStageError("stt") from exc
                 metrics["chars"] = len(transcript.text)
-        notify("redaction")
+        await notify_async(notify, "redaction")
         with stage(_logger, trace_id, "redaction") as metrics:
             try:
-                redacted = self.redactor.redact(transcript.text, known_identifiers)
+                redacted = await asyncio.to_thread(self.redactor.redact, transcript.text, identifiers)
             except Exception as exc:
                 # NER 실패 시 덜 가린 전사문을 외부로 보내지 않고 중단한다.
                 raise WorkflowStageError("redaction") from exc
             metrics["replacements"] = redacted.replacement_count
         external_transcript = Transcript(redacted.text, transcript.provider, transcript.model, transcript.language)
-        notify("transcript_term_review")
-        catalog = self._discover(trace_id)
-        # 작업마다 하나씩이므로 worker의 동시 작업 수만큼이면 충분하다.
-        review_pool = executors.shared("transcript-review", executors.worker_parallelism())
-        review = self._start_transcript_review(review_pool, external_transcript.text, trace_id, catalog)
+        await notify_async(notify, "transcript_term_review")
+        catalog = await asyncio.to_thread(self._discover, trace_id)
+        review = asyncio.ensure_future(self._review(external_transcript.text, trace_id, catalog))
         with stage(_logger, trace_id, "transcript_term_review") as metrics:
-            done, _ = wait([review], timeout=self.hint_budget_seconds)
-            hint_source = review.result() if done else None
+            done, _ = await asyncio.wait({review}, timeout=self.hint_budget_seconds)
+            hint_source = review.result() if review in done else None
             metrics.update(
                 status=hint_source.status if hint_source else "pending",
                 candidates=len(hint_source.occurrences) if hint_source else 0,
-                hints_deferred=not done,
+                hints_deferred=review not in done,
             )
         return PreparedTranscript(
             trace_id, external_transcript, redacted.replacement_count, catalog,
             self.hints(hint_source) if hint_source else (), audio.recorded_at or now_local(), review,
         )
 
-    def _start_transcript_review(
-        self, pool: ThreadPoolExecutor, text: str, trace_id: str, catalog: tuple[dict[str, Any], ...] | None,
-    ) -> Future[GatewayTermVerificationResult]:
+    async def _review(self, text: str, trace_id: str, catalog: tuple[dict[str, Any], ...] | None) -> GatewayTermVerificationResult:
         if catalog is None:
-            done: Future[GatewayTermVerificationResult] = Future()
-            done.set_result(GatewayTermVerificationResult("transcript", "unavailable"))
-            return done
-        return pool.submit(self._safe_review, text, trace_id, catalog)
+            return GatewayTermVerificationResult("transcript", "unavailable")
+        return await asyncio.to_thread(self._safe_review, text, trace_id, catalog)
 
     def _safe_review(self, text: str, trace_id: str, catalog: tuple[dict[str, Any], ...]) -> GatewayTermVerificationResult:
         """검토가 예외로 끝나도 ``unavailable``로 남긴다(검토 실패가 초안 생성 전체를 멈추지 않게)."""
@@ -213,11 +214,31 @@ class NursingNoteWorkflow:
         self, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
         progress: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
+        """``agenerate``의 동기 입구다(스크립트·테스트용)."""
+        return work_loop.run_sync(self.agenerate(snapshot, audio, schema, known_identifiers, progress))
+
+    async def agenerate(
+        self, snapshot, audio: AudioInput | PreTranscribedAudio, schema: FormSchema, known_identifiers: Iterable[str] = (),
+        progress: Callable[[str], None] | None = None,
+    ) -> NursingNoteWorkflowResult:
         """``progress``는 각 단계(stt, redaction, transcript_term_review, draft_generation, draft_review)를 시작할 때 호출된다."""
-        notify = progress or (lambda _: None)
-        return self.draft(self.preparation.prepare(audio, known_identifiers, notify), snapshot, schema, notify)
+        notify = progress or _ignore
+        return await self.adraft(await self.preparation.aprepare(audio, known_identifiers, notify), snapshot, schema, notify)
 
     def generate_many(
+        self,
+        audio: AudioInput | PreTranscribedAudio,
+        forms: Sequence[tuple[FormSchema, Any]],
+        known_identifiers: Iterable[str] = (),
+        progress: Callable[[str], None] | None = None,
+        on_form_stage: Callable[[int, str], None] | None = None,
+        on_form_done: Callable[[int, NursingNoteWorkflowResult | Exception], None] | None = None,
+        max_parallel: int = 1,
+    ) -> list[NursingNoteWorkflowResult | Exception]:
+        """``agenerate_many``의 동기 입구다(스크립트·테스트용)."""
+        return work_loop.run_sync(self.agenerate_many(audio, forms, known_identifiers, progress, on_form_stage, on_form_done, max_parallel))
+
+    async def agenerate_many(
         self,
         audio: AudioInput | PreTranscribedAudio,
         forms: Sequence[tuple[FormSchema, Any]],
@@ -235,68 +256,52 @@ class NursingNoteWorkflow:
         공통 단계가 실패하면 ``WorkflowStageError``를 던진다. 양식 하나의 실패는 다른 양식에 영향을 주지 않고
         결과 목록의 그 자리에 예외로 남는다(초안 생성 실패는 ``WorkflowStageError``).
         ``on_form_stage(index, stage)``는 양식별 단계가 바뀔 때, ``on_form_done(index, outcome)``은 양식 하나가
-        끝나는 즉시 작업 스레드에서 호출된다. 먼저 끝난 초안을 바로 저장·표시하기 위해서다.
+        끝나는 즉시 호출된다(콜백은 저장소를 쓸 수 있으므로 스레드에서 부른다). 먼저 끝난 초안을 바로 저장·표시하기 위해서다.
         """
         if not forms:
             raise ValueError("at least one form is required")
-        notify = progress or (lambda _: None)
-        form_stage = on_form_stage or (lambda _index, _stage: None)
-        form_done = on_form_done or (lambda _index, _outcome: None)
-        prepared = self.preparation.prepare(audio, known_identifiers, notify)
-        notify("draft_generation")
+        notify = progress or _ignore
+        form_stage = on_form_stage or _ignore
+        form_done = on_form_done or _ignore
+        prepared = await self.preparation.aprepare(audio, known_identifiers, notify)
+        await notify_async(notify, "draft_generation")
+        limit = asyncio.Semaphore(max(1, min(len(forms), max_parallel)))
 
-        def run(index: int, schema: FormSchema, snapshot: Any) -> NursingNoteWorkflowResult | Exception:
-            outcome: NursingNoteWorkflowResult | Exception
-            try:
-                outcome = self.draft(prepared, snapshot, schema, lambda name: form_stage(index, name))
-            except Exception as exc:  # 한 양식의 실패가 다른 양식의 결과를 버리지 않게 결과로 돌려준다.
-                outcome = exc
-            form_done(index, outcome)
-            return outcome
+        async def run(index: int, schema: FormSchema, snapshot: Any) -> NursingNoteWorkflowResult | Exception:
+            async with limit:
+                outcome: NursingNoteWorkflowResult | Exception
+                try:
+                    outcome = await self.adraft(prepared, snapshot, schema, lambda name: form_stage(index, name))
+                except Exception as exc:  # 한 양식의 실패가 다른 양식의 결과를 버리지 않게 결과로 돌려준다.
+                    outcome = exc
+                await notify_async(form_done, index, outcome)
+                return outcome
 
-        return self._run_forms(run, forms, max(1, min(len(forms), max_parallel)))
-
-    @staticmethod
-    def _run_forms(
-        run: Callable[[int, FormSchema, Any], NursingNoteWorkflowResult | Exception],
-        forms: Sequence[tuple[FormSchema, Any]],
-        max_parallel: int,
-    ) -> list[NursingNoteWorkflowResult | Exception]:
-        """양식 초안을 공유 풀에서 실행하되, 이 작업이 동시에 돌리는 양식은 ``max_parallel``개로 제한한다.
-
-        한도는 풀 안에서 세마포어로 기다리지 않고 제출 시점에 지킨다(기다리는 작업이 공유 스레드를 붙잡지 않게).
-        """
-        pool = executors.shared("form-draft", executors.worker_parallelism())
-        results: list[NursingNoteWorkflowResult | Exception | None] = [None] * len(forms)
-        queued = list(enumerate(forms))
-        running: dict[Future, int] = {}
-        while queued or running:
-            while queued and len(running) < max_parallel:
-                index, (schema, snapshot) = queued.pop(0)
-                running[pool.submit(run, index, schema, snapshot)] = index
-            done, _ = wait(running, return_when=FIRST_COMPLETED)
-            for future in done:
-                results[running.pop(future)] = future.result()
-        return results  # type: ignore[return-value]
+        return list(await asyncio.gather(*(run(index, schema, snapshot) for index, (schema, snapshot) in enumerate(forms))))
 
     def draft(
+        self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None = None,
+    ) -> NursingNoteWorkflowResult:
+        """``adraft``의 동기 입구다(스크립트·테스트용)."""
+        return work_loop.run_sync(self.adraft(prepared, snapshot, schema, notify))
+
+    async def adraft(
         self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None = None,
     ) -> NursingNoteWorkflowResult:
         """양식 하나의 단계다: 검토 힌트를 포함한 초안 생성 → 수치 대조 → (초안 용어 검토 ∥ 양식 완결성 검증)."""
         # 양식별 span이다. 여러 양식을 동시에 만들 때 추적 화면에서 양식마다 한 갈래로 보인다.
         with span("form_draft", prepared.trace_id, schema_id=schema.schema_id, schema_version=schema.version):
-            return self._draft(prepared, snapshot, schema, notify)
+            return await self._draft(prepared, snapshot, schema, notify or _ignore)
 
-    def _draft(
-        self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None] | None,
+    async def _draft(
+        self, prepared: PreparedTranscript, snapshot, schema: FormSchema, notify: Callable[[str], None],
     ) -> NursingNoteWorkflowResult:
-        notify = notify or (lambda _: None)
         trace_id, transcript, hints = prepared.trace_id, prepared.transcript, prepared.hints
-        notify("draft_generation")
+        await notify_async(notify, "draft_generation")
         with stage(_logger, trace_id, "draft_generation", schema_id=schema.schema_id) as metrics:
             try:
                 payload = self.projector.project(snapshot, transcript.text, schema, term_review_hints=hints, reference_time=prepared.reference_time)
-                draft = self.generator.generate(payload, schema)
+                draft = await self._generate(payload, schema)
             except Exception as exc:
                 raise WorkflowStageError("draft_generation") from exc
             # 환자 신원은 EMR이 확정한다. 초안에 남은 보호 토큰은 수치 대조·용어 검토 전에 지운다.
@@ -307,13 +312,13 @@ class NursingNoteWorkflow:
             draft = fill_recording_time(draft, schema, prepared.reference_time)
             metrics.update(fields=len(draft.proposed_fields), hints=len(hints))
         # 힌트 대기 상한을 넘긴 검토도 화면의 검토 후보로는 필요하다. Gateway timeout 안에 끝난다.
-        transcript_gateway = prepared.review.result()
+        transcript_gateway = await prepared.review
         sources = self.numeric_sources(transcript.text, payload)
         numeric_findings = NumericVerifier().check(schema, draft.proposed_fields, sources, prepared.reference_time, transcript=transcript.text)
         document = DraftDocument.build(schema, draft.proposed_fields)
-        notify("draft_review")
+        await notify_async(notify, "draft_review")
         with stage(_logger, trace_id, "draft_review", schema_id=schema.schema_id) as metrics:
-            draft_gateway, validation = self._review_draft(schema, document, trace_id, prepared.catalog)
+            draft_gateway, validation = await self._review_draft(schema, document, trace_id, prepared.catalog)
             metrics.update(term_status=draft_gateway.status, report_status=validation.status, numeric_findings=len(numeric_findings))
         return NursingNoteWorkflowResult(
             transcript, draft, transcript_gateway, draft_gateway, prepared.redaction_count,
@@ -321,24 +326,30 @@ class NursingNoteWorkflow:
             llm_applied_term_hints=self.applied_hints(hints, transcript.text, document.text),
         )
 
-    def _review_draft(
+    async def _generate(self, payload: dict[str, Any], schema: FormSchema) -> DraftResult:
+        """async 생성기(``agenerate``)는 기다리고, 동기 생성기(테스트 대역)는 스레드에서 부른다."""
+        agenerate = getattr(self.generator, "agenerate", None)
+        if agenerate is not None:
+            return await agenerate(payload, schema)
+        return await asyncio.to_thread(self.generator.generate, payload, schema)
+
+    async def _review_draft(
         self, schema: FormSchema, document: DraftDocument, trace_id: str, catalog: tuple[dict[str, Any], ...] | None,
     ) -> tuple[GatewayTermVerificationResult, ReportValidationResult]:
-        """초안 용어 검토와 양식 완결성 검증은 서로 독립이라 동시에 호출한다."""
+        """초안 용어 검토와 양식 완결성 검증은 서로 독립이라 동시에 호출한다(둘 다 동기 Gateway 호출이라 스레드에서)."""
         if catalog is None:
             # 필수 필드 완결성은 Gateway 없이도 판정한다. Gateway가 필요한 추가 기준만 unavailable이다.
             validation = (
-                self.report_validation.validate(schema, document, trace_id, gateway_available=False)
+                await asyncio.to_thread(self.report_validation.validate, schema, document, trace_id, None, False)
                 if self.report_validation else ReportValidationResult("skipped")
             )
             return GatewayTermVerificationResult("draft", "unavailable"), validation
+        terms = asyncio.to_thread(self.gateway_verification.verify_document, "draft", document, trace_id, catalog)
         if self.report_validation is None:
-            return self.gateway_verification.verify_document("draft", document, trace_id, catalog), ReportValidationResult("skipped")
-        # 양식 초안마다 두 작업이므로 worker의 동시 양식 수의 두 배로 둔다.
-        pool = executors.shared("draft-review", executors.worker_parallelism() * 2)
-        terms = pool.submit(self.gateway_verification.verify_document, "draft", document, trace_id, catalog)
-        report = pool.submit(self.report_validation.validate, schema, document, trace_id, catalog)
-        return terms.result(), report.result()
+            return await terms, ReportValidationResult("skipped")
+        report = asyncio.to_thread(self.report_validation.validate, schema, document, trace_id, catalog)
+        draft_gateway, validation = await asyncio.gather(terms, report)
+        return draft_gateway, validation
 
     @staticmethod
     def numeric_sources(transcript: str, payload: dict[str, Any]) -> tuple[str, ...]:
@@ -380,3 +391,13 @@ def fill_recording_time(draft: DraftResult, schema: FormSchema, recorded_at: dat
     if fields == draft.proposed_fields:
         return draft
     return replace(draft, proposed_fields=fields, evidence_refs=evidence)
+
+
+def _ignore(*_args: Any) -> None:
+    return None
+
+
+async def notify_async(callback: Callable[..., None], *args: Any) -> None:
+    """진행 콜백을 부른다. 콜백은 작업 상태 저장소(SQLite)를 쓸 수 있으므로 작업 루프를 막지 않게 스레드에서 부른다."""
+    if callback is not _ignore:
+        await asyncio.to_thread(callback, *args)

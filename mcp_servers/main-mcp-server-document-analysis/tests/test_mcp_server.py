@@ -1,17 +1,20 @@
 """Gateway 전용 network MCP 도구와 감사 경계를 확인한다."""
 
+import importlib.metadata
 import json
+import os
 import socket
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.request
 
 import uvicorn
 from starlette.testclient import TestClient
 
 from main_mcp_server_document_analysis.mcp_server import McpApplication, create_asgi_app
-from main_mcp_server_document_analysis.observability import SafeAuditLog
+from main_mcp_server_document_analysis.observability import SERVICE_VERSION, SafeAuditLog
 
 
 def arguments() -> dict:
@@ -127,11 +130,11 @@ class McpApplicationTest(unittest.TestCase):
         self.assertIn("assessment_policy", body["result"]["structuredContent"])
         self.assertFalse(body["result"]["isError"])
 
-    def test_gateway_prefixed_catalog_name_is_routed_to_the_actual_tool(self) -> None:
-        """Gateway가 충돌 방지를 위해 붙인 service prefix도 호출 대상에 사용할 수 있다."""
+    def test_prefixed_catalog_name_is_unknown_tool(self) -> None:
+        """Gateway가 service prefix를 떼고 호출하므로 접두사 붙은 이름은 알 수 없는 도구다."""
         response = McpApplication().call_tool("report__get_validation_guidance", {"validation_standard": arguments()["validation_standard"]})
-        self.assertFalse(response["isError"])
-        self.assertIn("assessment_policy", response["structuredContent"])
+        self.assertTrue(response["isError"])
+        self.assertEqual(response["structuredContent"]["error"]["code"], "invalid_input")
 
     def test_gateway_tools_call_accepts_extended_evidence_query_and_propagates_request_id(self) -> None:
         """확장 aliases/pattern_ids도 Gateway MCP envelope에서 실제 handler까지 전달된다."""
@@ -139,7 +142,7 @@ class McpApplicationTest(unittest.TestCase):
         request = {
             "jsonrpc": "2.0", "id": 8, "method": "tools/call",
             "params": {
-                "name": "report__find_evidence_candidates",
+                "name": "find_evidence_candidates",
                 "arguments": {
                     **arguments(),
                     "report": {"text": "3개월 동안의 결과분석"},
@@ -261,3 +264,40 @@ class AuditRetentionTest(unittest.TestCase):
         for request_id in ("a", "b", "c"):
             audit.record(request_id=request_id, tool_name="t", result_code="ok", standard_version=None, started_at=0.0)
         self.assertEqual([event.request_id for event in audit.events], ["b", "c"])
+
+    def test_audit_event_is_also_emitted_as_log_without_report_text(self) -> None:
+        """감사 이벤트는 같은 허용 필드만 logging으로도 내보낸다."""
+        audit = SafeAuditLog()
+        with self.assertLogs("main_mcp_server_document_analysis.audit", level="INFO") as captured:
+            audit.record(request_id="r-1", tool_name="t", result_code="ok", standard_version="v1", started_at=0.0)
+        logged = json.loads(captured.records[0].getMessage())
+        self.assertEqual(logged, audit.events[-1].__dict__)
+
+
+class ConfigurationTest(unittest.TestCase):
+    """입력 한도 환경 설정과 서비스 버전을 확인한다."""
+
+    def test_invalid_limit_environment_makes_service_not_ready(self) -> None:
+        for value in ("0", "-1", "abc"):
+            with self.subTest(value=value), unittest.mock.patch.dict(os.environ, {"MCP_MAX_TEXT_CHARS": value}):
+                self.assertFalse(McpApplication().is_ready())
+        with unittest.mock.patch.dict(os.environ, {"MCP_MAX_TEXT_CHARS": "7"}):
+            app = McpApplication()
+        self.assertTrue(app.is_ready())
+        self.assertEqual(app._max_text_chars, 7)
+
+    def test_each_tool_records_its_own_audit_name(self) -> None:
+        app = McpApplication()
+        app.call_tool("get_validation_guidance", {"validation_standard": arguments()["validation_standard"]})
+        app.call_tool("find_evidence_candidates", {**arguments(), "queries": "invalid"})
+        app.call_tool("evaluate_report_against_standard", arguments())
+        self.assertEqual(
+            [(event.tool_name, event.result_code, event.standard_version) for event in app._audit.events],
+            [("get_validation_guidance", "ok", "v1"), ("find_evidence_candidates", "invalid_input", "v1"), ("evaluate_report_against_standard", "ok", "v1")],
+        )
+
+    def test_service_version_comes_from_package_metadata(self) -> None:
+        self.assertEqual(SERVICE_VERSION, importlib.metadata.version("main-mcp-server-document-analysis"))
+        app = McpApplication()
+        app.evaluate(arguments())
+        self.assertEqual(app._audit.events[-1].service_version, SERVICE_VERSION)

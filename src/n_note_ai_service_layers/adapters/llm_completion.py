@@ -211,7 +211,7 @@ def model_tool_output(result: dict[str, Any]) -> dict[str, Any]:
     모르는 구조의 결과는 ``structuredContent``만, 구조화 결과가 없으면 원래 결과를 그대로 준다.
     """
     payload = result.get("structuredContent")
-    # FastMCP는 Union 반환 타입의 구조화 결과를 {"result": ...}로 감싼다.
+    # 예전 medic(FastMCP Union 반환)은 구조화 결과를 {"result": ...}로 감쌌다. 지금은 감싸지 않지만 둘 다 받는다.
     if isinstance(payload, dict) and set(payload) == {"result"} and isinstance(payload["result"], dict):
         payload = payload["result"]
     if not isinstance(payload, dict):

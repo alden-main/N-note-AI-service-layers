@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
+from dataclasses import dataclass
 from typing import Any
 
 from .contracts import (
     CandidateCriterion, CandidateElement, Citation, CriterionResult, EvaluationResult,
     Finding, InputError, SemanticAssessment, Status, ValidationStandard,
 )
+from .hmd_standard import interpret_hmd_analysis_requirement_set_v1
+from .standards import interpret_report_validation_standard_v1
 
 _STATUSES = {"satisfied", "missing", "insufficient", "uncertain"}
 _CITATION_REQUIRED = {"satisfied", "insufficient"}
@@ -95,150 +99,164 @@ def _element(value: Any) -> CandidateElement:
     )
 
 
-class CoverageValidator:
-    """기준 목록과 citation을 신뢰 원본으로 사용하는 결정적 validator다."""
+_INTERPRETERS = {
+    "report-validation-standard/v1": interpret_report_validation_standard_v1,
+    "hmd-analysis-requirement-set/v1": interpret_hmd_analysis_requirement_set_v1,
+}
 
-    def validate(self, standard: ValidationStandard, report: str, candidate: SemanticAssessment) -> EvaluationResult:
-        """모든 기준과 요소의 결과를 만든다.
 
-        입력 기준에 없는 ID, 중복 ID, 유효하지 않은 citation은 해당 후보만 무효화한다.
-        그러므로 하나의 외부 후보 실패가 다른 criterion 결과를 중단시키지 않는다.
-        """
-        if not isinstance(report, str):
-            raise InputError("report.text must be a string")
-        candidates, duplicate_ids = self._index_candidates(candidate)
-        results = tuple(self._criterion_result(spec, report, candidates.get(spec.criterion_id), spec.criterion_id in duplicate_ids) for spec in standard.criteria)
-        known_ids = {spec.criterion_id for spec in standard.criteria}
-        warnings = ["unknown candidate criterion: " + item_id for item_id in candidates if item_id not in known_ids and item_id != "__invalid__"]
-        if "__invalid__" in candidates:
-            warnings.append("invalid candidate criterion ignored")
-        for criterion_id, criterion in candidates.items():
-            spec = next((item for item in standard.criteria if item.criterion_id == criterion_id), None)
-            if spec is not None:
-                known_element_ids = {element.element_id for element in spec.required_elements}
-                warnings.extend(f"unknown candidate element: {criterion_id}.{element.element_id}" for element in criterion.elements if element.element_id not in known_element_ids)
-        return EvaluationResult(standard.standard_id, standard.standard_version, standard.status, standard.result_policy, standard.mutation_policy, results, warnings=tuple(warnings))
+def interpret_standard(raw: Any) -> ValidationStandard:
+    """schema_version에 맞는 interpreter로 기준 전체를 공통 IR로 변환한다."""
+    if not isinstance(raw, dict):
+        raise InputError("validation_standard must be an object")
+    interpreter = _INTERPRETERS.get(raw.get("schema_version"))
+    if interpreter is None:
+        raise InputError("unsupported validation_standard schema_version")
+    return interpreter(raw)
 
-    def _index_candidates(self, candidate: SemanticAssessment) -> tuple[dict[str, CandidateCriterion], set[str]]:
-        """candidate criterion ID를 index화하고 중복 ID를 별도로 기록한다."""
-        indexed: dict[str, CandidateCriterion] = {}
-        duplicates: set[str] = set()
-        for item in candidate.criteria:
-            if item.criterion_id in indexed:
-                duplicates.add(item.criterion_id)
+
+def validate_coverage(standard: ValidationStandard, report: Any, candidate: SemanticAssessment) -> EvaluationResult:
+    """기준 목록과 citation을 신뢰 원본으로 모든 기준과 요소의 결과를 결정적으로 만든다.
+
+    입력 기준에 없는 ID, 중복 ID, 유효하지 않은 citation은 해당 후보만 무효화한다.
+    그러므로 하나의 외부 후보 실패가 다른 criterion 결과를 중단시키지 않는다.
+    """
+    if not isinstance(report, str):
+        raise InputError("report.text must be a string")
+    candidates, duplicate_ids = _index_candidates(candidate)
+    results = tuple(_criterion_result(spec, report, candidates.get(spec.criterion_id), spec.criterion_id in duplicate_ids) for spec in standard.criteria)
+    specs = {spec.criterion_id: spec for spec in standard.criteria}
+    warnings = ["unknown candidate criterion: " + item_id for item_id in candidates if item_id not in specs and item_id != "__invalid__"]
+    if "__invalid__" in candidates:
+        warnings.append("invalid candidate criterion ignored")
+    for criterion_id, criterion in candidates.items():
+        spec = specs.get(criterion_id)
+        if spec is not None:
+            known_element_ids = {element.element_id for element in spec.required_elements}
+            warnings.extend(f"unknown candidate element: {criterion_id}.{element.element_id}" for element in criterion.elements if element.element_id not in known_element_ids)
+    return EvaluationResult(standard.standard_id, standard.standard_version, standard.status, standard.result_policy, standard.mutation_policy, results, warnings=tuple(warnings))
+
+
+def _index_candidates(candidate: SemanticAssessment) -> tuple[dict[str, CandidateCriterion], set[str]]:
+    """candidate criterion ID를 index화하고 중복 ID를 별도로 기록한다."""
+    indexed: dict[str, CandidateCriterion] = {}
+    duplicates: set[str] = set()
+    for item in candidate.criteria:
+        if item.criterion_id in indexed:
+            duplicates.add(item.criterion_id)
+        else:
+            indexed[item.criterion_id] = item
+    return indexed, duplicates
+
+
+def _criterion_result(spec: Any, report: str, candidate: CandidateCriterion | None, duplicate: bool) -> CriterionResult:
+    """criterion 후보와 각 element 후보를 독립적으로 정규화한다."""
+    warning = "duplicate or invalid candidate criterion" if duplicate or (candidate is not None and candidate.criterion_id == "__invalid__") else None
+    criterion = _finding(spec.criterion_id, candidate.status if candidate else "uncertain", candidate.reason if candidate else None, candidate.citations if candidate else (), report, warning)
+    elements_by_id: dict[str, CandidateElement] = {}
+    duplicate_elements: set[str] = set()
+    if candidate and not warning:
+        for element in candidate.elements:
+            if element.element_id in elements_by_id:
+                duplicate_elements.add(element.element_id)
             else:
-                indexed[item.criterion_id] = item
-        return indexed, duplicates
-
-    def _criterion_result(self, spec: Any, report: str, candidate: CandidateCriterion | None, duplicate: bool) -> CriterionResult:
-        """criterion 후보와 각 element 후보를 독립적으로 정규화한다."""
-        warning = "duplicate or invalid candidate criterion" if duplicate or (candidate is not None and candidate.criterion_id == "__invalid__") else None
-        criterion = self._finding(spec.criterion_id, candidate.status if candidate else "uncertain", candidate.reason if candidate else None, candidate.citations if candidate else (), report, warning)
-        elements_by_id: dict[str, CandidateElement] = {}
-        duplicate_elements: set[str] = set()
-        if candidate and not warning:
-            for element in candidate.elements:
-                if element.element_id in elements_by_id:
-                    duplicate_elements.add(element.element_id)
-                else:
-                    elements_by_id[element.element_id] = element
-        elements = tuple(
-            self._finding(element.element_id, elements_by_id[element.element_id].status if element.element_id in elements_by_id else "uncertain", elements_by_id[element.element_id].reason if element.element_id in elements_by_id else None, elements_by_id[element.element_id].citations if element.element_id in elements_by_id else (), report, "duplicate candidate element" if element.element_id in duplicate_elements else None)
-            for element in spec.required_elements
-        )
-        return CriterionResult(spec.criterion_id, spec.description, criterion, elements)
-
-    def _finding(self, item_id: str, status: Status, reason: str | None, citations: tuple[Citation, ...], report: str, warning: str | None) -> Finding:
-        """상태별 citation 규칙과 원문 offset/quote 일치를 검사해 finding을 만든다."""
-        warnings = [warning] if warning else []
-        if status in _CITATION_REQUIRED and not citations:
-            warnings.append("citation required for satisfied or insufficient")
-        if any(citation.start < 0 or citation.end < citation.start or citation.end > len(report) or report[citation.start:citation.end] != citation.quote for citation in citations):
-            warnings.append("citation does not match report")
-        if warnings:
-            return Finding(item_id, "uncertain", None, (), tuple(warnings))
-        return Finding(item_id, status, reason, citations)
+                elements_by_id[element.element_id] = element
+    elements = []
+    for element in spec.required_elements:
+        found = elements_by_id.get(element.element_id)
+        elements.append(_finding(
+            element.element_id, found.status if found else "uncertain", found.reason if found else None,
+            found.citations if found else (), report, "duplicate candidate element" if element.element_id in duplicate_elements else None,
+        ))
+    return CriterionResult(spec.criterion_id, spec.description, criterion, tuple(elements))
 
 
-class ReportValidationService:
-    """기준 해석·candidate 파싱·결정적 검증을 순서대로 조합한다."""
+def _finding(item_id: str, status: Status, reason: str | None, citations: tuple[Citation, ...], report: str, warning: str | None) -> Finding:
+    """상태별 citation 규칙과 원문 offset/quote 일치를 검사해 finding을 만든다."""
+    warnings = [warning] if warning else []
+    if status in _CITATION_REQUIRED and not citations:
+        warnings.append("citation required for satisfied or insufficient")
+    if any(citation.start < 0 or citation.end < citation.start or citation.end > len(report) or report[citation.start:citation.end] != citation.quote for citation in citations):
+        warnings.append("citation does not match report")
+    if warnings:
+        return Finding(item_id, "uncertain", None, (), tuple(warnings))
+    return Finding(item_id, status, reason, citations)
 
-    def __init__(self, registry: Any, validator: CoverageValidator | None = None) -> None:
-        """등록된 기준 interpreter와 validator를 보관한다."""
-        self._registry = registry
-        self._validator = validator or CoverageValidator()
 
-    def evaluate(self, report: dict[str, Any], standard: dict[str, Any], semantic_assessment: Any = None) -> EvaluationResult:
-        """요청 본문을 받아 사람이 검토할 평가 결과를 반환한다."""
-        if not isinstance(report, dict):
-            raise InputError("report must be an object")
-        return self._validator.validate(self._registry.interpret(standard), report.get("text"), parse_semantic_assessment(semantic_assessment))
+def evaluate(report: Any, standard: Any, semantic_assessment: Any = None) -> EvaluationResult:
+    """요청 본문을 받아 사람이 검토할 평가 결과를 반환한다."""
+    if not isinstance(report, dict):
+        raise InputError("report must be an object")
+    return validate_coverage(interpret_standard(standard), report.get("text"), parse_semantic_assessment(semantic_assessment))
 
-    def guidance(self, standard: dict[str, Any]) -> dict[str, Any]:
-        """LLM이 근거를 수집할 수 있는 검토 규칙을 구조화해 반환한다.
 
-        Args:
-            standard: schema_version을 포함한 검증 기준 JSON이다.
+def guidance(standard: Any) -> dict[str, Any]:
+    """LLM이 근거를 수집할 수 있는 검토 규칙을 구조화해 반환한다.
 
-        Returns:
-            기준별 설명·필수 요소와 상태·citation 정책을 담은 JSON 호환 사전이다.
-        """
-        interpreted = self._registry.interpret(standard)
-        return {
-            "standard": {
-                "standard_id": interpreted.standard_id,
-                "standard_version": interpreted.standard_version,
-                "result_policy": interpreted.result_policy,
-                "mutation_policy": interpreted.mutation_policy,
-            },
-            "assessment_policy": {
-                "allowed_statuses": ["satisfied", "missing", "insufficient", "uncertain"],
-                "citation_required_for": ["satisfied", "insufficient"],
-                "missing_rule": "내용 부재를 판단한 경우에만 missing을 사용합니다.",
-                "uncertain_rule": "근거나 의미 판단이 충분하지 않으면 uncertain을 사용합니다.",
-            },
-            "criteria": [
-                {
-                    "criterion_id": criterion.criterion_id,
-                    "category": criterion.category,
-                    "description": criterion.description,
-                    "required_elements": [
-                        {"element_id": element.element_id, "description": element.description}
-                        for element in criterion.required_elements
-                    ],
-                }
-                for criterion in interpreted.criteria
-            ],
-        }
+    Args:
+        standard: schema_version을 포함한 검증 기준 JSON이다.
 
-    def find_evidence_candidates(self, report: dict[str, Any], standard: dict[str, Any], queries: Any) -> dict[str, Any]:
-        """검색어가 포함된 보고서 문장과 citation 좌표를 결정적으로 반환한다.
-
-        Args:
-            report: `text`를 포함하는 보고서 객체다.
-            standard: 검색 대상 ID를 제한할 검증 기준 JSON이다.
-            queries: criterion_id, 선택 element_id, 비공백 terms 목록을 가진 검색 요청 목록이다.
-
-        Returns:
-            요청별 원문 문장, start/end offset 및 실제로 일치한 검색어 목록이다.
-        """
-        if not isinstance(report, dict) or not isinstance(report.get("text"), str):
-            raise InputError("report.text must be a string")
-        if not isinstance(queries, list):
-            raise InputError("queries must be a list")
-        interpreted = self._registry.interpret(standard)
-        criteria = {criterion.criterion_id: criterion for criterion in interpreted.criteria}
-        sentences = _report_sentences(report["text"])
-        results: list[dict[str, Any]] = []
-        for index, query in enumerate(queries):
-            criterion_id, element_id, terms, aliases, pattern_ids = _parse_evidence_query(query, index, criteria)
-            matches = _find_evidence_matches(report["text"], sentences, terms, aliases, pattern_ids)
-            results.append({"criterion_id": criterion_id, "element_id": element_id, "matches": matches})
-        return {
+    Returns:
+        기준별 설명·필수 요소와 상태·citation 정책을 담은 JSON 호환 사전이다.
+    """
+    interpreted = interpret_standard(standard)
+    return {
+        "standard": {
             "standard_id": interpreted.standard_id,
             "standard_version": interpreted.standard_version,
-            "queries": results,
-        }
+            "result_policy": interpreted.result_policy,
+            "mutation_policy": interpreted.mutation_policy,
+        },
+        "assessment_policy": {
+            "allowed_statuses": ["satisfied", "missing", "insufficient", "uncertain"],
+            "citation_required_for": ["satisfied", "insufficient"],
+            "missing_rule": "내용 부재를 판단한 경우에만 missing을 사용합니다.",
+            "uncertain_rule": "근거나 의미 판단이 충분하지 않으면 uncertain을 사용합니다.",
+        },
+        "criteria": [
+            {
+                "criterion_id": criterion.criterion_id,
+                "category": criterion.category,
+                "description": criterion.description,
+                "required_elements": [
+                    {"element_id": element.element_id, "description": element.description}
+                    for element in criterion.required_elements
+                ],
+            }
+            for criterion in interpreted.criteria
+        ],
+    }
+
+
+def find_evidence_candidates(report: Any, standard: Any, queries: Any) -> dict[str, Any]:
+    """검색어가 포함된 보고서 문장과 citation 좌표를 결정적으로 반환한다.
+
+    Args:
+        report: `text`를 포함하는 보고서 객체다.
+        standard: 검색 대상 ID를 제한할 검증 기준 JSON이다.
+        queries: criterion_id, 선택 element_id, 비공백 terms 목록을 가진 검색 요청 목록이다.
+
+    Returns:
+        요청별 원문 문장, start/end offset 및 실제로 일치한 검색어 목록이다.
+    """
+    if not isinstance(report, dict) or not isinstance(report.get("text"), str):
+        raise InputError("report.text must be a string")
+    if not isinstance(queries, list):
+        raise InputError("queries must be a list")
+    interpreted = interpret_standard(standard)
+    criteria = {criterion.criterion_id: criterion for criterion in interpreted.criteria}
+    # 보고서 색인(문장·공백 제거 casefold 문자열)은 요청당 한 번만 만들어 모든 검색어가 공유한다.
+    indexed = _ReportIndex.build(report["text"])
+    results: list[dict[str, Any]] = []
+    for index, query in enumerate(queries):
+        criterion_id, element_id, terms, aliases, pattern_ids = _parse_evidence_query(query, index, criteria)
+        matches = _find_evidence_matches(indexed, terms, aliases, pattern_ids)
+        results.append({"criterion_id": criterion_id, "element_id": element_id, "matches": matches})
+    return {
+        "standard_id": interpreted.standard_id,
+        "standard_version": interpreted.standard_version,
+        "queries": results,
+    }
 
 
 def _parse_evidence_query(
@@ -288,20 +306,49 @@ def _registered_pattern_ids(value: Any) -> tuple[str, ...]:
     return pattern_ids
 
 
+@dataclass(frozen=True)
+class _ReportIndex:
+    """한 보고서에 대한 검색 색인이다. 요청당 한 번 만들어 모든 검색어가 공유한다.
+
+    `folded`는 공백을 뺀 casefold 문자열이고, `folded_indices[i]`는 `folded[i]`가 나온 원문 code-point 위치다.
+    casefold가 한 글자를 여러 글자로 늘려도(예: 'ß'→'ss') 늘어난 글자는 모두 같은 원문 위치를 가리킨다.
+    """
+
+    text: str
+    sentences: tuple[tuple[int, int, str], ...]
+    sentence_starts: tuple[int, ...]
+    folded: str
+    folded_indices: tuple[int, ...]
+
+    @classmethod
+    def build(cls, text: str) -> _ReportIndex:
+        """문장 목록과 공백 제거 casefold 문자열·원문 위치 표를 만든다."""
+        sentences = _report_sentences(text)
+        folded: list[str] = []
+        indices: list[int] = []
+        for index, character in enumerate(text):
+            if character.isspace():
+                continue
+            for folded_character in character.casefold():
+                folded.append(folded_character)
+                indices.append(index)
+        return cls(text, sentences, tuple(sentence[0] for sentence in sentences), "".join(folded), tuple(indices))
+
+
 def _find_evidence_matches(
-    report: str,
-    sentences: tuple[tuple[int, int, str], ...],
+    indexed: _ReportIndex,
     terms: tuple[str, ...],
     aliases: tuple[str, ...],
     pattern_ids: tuple[str, ...],
 ) -> list[dict[str, Any]]:
     """문자열·승인 alias·등록 pattern의 원문 범위를 보존해 후보를 만든다."""
+    report = indexed.text
     matches: dict[tuple[int, int, str], dict[str, Any]] = {}
 
     def add(start: int, end: int, matched_term: str, strategy: str, sentence_candidate: bool) -> None:
         # 공백 정규화로 문장 경계를 넘은 경우에는 문장 quote를 만들 수 없으므로
         # 실제 원문 연속 구간 자체를 quote로 사용한다.
-        sentence = _enclosing_sentence(sentences, start, end) if sentence_candidate else None
+        sentence = _enclosing_sentence(indexed, start, end) if sentence_candidate else None
         quote_start, quote_end = sentence[:2] if sentence else (start, end)
         key = (quote_start, quote_end, strategy)
         item = matches.setdefault(key, {
@@ -322,7 +369,7 @@ def _find_evidence_matches(
             exact_spans = set(_literal_spans(report, expression))
             for start, end in exact_spans:
                 add(start, end, expression, literal_strategy, True)
-            for start, end in _whitespace_normalized_spans(report, expression):
+            for start, end in _whitespace_normalized_spans(indexed, expression):
                 if (start, end) not in exact_spans:
                     add(start, end, expression, normalized_strategy, True)
 
@@ -338,20 +385,12 @@ def _literal_spans(report: str, expression: str) -> tuple[tuple[int, int], ...]:
     return tuple((match.start(), match.end()) for match in re.finditer(re.escape(expression), report, re.IGNORECASE))
 
 
-def _whitespace_normalized_spans(report: str, expression: str) -> tuple[tuple[int, int], ...]:
+def _whitespace_normalized_spans(indexed: _ReportIndex, expression: str) -> tuple[tuple[int, int], ...]:
     """Unicode 공백 변형을 무시해 일치시키되, 원문 code-point 범위를 반환한다."""
     target = "".join(character.casefold() for character in expression.strip() if not character.isspace())
     if not target:
         return ()
-    folded: list[str] = []
-    indices: list[int] = []
-    for index, character in enumerate(report):
-        if character.isspace():
-            continue
-        for folded_character in character.casefold():
-            folded.append(folded_character)
-            indices.append(index)
-    haystack = "".join(folded)
+    haystack, indices = indexed.folded, indexed.folded_indices
     spans: list[tuple[int, int]] = []
     start_at = 0
     while (found := haystack.find(target, start_at)) >= 0:
@@ -362,11 +401,16 @@ def _whitespace_normalized_spans(report: str, expression: str) -> tuple[tuple[in
     return tuple(spans)
 
 
-def _enclosing_sentence(
-    sentences: tuple[tuple[int, int, str], ...], start: int, end: int
-) -> tuple[int, int, str] | None:
-    """일치 범위 전체를 포함하는 문장이 있을 때만 기존 문장 단위 quote를 쓴다."""
-    return next((sentence for sentence in sentences if sentence[0] <= start and end <= sentence[1]), None)
+def _enclosing_sentence(indexed: _ReportIndex, start: int, end: int) -> tuple[int, int, str] | None:
+    """일치 범위 전체를 포함하는 문장이 있을 때만 기존 문장 단위 quote를 쓴다.
+
+    문장은 시작 위치 순으로 겹치지 않으므로 `start` 이하에서 시작하는 마지막 문장만 후보다.
+    """
+    position = bisect_right(indexed.sentence_starts, start) - 1
+    if position < 0:
+        return None
+    sentence = indexed.sentences[position]
+    return sentence if end <= sentence[1] else None
 
 
 def _report_sentences(report: str) -> tuple[tuple[int, int, str], ...]:

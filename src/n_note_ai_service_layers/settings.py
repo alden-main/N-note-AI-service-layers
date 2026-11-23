@@ -5,7 +5,7 @@
 대체하지 않고 ``pydantic.ValidationError``로 알린다. 로컬 ``.env``는 ``dotenv.load_dotenv()``로 불러온다.
 
 설정을 읽는 곳은 조립 지점(``api/state.py``·``api/deps.py``·``adapters/model_providers.py``·진입점 스크립트),
-API 계층, 경계 유틸(``services/clock.py``·``services/executors.py``)뿐이다. 서비스·어댑터 생성자는 값을 인자로
+API 계층, 경계 유틸(``services/clock.py``·``services/work_loop.py``)뿐이다. 서비스·어댑터 생성자는 값을 인자로
 받고, 기본값은 아래 ``DEFAULT_*`` 상수를 쓴다.
 """
 

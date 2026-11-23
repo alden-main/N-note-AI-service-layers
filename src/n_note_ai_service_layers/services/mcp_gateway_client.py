@@ -390,22 +390,41 @@ def _tool_outcome(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_error_details(result: dict[str, Any]) -> tuple[str, bool]:
-    """Read the Gateway's compact error envelope without retaining its message text."""
+    """Read the Gateway's compact error envelope without retaining its message text.
+
+    순서: 최상위 ``code`` → ``structuredContent.error``(모든 MCP 서버의 현재 봉투) →
+    ``structuredContent.result.error``(예전 medic, FastMCP의 Union 결과 감싸기) → content text JSON의 ``error``.
+    """
     code = result.get("code") or result.get("errorCode")
     retryable = result.get("retryable")
     if not code:
-        content = result.get("content")
-        if isinstance(content, list):
-            for item in content:
-                text = item.get("text") if isinstance(item, dict) else None
-                if not isinstance(text, str):
-                    continue
-                try:
-                    embedded = json.loads(text).get("error", {})
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(embedded, dict):
-                    code = embedded.get("code")
-                    retryable = embedded.get("retryable", retryable)
-                    break
+        embedded = _structured_error(result.get("structuredContent")) or _text_error(result.get("content"))
+        if embedded:
+            code = embedded.get("code")
+            retryable = embedded.get("retryable", retryable)
     return str(code or "tool_error"), bool(retryable)
+
+
+def _structured_error(structured: Any) -> dict[str, Any] | None:
+    if not isinstance(structured, dict):
+        return None
+    if isinstance(structured.get("error"), dict):
+        return structured["error"]
+    legacy = structured.get("result")
+    return legacy["error"] if isinstance(legacy, dict) and isinstance(legacy.get("error"), dict) else None
+
+
+def _text_error(content: Any) -> dict[str, Any] | None:
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        text = item.get("text") if isinstance(item, dict) else None
+        if not isinstance(text, str):
+            continue
+        try:
+            embedded = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(embedded, dict) and isinstance(embedded.get("error"), dict):
+            return embedded["error"]
+    return None

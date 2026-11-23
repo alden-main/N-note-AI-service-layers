@@ -21,7 +21,7 @@ from n_note_ai_service_layers.api.deps import get_transcript_preparation, read_a
 from n_note_ai_service_layers.contracts.audio import AudioInput
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
 from n_note_ai_service_layers.observability import span
-from n_note_ai_service_layers.services import form_extraction
+from n_note_ai_service_layers.services import form_extraction, work_loop
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.nursing_note_workflow import TranscriptPreparation, WorkflowStageError
 from n_note_ai_service_layers.services.recording_time import parse_recorded_at, resolve_recording_time
@@ -123,9 +123,14 @@ async def _internal_transcription(request: Request, preparation: TranscriptPrepa
     metadata_time = None if requested_time else await run_in_threadpool(audio_creation_time, content)
     recording = resolve_recording_time(requested_time, metadata_time, received_at)
     audio = AudioInput(content, file.filename or "audio", file.content_type or "application/octet-stream", trace_id, "ko", recorded_at=recording.value)
-    # STT → 비식별화 → 전사문 검토(힌트 대기 상한까지)는 비동기 초안 작업과 같은 공통 단계다.
+    # 공통 단계·서식 추출은 서비스 작업 루프에서 돈다(API 루프는 HTTP만 처리한다).
+    return await work_loop.run(_transcribe_and_extract(preparation, audio, templates, trace_id))
+
+
+async def _transcribe_and_extract(preparation: TranscriptPreparation, audio: AudioInput, templates: list[dict], trace_id: str) -> dict:
+    """작업 루프에서 실행한다: STT → 비식별화 → 전사문 검토(힌트 대기 상한까지) → 서식별 추출."""
     try:
-        prepared = await run_in_threadpool(preparation.prepare, audio, (), lambda _stage: None)
+        prepared = await preparation.aprepare(audio, (), lambda _stage: None)
     except WorkflowStageError as exc:
         status_code, detail = _PREPARATION_FAILURES.get(exc.stage, (503, "speech transcription is unavailable"))
         raise HTTPException(status_code=status_code, detail=detail) from exc
@@ -139,7 +144,7 @@ async def _internal_transcription(request: Request, preparation: TranscriptPrepa
         hints_deferred=not reviewed_in_time, recorded_at=prepared.reference_time,
     )
     if not reviewed_in_time:
-        _require_review(await asyncio.wrap_future(prepared.review))
+        _require_review(await prepared.review)
     return {"transcript": prepared.transcript.text, "recordedAt": prepared.reference_time.isoformat(), "forms": forms}
 
 
@@ -160,7 +165,8 @@ async def _extract_forms(
 
     async def extract_form(template: dict) -> dict:
         async with limit:
-            return await run_in_threadpool(
+            # 추출은 동기 LLM 입구(complete)를 쓰므로 스레드에서 부른다.
+            return await asyncio.to_thread(
                 form_extraction.extract_form, template, sentences, transcript, hints, trace_id, recorded_at, hints_deferred,
             )
 

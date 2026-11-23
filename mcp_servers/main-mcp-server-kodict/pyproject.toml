@@ -10,6 +10,8 @@ requires-python = ">=3.12"
 dependencies = [
     "kiwipiepy>=0.21,<1",
     "mcp>=1.20,<2",
+    # mcp가 이미 의존한다. 설정 로딩에 직접 쓰므로 명시한다.
+    "pydantic-settings>=2.5.2,<3",
     "uvicorn>=0.30,<1",
 ]
 

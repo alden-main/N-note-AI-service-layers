@@ -340,3 +340,75 @@ def test_compact_review_limit_counts_only_findings_with_candidates(tmp_path: Pat
     compact = reviewer.review(text, compact=True)
     assert compact["warnings"] == []
     assert compact["findings"][-1]["candidates"][0]["replacement"] == "돼요"
+
+
+def test_repository_reuses_connection_per_thread(tmp_path: Path) -> None:
+    """같은 thread의 조회는 연결을 재사용하고, 다른 thread는 자기 연결을 연다."""
+    import threading
+
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    repository = DictionaryRepository(database)
+
+    with repository.read_session() as first:
+        pass
+    assert repository.lookup("가다")
+    with repository.read_session() as second:
+        pass
+    assert first is second
+
+    other: list[sqlite3.Connection] = []
+
+    def open_in_other_thread() -> None:
+        with repository.read_session() as connection:
+            other.append(connection)
+
+    thread = threading.Thread(target=open_in_other_thread)
+    thread.start()
+    thread.join()
+    assert other and other[0] is not first
+
+
+def test_repository_opens_read_only_and_optionally_immutable(tmp_path: Path) -> None:
+    """연결은 쓰기를 거부하고, immutable 설정이면 불변 파일 모드로도 조회된다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+
+    for immutable in (False, True):
+        repository = DictionaryRepository(database, immutable=immutable)
+        assert repository.is_ready() is True
+        assert repository.lookup("가다")[0].entry_id == "sample.xls:2"
+        with repository.read_session() as connection:
+            try:
+                connection.execute("DELETE FROM surface_form")
+            except sqlite3.OperationalError:
+                pass
+            else:
+                raise AssertionError("읽기 전용 연결이 쓰기를 허용했다.")
+
+
+def test_repository_discards_connection_after_sqlite_error(tmp_path: Path) -> None:
+    """SQLite 오류가 난 연결은 버리고, 다음 요청은 새 연결을 연다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    repository = DictionaryRepository(database)
+
+    with repository.read_session() as broken:
+        pass
+    try:
+        with repository.read_session() as connection:
+            connection.execute("SELECT * FROM missing_table")
+    except sqlite3.OperationalError:
+        pass
+    with repository.read_session() as fresh:
+        pass
+    assert fresh is not broken
+
+
+def test_missing_database_is_not_cached_as_connection(tmp_path: Path) -> None:
+    """기동 후 사전이 생기면 실패한 연결 시도에 묶이지 않고 준비 상태가 된다."""
+    database = tmp_path / "dictionary.sqlite3"
+    repository = DictionaryRepository(database)
+    assert repository.is_ready() is False
+    make_database(database)
+    assert repository.is_ready() is True

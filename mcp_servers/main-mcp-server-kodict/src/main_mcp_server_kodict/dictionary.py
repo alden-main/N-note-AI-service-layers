@@ -6,6 +6,7 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
+from threading import local
 from typing import Iterator
 
 from .normalization import normalize_surface
@@ -15,8 +16,12 @@ from .models import Entry, Evidence, Source
 class DictionaryRepository:
     """활성 SQLite DB만 읽는 사전 저장소다."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, immutable: bool = False) -> None:
         self.database_path = database_path
+        self.immutable = immutable
+        # 읽기 전용 연결을 thread마다 하나씩 열어 재사용한다. 도구 호출은 anyio worker thread에서
+        # 실행되므로 sqlite3의 같은 thread 제약을 지키면서 요청마다 연결을 여는 비용을 없앤다.
+        self._thread_connections = local()
 
     def is_ready(self) -> bool:
         """DB를 빠르게 열고 필수 스키마를 읽을 수 있는지만 확인한다.
@@ -27,7 +32,7 @@ class DictionaryRepository:
         여부와 필수 테이블 존재만 확인한다.
         """
         try:
-            with self._connect() as connection:
+            with self.read_session() as connection:
                 row = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dictionary_entry'"
                 ).fetchone()
@@ -37,17 +42,18 @@ class DictionaryRepository:
 
     @contextmanager
     def read_session(self) -> Iterator[sqlite3.Connection]:
-        """한 요청에서 여러 색인을 조회할 때 사용할 읽기 전용 연결을 연다.
+        """현재 thread의 읽기 전용 연결을 빌려준다.
 
-        연결은 요청 범위를 벗어나 보관하지 않는다. 따라서 SQLite 연결이 서로 다른
-        worker thread에서 재사용되는 일이 없고, 긴 문서 검토 중에는 연결 생성 비용을
-        형태소 수가 아닌 요청 수에 비례하게 만든다.
+        연결은 닫지 않고 같은 thread의 다음 요청이 재사용한다. 한 요청의 여러 조회가 같은
+        연결을 공유하므로 연결 비용은 형태소 수가 아니라 thread 수에 비례한다. SQLite 오류가 나면
+        손상됐을 수 있는 연결을 버려 다음 요청이 새로 연다.
         """
         connection = self._connect()
         try:
             yield connection
-        finally:
-            connection.close()
+        except sqlite3.Error:
+            self._discard(connection)
+            raise
 
     def lookup(
         self, query: str, limit: int = 20, *, connection: sqlite3.Connection | None = None
@@ -70,8 +76,22 @@ class DictionaryRepository:
         return [self._entry_from_row(row) for row in rows]
 
     def _connect(self) -> sqlite3.Connection:
-        """SQLite URI의 mode=ro로만 연결해 런타임 쓰기를 막는다."""
-        return sqlite3.connect(f"file:{self.database_path}?mode=ro", uri=True)
+        """현재 thread의 연결을 반환하고, 없으면 SQLite URI의 mode=ro로 열어 런타임 쓰기를 막는다.
+
+        ``immutable``이면 이미지에 구운 불변 파일로 보고 잠금·변경 감지를 생략한다.
+        """
+        connection = getattr(self._thread_connections, "connection", None)
+        if connection is None:
+            options = "mode=ro&immutable=1" if self.immutable else "mode=ro"
+            connection = sqlite3.connect(f"file:{self.database_path}?{options}", uri=True)
+            self._thread_connections.connection = connection
+        return connection
+
+    def _discard(self, connection: sqlite3.Connection) -> None:
+        """현재 thread에 보관한 연결을 닫고 지운다."""
+        if getattr(self._thread_connections, "connection", None) is connection:
+            del self._thread_connections.connection
+        connection.close()
 
     @staticmethod
     def _entry_from_row(row: tuple[str, str, str, str, int, str]) -> Entry:

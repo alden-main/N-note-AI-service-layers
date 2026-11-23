@@ -6,6 +6,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import local
 
 from .models import (
     AnalysisResult,
@@ -32,6 +33,8 @@ class AnalysisStore:
         """운영 이력 DB와 필요한 테이블을 생성한다."""
         self._database_path = database_path
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        # 도구 호출마다 연결을 열지 않도록 thread마다 연결 하나를 재사용한다(사전 저장소와 같은 방식).
+        self._thread_connections = local()
         with self._connect() as connection:
             connection.executescript("""
                 CREATE TABLE IF NOT EXISTS analyses (
@@ -193,9 +196,16 @@ class AnalysisStore:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        """외래 키를 활성화한 이력 DB 연결을 반환한다."""
-        connection = sqlite3.connect(self._database_path)
-        connection.execute("PRAGMA foreign_keys = ON")
+        """현재 thread의 외래 키 활성 이력 DB 연결을 반환하고, 없으면 연다.
+
+        호출부의 ``with`` 블록이 성공 시 commit, 예외 시 rollback으로 트랜잭션을 끝내며 연결은 닫지 않는다.
+        연결은 thread 사이에 공유하지 않으므로 thread가 끝나면 함께 정리된다.
+        """
+        connection = getattr(self._thread_connections, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(self._database_path)
+            connection.execute("PRAGMA foreign_keys = ON")
+            self._thread_connections.connection = connection
         return connection
 
 

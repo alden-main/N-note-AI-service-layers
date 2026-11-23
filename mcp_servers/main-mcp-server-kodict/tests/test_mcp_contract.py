@@ -1,6 +1,7 @@
 """Gateway가 사용하는 MCP 세션과 도구 결과 계약을 검증한다."""
 
 import json
+import logging
 from pathlib import Path
 import sqlite3
 from unittest.mock import patch
@@ -8,6 +9,8 @@ from unittest.mock import patch
 import anyio
 import httpx
 import mcp.types as types
+from pydantic import ValidationError
+import pytest
 from mcp.client.session import ClientSession
 from mcp.shared.memory import create_client_server_memory_streams
 
@@ -178,3 +181,78 @@ def test_review_tool_accepts_optional_compact_detail(tmp_path: Path) -> None:
     assert full.structuredContent["findings"][0]["candidates"][0]["evidence"]["headword"] == "가다"
     assert compact.structuredContent["findings"][0]["status"] == "matched"
     assert compact.structuredContent["findings"][0]["candidates"] == []
+
+
+def test_settings_read_environment_at_instantiation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """설정은 import 시점이 아니라 생성 시점에 환경 변수를 읽고, 잘못된 값은 그때 실패한다."""
+    monkeypatch.setenv("KODICT_MAX_RESULTS", "7")
+    monkeypatch.setenv("KODICT_DATABASE_IMMUTABLE", "true")
+    settings = Settings()
+    assert settings.max_results == 7
+    assert settings.database_immutable is True
+    assert Settings(max_results=3).max_results == 3
+
+    monkeypatch.setenv("KODICT_MAX_RESULTS", "not-a-number")
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_service_version_comes_from_package_metadata() -> None:
+    """감사 로그의 서비스 버전은 하드코딩하지 않고 패키지 메타데이터에서 읽는다."""
+    from importlib.metadata import version
+
+    assert Settings().service_version == version("main-mcp-server-kodict")
+
+
+def test_reviewer_initialization_failure_is_logged_without_detail(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """검토기 초기화 실패는 예외 유형만 로그에 남기고, 서버는 뜬 채 도구가 unavailable을 반환한다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    missing_catalog = tmp_path / "secret-name-missing.json"
+
+    with caplog.at_level(logging.ERROR, logger=server_module.logger.name):
+        server = create_server(Settings(database_path=database, recommendation_data_path=missing_catalog))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("reviewer_init_failed" in message and "FileNotFoundError" in message for message in messages)
+    assert all("secret-name-missing" not in message for message in messages)
+
+    async def call_review() -> types.CallToolResult:
+        result = await server.call_tool("review_standard_korean_text", {"text": "가다"})
+        assert isinstance(result, types.CallToolResult)
+        return result
+
+    result = anyio.run(call_review)
+    assert result.structuredContent["error"]["code"] == "upstream_unavailable"
+
+
+def test_review_does_not_check_readiness_per_request(tmp_path: Path) -> None:
+    """요청 경로는 readiness를 따로 조회하지 않는다. readiness는 /healthz가 맡는다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    server = create_server(Settings(database_path=database))
+
+    async def call_review() -> types.CallToolResult:
+        result = await server.call_tool("review_standard_korean_text", {"text": "가다"})
+        assert isinstance(result, types.CallToolResult)
+        return result
+
+    with patch.object(server_module.DictionaryRepository, "is_ready", side_effect=AssertionError("is_ready called")):
+        result = anyio.run(call_review)
+    assert result.isError is False
+
+
+def test_healthz_returns_200_when_ready(tmp_path: Path) -> None:
+    """공개 custom_route로 등록한 /healthz가 준비 상태를 반환한다."""
+    database = tmp_path / "dictionary.sqlite3"
+    make_database(database)
+    server = create_server(Settings(database_path=database))
+
+    async def get_healthz() -> httpx.Response:
+        transport = httpx.ASGITransport(app=server.streamable_http_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.get("/healthz")
+
+    response = anyio.run(get_healthz)
+    assert response.status_code == 200
+    assert response.text == "ok"

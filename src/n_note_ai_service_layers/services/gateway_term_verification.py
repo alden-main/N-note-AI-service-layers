@@ -167,7 +167,7 @@ class GatewayTermVerificationFlow:
 
     def _parse_result(self, result: dict[str, Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
         payload = result.get("structuredContent")
-        # FastMCP는 Union 반환 타입의 구조화 결과를 {"result": ...}로 감싼다.
+        # 예전 medic(FastMCP Union 반환)은 구조화 결과를 {"result": ...}로 감쌌다. 지금은 감싸지 않지만 둘 다 받는다.
         if isinstance(payload, dict) and isinstance(payload.get("result"), dict) and not any(key in payload for key in ("findings", "candidates", "suggestions")):
             payload = payload["result"]
         if not isinstance(payload, dict):

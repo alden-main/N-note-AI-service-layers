@@ -1,16 +1,22 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
 RUN useradd --create-home --uid 10001 mcp
 
-# HTTP 서버(uvicorn·starlette)를 포함해 패키지를 설치한다.
-COPY pyproject.toml README.md ./
+RUN pip install --no-cache-dir uv
+
+# uv.lock에 고정된 의존성만 설치한다(HTTP 서버 uvicorn·starlette 포함). 소스보다 먼저 설치해 layer cache를 살린다.
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+
 COPY src/ ./src/
-RUN pip install --no-cache-dir .
+RUN uv sync --frozen --no-dev
 
 USER mcp
 

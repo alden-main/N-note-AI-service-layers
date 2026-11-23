@@ -6,6 +6,7 @@ LLM 호출(API 형식·도구 왕복)은 ``pydantic_ai_completion``이 맡고, �
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -15,6 +16,7 @@ from n_note_ai_service_layers import prompts
 from n_note_ai_service_layers.adapters.llm_completion import StructuredCompletion, StructuredOutput, ToolExecutor, json_text
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema
+from n_note_ai_service_layers.services import work_loop
 
 
 class DraftGenerationAdapter:
@@ -33,12 +35,19 @@ class DraftGenerationAdapter:
         self._prompt_version = prompt_version or prompts.get().draft.version
 
     def generate(self, payload: dict, schema: FormSchema) -> DraftResult:
+        """``agenerate``의 동기 입구다(스크립트·테스트용)."""
+        return work_loop.run_sync(self.agenerate(payload, schema))
+
+    async def agenerate(self, payload: dict, schema: FormSchema) -> DraftResult:
         """최소화된 LLM 입력으로 초안을 생성하고 스키마 허용 필드만 반환한다. 잘못된 응답은 ``ValueError``다."""
         output = self._output_format(schema)
-        text = self.completion.complete(
+        arguments = (
             self._instructions(schema), json.dumps(payload, ensure_ascii=False), StructuredOutput(output["name"], output["schema"]),
-            self.tools, prompts.get().draft.tool, accept_unconstrained=lambda content: self._unconstrained(content, output["schema"]),
+            self.tools, prompts.get().draft.tool, lambda content: self._unconstrained(content, output["schema"]),
         )
+        acomplete = getattr(self.completion, "acomplete", None)
+        # 동기 요청기(테스트 대역)는 작업 루프를 막지 않도록 스레드에서 부른다.
+        text = await acomplete(*arguments) if acomplete else await asyncio.to_thread(self.completion.complete, *arguments)
         return self._draft_result(text, schema)
 
     @staticmethod

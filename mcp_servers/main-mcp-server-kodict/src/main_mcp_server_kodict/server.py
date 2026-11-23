@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from time import perf_counter
 from typing import Annotated, Literal
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, TextContent
+from starlette.requests import Request
 from starlette.responses import PlainTextResponse
-from starlette.routing import Route
 
 from .config import Settings
 from .dictionary import DictionaryRepository
@@ -34,7 +35,9 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         Streamable HTTP 전송으로 실행할 준비가 된 FastMCP 인스턴스다.
     """
     settings = settings or Settings()
-    repository = DictionaryRepository(settings.database_path)
+    repository = DictionaryRepository(settings.database_path, immutable=settings.database_immutable)
+    # 초기화 실패에도 서버는 뜬다. 이때 도구는 upstream_unavailable을, /healthz는 503을 반환한다.
+    reviewer: TextReviewer | None = None
     try:
         catalog = RecommendationCatalog.from_path(settings.recommendation_data_path)
         analyzer = MorphologyAnalyzer()
@@ -43,8 +46,9 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         reviewer = TextReviewer(
             repository, analyzer, settings.max_candidates, catalog, max_findings=settings.max_findings
         )
-    except Exception:
-        reviewer = None
+    except Exception as exc:
+        # 예외 메시지에는 경로 등이 섞일 수 있어 유형만 남긴다.
+        logger.error("reviewer_init_failed service_id=%s error_type=%s", SERVICE_ID, type(exc).__name__)
     mcp = FastMCP(
         SERVICE_ID,
         host=settings.host,
@@ -58,9 +62,6 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     # FastMCP는 동기 도구 함수를 이벤트 루프에서 직접 실행한다. CPU·SQLite 작업은
     # 별도 thread로 옮기고, 이 limiter가 과도한 장문 검토의 동시 실행을 제한한다.
     execution_limiter = anyio.CapacityLimiter(settings.max_concurrent_requests)
-
-    def error(code: str, message: str, retryable: bool) -> dict[str, object]:
-        return {"error": {"code": code, "message": message, "retryable": retryable}}
 
     def request_id(context: Context) -> str:
         """Gateway의 요청 ID가 있으면 기록하고, 없으면 MCP JSON-RPC ID를 사용한다."""
@@ -106,6 +107,13 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         audit(tool_name, result_code, context, started_at)
         return tool_result(payload, is_error)
 
+    def fail(
+        tool_name: str, code: str, message: str, retryable: bool, context: Context, started_at: float
+    ) -> CallToolResult:
+        """오류 코드를 감사 결과 코드로도 쓰는 공통 오류 envelope 결과다."""
+        payload: dict[str, object] = {"error": {"code": code, "message": message, "retryable": retryable}}
+        return complete(tool_name, code, payload, context, started_at, is_error=True)
+
     @mcp.tool(structured_output=False)
     async def lookup_standard_dictionary(query: Annotated[str, "조회할 표제어 또는 이형태"], context: Context) -> CallToolResult:
         """표제어 또는 검색용 이형태를 정확 일치 조회한다.
@@ -114,18 +122,18 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         코드 포인트)을 넘을 수 없다. 결과는 구성된 상한(기본 20개)까지만
         반환하며, 부분·유사 검색이나 자동 교정은 제공하지 않는다.
         """
-        started_at = perf_counter()
+        tool_name, started_at = "lookup_standard_dictionary", perf_counter()
         if not isinstance(query, str) or not query.strip():
-            return complete("lookup_standard_dictionary", "invalid_input", error("invalid_input", "query는 비어 있지 않은 문자열이어야 합니다.", False), context, started_at, is_error=True)
+            return fail(tool_name, "invalid_input", "query는 비어 있지 않은 문자열이어야 합니다.", False, context, started_at)
         if len(query) > settings.max_text_length:
-            return complete("lookup_standard_dictionary", "request_too_large", error("request_too_large", "query가 허용 길이를 초과했습니다.", False), context, started_at, is_error=True)
+            return fail(tool_name, "request_too_large", "query가 허용 길이를 초과했습니다.", False, context, started_at)
         try:
             entries = await anyio.to_thread.run_sync(repository.lookup, query, settings.max_results, limiter=execution_limiter)
         except Exception:
-            return complete("lookup_standard_dictionary", "upstream_unavailable", error("upstream_unavailable", "사전 DB를 현재 조회할 수 없습니다.", True), context, started_at, is_error=True)
+            return fail(tool_name, "upstream_unavailable", "사전 DB를 현재 조회할 수 없습니다.", True, context, started_at)
         if not entries:
-            return complete("lookup_standard_dictionary", "not_found", error("not_found", "일치하는 사전 항목이 없습니다.", False), context, started_at, is_error=True)
-        return complete("lookup_standard_dictionary", "ok", {"entries": [entry.as_dict() for entry in entries]}, context, started_at)
+            return fail(tool_name, "not_found", "일치하는 사전 항목이 없습니다.", False, context, started_at)
+        return complete(tool_name, "ok", {"entries": [entry.as_dict() for entry in entries]}, context, started_at)
 
     @mcp.tool(structured_output=False)
     async def review_standard_korean_text(
@@ -145,28 +153,30 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         비운다. 이때 상한은 교정 후보가 있는 결과에만 적용한다. 응답 크기가
         크게 줄어 문서 전체 검토에 적합하다.
         """
-        started_at = perf_counter()
+        tool_name, started_at = "review_standard_korean_text", perf_counter()
         if not isinstance(text, str) or not text.strip():
-            return complete("review_standard_korean_text", "invalid_input", error("invalid_input", "text는 비어 있지 않은 문자열이어야 합니다.", False), context, started_at, is_error=True)
+            return fail(tool_name, "invalid_input", "text는 비어 있지 않은 문자열이어야 합니다.", False, context, started_at)
         if len(text) > settings.max_text_length:
-            return complete("review_standard_korean_text", "request_too_large", error("request_too_large", "text가 허용 길이를 초과했습니다.", False), context, started_at, is_error=True)
-        is_ready = reviewer is not None and await anyio.to_thread.run_sync(repository.is_ready, limiter=execution_limiter)
-        if not is_ready:
-            return complete("review_standard_korean_text", "upstream_unavailable", error("upstream_unavailable", "분석기 또는 사전 DB를 사용할 수 없습니다.", True), context, started_at, is_error=True)
+            return fail(tool_name, "request_too_large", "text가 허용 길이를 초과했습니다.", False, context, started_at)
+        unavailable = "분석기 또는 사전 DB를 사용할 수 없습니다."
+        if reviewer is None:
+            return fail(tool_name, "upstream_unavailable", unavailable, True, context, started_at)
+        # 사전 readiness는 /healthz가 맡는다. 요청마다 따로 확인하지 않고, 검토 중 SQLite 오류를 같은 오류로 돌려준다.
         try:
             result = await anyio.to_thread.run_sync(reviewer.review, text, detail == "compact", limiter=execution_limiter)
+        except sqlite3.Error:
+            return fail(tool_name, "upstream_unavailable", unavailable, True, context, started_at)
         except Exception:
-            return complete("review_standard_korean_text", "internal_error", error("internal_error", "텍스트 검토 중 예상하지 못한 오류가 발생했습니다.", True), context, started_at, is_error=True)
-        return complete("review_standard_korean_text", "ok", result, context, started_at)
+            return fail(tool_name, "internal_error", "텍스트 검토 중 예상하지 못한 오류가 발생했습니다.", True, context, started_at)
+        return complete(tool_name, "ok", result, context, started_at)
 
-    async def healthz(request: object) -> PlainTextResponse:
+    @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+    async def healthz(request: Request) -> PlainTextResponse:
         """민감한 내부 상태를 노출하지 않고 DB·분석기 준비 상태만 HTTP 상태로 반환한다."""
         # Healthcheck가 장문 검토의 대기열에 묶여 false negative가 되지 않도록
         # 짧은 readiness 조회는 별도 worker에서 실행한다.
         is_ready = reviewer is not None and await anyio.to_thread.run_sync(repository.is_ready)
         return PlainTextResponse("ok" if is_ready else "unavailable", status_code=200 if is_ready else 503)
-
-    mcp._custom_starlette_routes = [Route("/healthz", healthz)]
     return mcp
 
 

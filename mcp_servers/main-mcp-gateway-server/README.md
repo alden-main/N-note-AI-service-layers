@@ -44,7 +44,7 @@ upstreams:
 
 ### 동시 호출과 일괄 호출
 
-도구 호출은 catalog 잠금 밖에서 upstream을 호출하므로 여러 요청의 호출이 동시에 진행되며, discovery(`tools/list`) 중에도 기존 catalog로 호출을 계속 처리합니다. upstream 연결은 keep-alive로 재사용하고, 성공한 health 확인은 `GATEWAY_HEALTH_TTL_SECONDS`(기본 5초) 동안 재사용합니다. upstream 호출이 실패하면 health 캐시를 버립니다.
+도구 호출은 catalog 잠금 밖에서 upstream을 호출하므로 여러 요청의 호출이 동시에 진행되며, discovery(`tools/list`) 중에도 기존 catalog로 호출을 계속 처리합니다. upstream 연결은 keep-alive로 재사용하고, 성공한 health 확인은 `GATEWAY_HEALTH_TTL_SECONDS`(기본 5초) 동안 재사용합니다. upstream 호출이 실패하면 health 캐시를 버립니다. `tools/list`는 upstream 목록을 `GATEWAY_CATALOG_TTL_SECONDS`(기본 30초) 동안 재사용하고, 연결되지 않은 upstream만 5초 간격으로 다시 찾습니다. discovery는 upstream마다 동시에 진행합니다.
 
 여러 도구를 한 번에 호출하려면 `POST /v1/tools/batch-call`을 사용합니다. 각 결과는 `tools/call`과 같은 MCP tool result 계약과 감사 로그를 따르며, 한 호출의 실패가 다른 호출에 영향을 주지 않습니다.
 
