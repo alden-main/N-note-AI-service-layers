@@ -1,8 +1,13 @@
 """One isolated model invocation; stdin contains only model inputs, never reference answers."""
 from __future__ import annotations
-import json, sys, time, uuid
+
+import json
+import sys
+import time
+import uuid
 from dataclasses import replace
 from datetime import datetime
+
 
 class NoopGateway:
     def discover(self, request_id):
@@ -26,7 +31,7 @@ class TimedGenerator:
 def run(data):
     from n_note_ai_service_layers import settings
     from n_note_ai_service_layers.adapters.model_providers import draft_generator
-    from n_note_ai_service_layers.api.deps import get_workflow_context_flow, get_transcript_redactor
+    from n_note_ai_service_layers.api.deps import get_transcript_redactor, get_workflow_context_flow
     from n_note_ai_service_layers.api.routes.workflow_jobs import resolve_workflow_form
     from n_note_ai_service_layers.contracts.audio import PreTranscribedAudio, Transcript
     from n_note_ai_service_layers.contracts.clinical_context import ClinicalContextQuery

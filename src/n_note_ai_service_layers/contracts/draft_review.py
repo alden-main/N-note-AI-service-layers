@@ -7,7 +7,6 @@ from typing import Any, Literal
 
 from n_note_ai_service_layers.contracts.codec import IsoDatetime
 
-
 CandidateDecision = Literal["pending", "accepted", "rejected"]
 
 

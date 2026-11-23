@@ -16,11 +16,14 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from n_note_ai_service_layers import prompts
 from n_note_ai_service_layers.observability import current_span, set_attributes, set_content, span
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient, McpGatewayError, McpGatewayToolError
+
+if TYPE_CHECKING:
+    from pydantic_ai.settings import ModelSettings
 
 # 응답 하나에서 동시에 Gateway로 보내는 도구 호출 수다. 넘는 호출은 앞 호출이 끝나기를 기다린다.
 MAX_PARALLEL_TOOL_CALLS = 4
@@ -37,9 +40,9 @@ class GenerationOptions:
     temperature: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
 
-    def model_settings(self) -> dict[str, Any]:
+    def model_settings(self) -> ModelSettings:
         """Pydantic AI ``ModelSettings``다. 값이 없는 옵션은 서버 기본값을 쓴다."""
-        settings: dict[str, Any] = {}
+        settings: ModelSettings = {}
         if self.max_tokens is not None:
             settings["max_tokens"] = self.max_tokens
         if self.temperature is not None:

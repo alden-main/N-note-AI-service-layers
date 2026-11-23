@@ -189,5 +189,23 @@ class CatalogRefreshTests(unittest.TestCase):
         self.assertEqual(client.discover(), tuple(gateway.tools))
 
 
+
+class SharedClientTests(unittest.TestCase):
+    def test_client_is_shared_until_settings_change_and_the_replaced_one_is_closed(self):
+        import os
+        from unittest.mock import patch
+
+        from n_note_ai_service_layers.api.deps import get_gateway_client
+
+        with patch.dict(os.environ, {"MCP_GATEWAY_URL": "http://gateway-a:8080/mcp"}):
+            first = get_gateway_client()
+            self.assertIs(get_gateway_client(), first)
+        with patch.dict(os.environ, {"MCP_GATEWAY_URL": "http://gateway-b:8080/mcp"}):
+            second = get_gateway_client()
+        self.assertIsNot(first, second)
+        self.assertTrue(first._http.is_closed)
+        self.assertFalse(second._http.is_closed)
+
+
 if __name__ == "__main__":
     unittest.main()

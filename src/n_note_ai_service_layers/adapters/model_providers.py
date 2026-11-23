@@ -10,8 +10,8 @@ from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.audio_preprocessing import DEFAULT_HALLUCINATION_PATTERNS, AudioPreprocessingSpeechToText, HallucinationFilter, VadConfig
 from n_note_ai_service_layers.adapters.draft_generation import DraftGenerationAdapter
 from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions, ToolExecutor
-from n_note_ai_service_layers.adapters.pydantic_ai_completion import PydanticAiCompletion
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
+from n_note_ai_service_layers.adapters.pydantic_ai_completion import PydanticAiCompletion
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
 
 

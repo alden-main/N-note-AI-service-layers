@@ -87,4 +87,4 @@ async def run(coroutine: Coroutine[Any, Any, T]) -> T:
 
 async def resolve(value: T | Awaitable[T]) -> T:
     """동기 대역(테스트)과 async 구현을 함께 받는다. 값이 awaitable이면 기다린다."""
-    return await value if inspect.isawaitable(value) else value  # type: ignore[misc]
+    return await value if inspect.isawaitable(value) else value

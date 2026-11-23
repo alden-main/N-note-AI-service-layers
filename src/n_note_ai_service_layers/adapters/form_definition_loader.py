@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -100,7 +100,7 @@ class FormDefinitionLoader:
                 **{key: value for key, value in raw.items() if key not in _DEPLOYMENT_KEYS},
                 "status": status,
                 "approved_by": f"form-definition:{(form_dir or path.parent).name}",
-                "approved_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc),
+                "approved_at": datetime.fromtimestamp(path.stat().st_mtime, UTC),
                 "pdf_template": pdf_template,
                 "pdf_meta": [(key, placement) for key, placement in (pdf.meta or {}).items()],
             })

@@ -12,8 +12,8 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.audio_preprocessing import audio_creation_time
@@ -25,6 +25,7 @@ from n_note_ai_service_layers.services import form_extraction, work_loop
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.nursing_note_workflow import TranscriptPreparation, WorkflowStageError
 from n_note_ai_service_layers.services.recording_time import parse_recorded_at, resolve_recording_time
+
 
 class NumericVerification(BaseModel):
     status: str
@@ -101,9 +102,9 @@ async def _internal_transcription(request: Request, preparation: TranscriptPrepa
         raise HTTPException(status_code=422, detail="file must be an upload")
     part = parts[0]
     if isinstance(part, StarletteUploadFile):
-        raw = await part.read()
+        body = await part.read()
         try:
-            raw = raw.decode("utf-8")
+            raw = body.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPException(status_code=422, detail="templates must be UTF-8 JSON") from None
     else:

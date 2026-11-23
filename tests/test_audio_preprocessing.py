@@ -14,9 +14,7 @@ from fastapi.testclient import TestClient
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
-from n_note_ai_service_layers.adapters.audio_preprocessing import (
-    SAMPLE_RATE, AudioPreprocessingSpeechToText, HallucinationFilter, VadConfig, decode_to_pcm,
-)
+from n_note_ai_service_layers.adapters.audio_preprocessing import SAMPLE_RATE, AudioPreprocessingSpeechToText, HallucinationFilter, VadConfig, decode_to_pcm
 from n_note_ai_service_layers.api import app, get_speech_to_text_provider
 from n_note_ai_service_layers.contracts.audio import AudioDecodeError, AudioInput, Transcript
 

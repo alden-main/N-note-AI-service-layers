@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import time
 import unittest
+from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
@@ -20,7 +20,7 @@ from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteW
 draft_review_store = get_services().draft_review_store
 template_registry = get_services().template_registry
 
-REFERENCE = datetime(2026, 10, 28, 16, 44, tzinfo=timezone.utc)
+REFERENCE = datetime(2026, 10, 28, 16, 44, tzinfo=UTC)
 SCHEMA = FormSchema(
     "numeric-test", "v1", "NUMERIC_TEST",
     (FormSection("s", (FormField("recorded_at", "datetime"), FormField("assessment", "text", required=True), FormField("evaluation", "text"))),),

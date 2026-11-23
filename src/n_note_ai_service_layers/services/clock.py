@@ -6,14 +6,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from n_note_ai_service_layers import settings
 
 
 def now_utc() -> datetime:
     """저장·API 응답에 쓰는 기준 시각(UTC)이다."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def now_local() -> datetime:

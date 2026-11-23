@@ -7,18 +7,14 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from n_note_ai_service_layers.adapters.note_artifact_store import FileNursingNoteStore
-from n_note_ai_service_layers.api import app, get_note_store, get_nursing_note_workflow, get_workflow_context_flow, get_services
-from n_note_ai_service_layers.contracts.report_validation import ReportValidationCriterion, ReportValidationResult
 from n_note_ai_service_layers import settings
+from n_note_ai_service_layers.adapters.note_artifact_store import FileNursingNoteStore
+from n_note_ai_service_layers.api import app, get_note_store, get_nursing_note_workflow, get_services, get_workflow_context_flow
 from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
-from n_note_ai_service_layers.contracts.term_verification import (
-    GatewaySuggestion,
-    GatewayTermOccurrence,
-    GatewayTermVerificationResult,
-)
+from n_note_ai_service_layers.contracts.report_validation import ReportValidationCriterion, ReportValidationResult
+from n_note_ai_service_layers.contracts.term_verification import GatewaySuggestion, GatewayTermOccurrence, GatewayTermVerificationResult
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflowResult
 
 # 테스트가 상태를 직접 확인·초기화하는 저장소다.

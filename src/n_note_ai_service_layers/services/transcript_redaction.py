@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN, NamedEntityRecognizer, RedactedText, privacy_token
 
@@ -61,14 +61,20 @@ class TranscriptRedactor:
             counts[kind] = counts.get(kind, 0) + 1
             return privacy_token(kind, counts[kind])
 
+        def plain(kind: str) -> Callable[[re.Match[str]], str]:
+            return lambda _: token(kind)
+
+        def labeled(kind: str) -> Callable[[re.Match[str]], str]:
+            return lambda match: f"{match.group('label')}{token(kind)}"
+
         redacted = text
         # 짧은 값은 일반 수치와 겹치므로 4자 이상인 식별자만 가린다.
         for identifier in sorted({item.strip() for item in known_identifiers if item and len(item.strip()) >= 4}, key=len, reverse=True):
             redacted = re.sub(rf"(?<![0-9A-Za-z]){re.escape(identifier)}(?![0-9A-Za-z])", lambda _: token("KNOWN_ID"), redacted)
         for kind, pattern in self._RULES:
-            redacted = pattern.sub(lambda _, kind=kind: token(kind), redacted)
+            redacted = pattern.sub(plain(kind), redacted)
         for kind, pattern in self._LABELED_RULES:
-            redacted = pattern.sub(lambda match, kind=kind: f"{match.group('label')}{token(kind)}", redacted)
+            redacted = pattern.sub(labeled(kind), redacted)
 
         def honorific(match: re.Match[str]) -> str:
             value = match.group("value")
@@ -77,13 +83,14 @@ class TranscriptRedactor:
             return f"{token('PERSON')}{match.group('suffix')}"
         redacted = self._HONORIFIC.sub(honorific, redacted)
         if self.recognizer is not None:
-            redacted = self._redact_entities(redacted, token)
+            redacted = self._redact_entities(self.recognizer, redacted, token)
         return RedactedText(redacted, sum(counts.values()))
 
-    def _redact_entities(self, text: str, token) -> str:
+    @staticmethod
+    def _redact_entities(recognizer: NamedEntityRecognizer, text: str, token: Callable[[str], str]) -> str:
         """NER 범위를 뒤에서부터 치환한다. 보호 토큰과 겹치거나 호칭·직함인 범위는 건너뛴다."""
         protected = [(match.start(), match.end()) for match in PRIVACY_TOKEN.finditer(text)]
-        spans = sorted({(span.start, span.end) for span in self.recognizer.detect(text)}, reverse=True)
+        spans = sorted({(span.start, span.end) for span in recognizer.detect(text)}, reverse=True)
         replacements: list[tuple[int, int]] = []
         for start, end in spans:
             value = text[start:end].strip()

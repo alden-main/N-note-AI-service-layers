@@ -5,11 +5,10 @@ import logging
 import unittest
 import unittest.mock
 
-from tracing_support import all_attribute_text, by_name, recorded_spans
-
-from n_note_ai_service_layers import observability, prompts
 from llm_support import FakeServer, adapter, chat
+from n_note_ai_service_layers import observability, prompts
 from support import FakeGateway, sample_form_schema
+from tracing_support import all_attribute_text, by_name, recorded_spans
 
 PRIVATE = "환자가 오늘 흉통을 호소함"
 FINAL = '{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":[{"field_id":"assessment.pain_score","refs":["transcript"]}],"needs_confirmation":false}'

@@ -21,11 +21,7 @@ from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_ser
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, SchemaStatus
-from n_note_ai_service_layers.contracts.term_verification import (
-    GatewaySuggestion,
-    GatewayTermOccurrence,
-    GatewayTermVerificationResult,
-)
+from n_note_ai_service_layers.contracts.term_verification import GatewaySuggestion, GatewayTermOccurrence, GatewayTermVerificationResult
 from n_note_ai_service_layers.services.draft_review import DraftReviewStore, DraftRevisionConflict
 from n_note_ai_service_layers.services.llm_payload import LlmPayloadProjector
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient

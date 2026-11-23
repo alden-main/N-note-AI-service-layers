@@ -54,7 +54,9 @@ explicit = true
 
 [dependency-groups]
 dev = [
+    "mypy>=2.4.1",
     "pytest>=9.2.0",
+    "ruff>=0.17.6",
 ]
 
 [tool.pytest.ini_options]
@@ -62,3 +64,41 @@ dev = [
 testpaths = ["tests"]
 # tests/test_benchmark.py가 루트의 benchmark 패키지를 가져온다.
 pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+# 긴 줄을 쓰는 코드베이스다. import 정렬(I)이 줄을 나누는 기준으로만 쓰인다(E501은 끔).
+line-length = 160
+src = ["src", "tests", "."]
+
+[tool.ruff.lint]
+# 오류(E·F)·import 정렬(I)·흔한 버그 패턴(B)·Python 3.12 문법(UP)만 본다.
+select = ["E", "F", "I", "B", "UP"]
+# E501: 긴 줄은 이 코드베이스의 서식이다. B008: FastAPI Depends()·File() 기본값 패턴이다.
+# UP047: PEP 695 제네릭 문법 강제는 취향 문제다.
+ignore = ["E501", "B008", "UP047"]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+known-first-party = ["n_note_ai_service_layers", "support", "llm_support", "tracing_support", "benchmark"]
+
+[tool.ruff.lint.per-file-ignores]
+# 벤치마크 스크립트는 한 줄 압축 서식, 테스트 대역은 한 줄 정의(;·:)와 lambda 대역을 쓴다.
+"benchmark/*" = ["E701", "E702", "E731"]
+"tests/*" = ["E701", "E702", "E731"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+# 타입 힌트가 없는 함수 본문도 검사하되, 모든 함수에 힌트를 강제하지는 않는다.
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# pydantic-settings 모델의 기본값·환경 변수 별칭을 mypy가 이해하게 한다.
+plugins = ["pydantic.mypy"]
+
+# 타입 정보를 제공하지 않는 외부 패키지다(NER용 torch·transformers는 선택 설치).
+[[tool.mypy.overrides]]
+module = ["reportlab.*", "jsonschema.*", "torch.*", "transformers.*"]
+ignore_missing_imports = true

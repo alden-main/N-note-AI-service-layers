@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from functools import cache
 from typing import Annotated, Any, TypeVar
 
 from pydantic import PlainSerializer, TypeAdapter
@@ -14,9 +13,15 @@ T = TypeVar("T")
 IsoDatetime = Annotated[datetime, PlainSerializer(datetime.isoformat, when_used="json")]
 
 
-@cache
+# 같은 타입의 ``TypeAdapter``는 한 번만 만든다. ``functools.cache``는 mypy가 ``type[T]`` 인자를 ``Hashable``로 보지 않아 쓰지 않는다.
+_ADAPTERS: dict[type[Any], TypeAdapter[Any]] = {}
+
+
 def _adapter(cls: type[T]) -> TypeAdapter[T]:
-    return TypeAdapter(cls)
+    adapter = _ADAPTERS.get(cls)
+    if adapter is None:
+        adapter = _ADAPTERS[cls] = TypeAdapter(cls)
+    return adapter
 
 
 def to_json_dict(value: Any) -> dict[str, Any]:

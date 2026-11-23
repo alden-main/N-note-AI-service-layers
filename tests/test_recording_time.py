@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import numpy as np
 from fastapi.testclient import TestClient
@@ -72,7 +72,7 @@ class ResolveRecordingTimeTests(unittest.TestCase):
             parse_recorded_at("어제 오후")
 
     def test_field_format_matches_llm_format(self) -> None:
-        value = datetime(2026, 11, 18, 0, 7, tzinfo=timezone.utc)
+        value = datetime(2026, 11, 18, 0, 7, tzinfo=UTC)
         self.assertEqual(format_for_field(value, "datetime"), "2026-11-18 09:07")
         self.assertEqual(format_for_field(value, "date"), "2026-11-18")
 
@@ -185,10 +185,10 @@ class RecordingTimeApiTests(unittest.TestCase):
         self.assertEqual(value, datetime(2026, 11, 18, 8, 5, tzinfo=KST))
 
     def test_received_time_is_used_when_audio_has_no_metadata(self) -> None:
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
         value = self._recorded_at(self._post(b"audio", "a.wav", "audio/wav"))
         self.assertLessEqual(before - timedelta(seconds=1), value)
-        self.assertLessEqual(value, datetime.now(timezone.utc))
+        self.assertLessEqual(value, datetime.now(UTC))
 
     def test_invalid_request_value_is_rejected(self) -> None:
         self.assertEqual(self._post(b"audio", "a.wav", "audio/wav", recorded_at="어제").status_code, 422)

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
+import threading
+from typing import Any
 
 from fastapi import Depends, HTTPException, Request, UploadFile
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters import model_providers
@@ -34,7 +36,7 @@ def audio_media_type(content_type: str | None) -> str:
     return (content_type or "").split(";", 1)[0].strip().lower()
 
 
-async def read_audio(audio: UploadFile, max_bytes: int) -> bytes:
+async def read_audio(audio: StarletteUploadFile, max_bytes: int) -> bytes:
     """음성 바이트를 ``max_bytes``까지만 읽는다. 비었으면 422, 넘으면 413이다(형식 검사는 호출자가 한다)."""
     content = await audio.read(max_bytes + 1)
     if not content:
@@ -60,9 +62,23 @@ def get_speech_to_text_provider() -> SpeechToTextProvider:
         raise HTTPException(status_code=503, detail="speech transcription is not configured") from exc
 
 
-@lru_cache(maxsize=4)
+_gateway: tuple[tuple[Any, ...], McpGatewayClient] | None = None
+_gateway_lock = threading.Lock()
+
+
 def _gateway_client(url: str, timeout_seconds: float, catalog_ttl_seconds: float, expected_tools: tuple[str, ...]) -> McpGatewayClient:
-    return McpGatewayClient(url, timeout_seconds, catalog_ttl_seconds=catalog_ttl_seconds, expected_tools=expected_tools)
+    """설정이 같으면 클라이언트 하나를 공유한다. 설정이 바뀌면(테스트 등) 새로 만들고 이전 클라이언트의 연결을 닫는다."""
+    global _gateway
+    key = (url, timeout_seconds, catalog_ttl_seconds, expected_tools)
+    with _gateway_lock:
+        if _gateway is not None and _gateway[0] == key:
+            return _gateway[1]
+        previous = _gateway[1] if _gateway is not None else None
+        client = McpGatewayClient(url, timeout_seconds, catalog_ttl_seconds=catalog_ttl_seconds, expected_tools=expected_tools)
+        _gateway = (key, client)
+    if previous is not None:
+        previous.close()
+    return client
 
 
 def _expected_gateway_tools() -> tuple[str, ...]:

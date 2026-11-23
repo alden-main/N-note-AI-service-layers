@@ -11,13 +11,18 @@ from __future__ import annotations
 import os
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING, TypeVar
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 PROMPTS_FILE_ENV = "N_NOTE_PROMPTS_FILE"
 DEFAULT_PROMPTS_FILE = Path(__file__).with_name("prompts.toml")
 _PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
+_Section = TypeVar("_Section", bound="DataclassInstance")
 
 
 class PromptCatalogError(RuntimeError):
@@ -80,19 +85,19 @@ def _load(path: Path) -> PromptCatalog:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise PromptCatalogError(f"prompt file could not be read: {path}") from exc
 
-    def section(name: str, kind: type) -> object:
+    def section(name: str, kind: type[_Section]) -> _Section:
         values = raw.get(name)
-        names = kind.__dataclass_fields__
+        names = [field.name for field in fields(kind)]
         if not isinstance(values, dict) or any(not isinstance(values.get(key), str) for key in names):
             raise PromptCatalogError(f"prompt file {path} needs string keys {sorted(names)} in [{name}]")
         return kind(**{key: values[key] for key in names})
 
     return PromptCatalog(
         source=path,
-        draft=section("draft", DraftPrompts),  # type: ignore[arg-type]
-        form_extraction=section("form_extraction", FormExtractionPrompts),  # type: ignore[arg-type]
-        structured_output=section("structured_output", StructuredOutputPrompts),  # type: ignore[arg-type]
-        stt=section("stt", SttPrompts),  # type: ignore[arg-type]
+        draft=section("draft", DraftPrompts),
+        form_extraction=section("form_extraction", FormExtractionPrompts),
+        structured_output=section("structured_output", StructuredOutputPrompts),
+        stt=section("stt", SttPrompts),
     )
 
 

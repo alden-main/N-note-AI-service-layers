@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import re
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from n_note_ai_service_layers import settings
@@ -60,7 +60,7 @@ def _network_definitions(compose: str) -> dict[str, str]:
     """최상위 ``networks:`` 아래 네트워크별 정의를 문자열로 읽는다."""
     body = compose.split("\nnetworks:\n")[-1]
     sections = re.split(r"^  ([a-z0-9-]+):\n", body, flags=re.MULTILINE)
-    return dict(zip(sections[1::2], sections[2::2]))
+    return dict(zip(sections[1::2], sections[2::2], strict=True))
 
 
 class DockerGatewayConfigurationTests(unittest.TestCase):

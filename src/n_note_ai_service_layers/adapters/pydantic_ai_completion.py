@@ -30,9 +30,9 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Text
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext, ToolDefinition
-from pydantic_ai.usage import UsageLimits
 from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
+from pydantic_ai.usage import UsageLimits
 
 from n_note_ai_service_layers import observability, prompts
 from n_note_ai_service_layers.adapters.llm_completion import (
@@ -83,7 +83,7 @@ class GatewayToolset(AbstractToolset[None]):
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
         # 도구 호출 하나가 실패해도(오류 객체 반환) 재시도가 아니므로 max_retries는 모델이 이름·인자를 잘못 낸 경우에만 쓰인다.
         return {
-            name: ToolsetTool(toolset=self, tool_def=definition, max_retries=self.executor.max_tool_calls, args_validator=_ANY_ARGUMENTS)
+            name: ToolsetTool(toolset=self, tool_def=definition, max_retries=self.executor.max_tool_calls, args_validator=_ANY_ARGUMENTS)  # type: ignore[arg-type]  # pydantic PluggableSchemaValidator가 pydantic-ai 프로토콜 타입에 없다.
             for name, definition in self._definitions.items()
         }
 
@@ -145,7 +145,7 @@ class PydanticAiCompletion:
         model_tools: list[dict[str, Any]], tool_instruction: str,
     ) -> Any:
         budget = ToolBudget()
-        toolsets = [GatewayToolset(tools, model_tools, budget)] if model_tools and tools is not None else []
+        toolsets: list[AbstractToolset[None]] = [GatewayToolset(tools, model_tools, budget)] if model_tools and tools is not None else []
         base = {**self.options.model_settings(), "openai_store": False}
 
         def step_settings(ctx: RunContext[None]) -> ModelSettings:
@@ -191,9 +191,9 @@ class PydanticAiCompletion:
         """
         budget = ToolBudget()
         agent = self._agent(f"{output.name}.tools", system, str, [GatewayToolset(tools, model_tools, budget)])
-        settings = {**self.options.model_settings(), "tool_choice": "auto"}
+        settings: ModelSettings = {**self.options.model_settings(), "tool_choice": "auto"}
         try:
-            async with agent.iter(user_content, model_settings=settings) as run:  # type: ignore[arg-type]
+            async with agent.iter(user_content, model_settings=settings) as run:
                 async for node in run:
                     if not Agent.is_model_request_node(node):
                         continue
@@ -235,12 +235,13 @@ class PydanticAiCompletion:
 
     def _model(self) -> Any:
         from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+        from pydantic_ai.profiles.openai import OpenAIModelProfile
         from pydantic_ai.providers.openai import OpenAIProvider
 
         provider = OpenAIProvider(openai_client=self.client_factory())
         if self.api == "chat":
             # max_tokens로 보낸다. llama.cpp·MLX 등 일부 OpenAI 호환 서버는 max_completion_tokens를 모른다.
-            return OpenAIChatModel(self.model, provider=provider, profile={"openai_chat_supports_max_completion_tokens": False})  # type: ignore[typeddict-unknown-key]
+            return OpenAIChatModel(self.model, provider=provider, profile=OpenAIModelProfile(openai_chat_supports_max_completion_tokens=False))
         return OpenAIResponsesModel(self.model, provider=provider)
 
 

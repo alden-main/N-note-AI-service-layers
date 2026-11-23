@@ -8,7 +8,6 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from n_note_ai_service_layers.settings import DEFAULT_TERM_REVIEW_CHUNK_CHARS, DEFAULT_TERM_REVIEW_TOOLS
 from n_note_ai_service_layers.contracts.gateway_payloads import KOREAN_FINDINGS, MEDICAL_CANDIDATES, MEDICAL_SUGGESTIONS, MedicalTermName
 from n_note_ai_service_layers.contracts.privacy import PRIVACY_TOKEN
 from n_note_ai_service_layers.contracts.term_verification import (
@@ -16,9 +15,11 @@ from n_note_ai_service_layers.contracts.term_verification import (
     GatewayTermOccurrence,
     GatewayTermVerificationResult,
     TermCategory,
+    TermVerificationPhase,
 )
 from n_note_ai_service_layers.services.draft_document import DraftDocument
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient, McpGatewayError
+from n_note_ai_service_layers.settings import DEFAULT_TERM_REVIEW_CHUNK_CHARS, DEFAULT_TERM_REVIEW_TOOLS
 
 _HANGUL = re.compile(r"[가-힣]")
 # 일반 단어 뒤에 붙으면 용언 활용형으로 보는 어미다('말+라고', '설명+함', '변경+해').
@@ -42,7 +43,7 @@ class GatewayTermVerificationFlow:
         self.tool_names = tool_names
         self.chunk_chars = chunk_chars
 
-    def verify(self, phase: str, text: str, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> GatewayTermVerificationResult:
+    def verify(self, phase: TermVerificationPhase, text: str, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> GatewayTermVerificationResult:
         """전사문 같은 단일 텍스트를 검토하고 원문 기준 offset 후보를 반환한다."""
         if not text.strip():
             return GatewayTermVerificationResult(phase, "ok")
@@ -59,7 +60,7 @@ class GatewayTermVerificationFlow:
         unsupported = unavailable = False
         compact_tools = frozenset(tool["name"] for tool in tools if self._supports_compact(tool))
         tasks = [(tool["name"], offset, chunk) for tool in tools for offset, chunk in self._chunks(text) if chunk.strip()]
-        for (tool_name, offset, chunk), result in zip(tasks, self._call_all(tasks, request_id, compact_tools)):
+        for (tool_name, offset, chunk), result in zip(tasks, self._call_all(tasks, request_id, compact_tools), strict=True):
             if result is None:
                 unavailable = True
                 continue
@@ -81,7 +82,7 @@ class GatewayTermVerificationFlow:
             return GatewayTermVerificationResult(phase, "unavailable", tool_names=tool_names)
         return GatewayTermVerificationResult(phase, "unsupported" if unsupported else "ok", tool_names=tool_names)
 
-    def verify_document(self, phase: str, document: DraftDocument, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> GatewayTermVerificationResult:
+    def verify_document(self, phase: TermVerificationPhase, document: DraftDocument, request_id: str | None = None, catalog: tuple[dict[str, Any], ...] | None = None) -> GatewayTermVerificationResult:
         """양식 문서를 한 번에 검토하고, 후보를 필드 값 기준 offset으로 변환한다.
 
         라벨·섹션 제목이나 필드 경계를 넘는 후보는 사용자가 적용할 수 없으므로 제외한다.
@@ -165,7 +166,7 @@ class GatewayTermVerificationFlow:
             for start, end in known_words
         )
 
-    def _parse_result(self, result: dict[str, Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
+    def _parse_result(self, result: dict[str, Any], phase: TermVerificationPhase, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
         payload = result.get("structuredContent")
         # 예전 medic(FastMCP Union 반환)은 구조화 결과를 {"result": ...}로 감쌌다. 지금은 감싸지 않지만 둘 다 받는다.
         if isinstance(payload, dict) and isinstance(payload.get("result"), dict) and not any(key in payload for key in ("findings", "candidates", "suggestions")):
@@ -180,7 +181,7 @@ class GatewayTermVerificationFlow:
             return self._parse_medical_suggestions(payload["suggestions"], phase, source_text, tool_name)
         return None
 
-    def _parse_korean_findings(self, findings: list[Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
+    def _parse_korean_findings(self, findings: list[Any], phase: TermVerificationPhase, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
         # 형태소 분석기가 복원해 원문에 없는 형태소다. 교정할 구간이 없을 뿐 응답 오류가 아니다.
         findings = [item for item in findings if not (isinstance(item, dict) and item.get("start") == item.get("end") and item.get("source_text") == "")]
         try:
@@ -203,7 +204,7 @@ class GatewayTermVerificationFlow:
                 ))
         return parsed
 
-    def _parse_medical_candidates(self, candidates: list[Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
+    def _parse_medical_candidates(self, candidates: list[Any], phase: TermVerificationPhase, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
         try:
             parsed_candidates = MEDICAL_CANDIDATES.validate_python(candidates)
         except ValidationError:
@@ -222,7 +223,7 @@ class GatewayTermVerificationFlow:
                 ))
         return parsed
 
-    def _parse_medical_suggestions(self, suggestions: list[Any], phase: str, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
+    def _parse_medical_suggestions(self, suggestions: list[Any], phase: TermVerificationPhase, source_text: str, tool_name: str) -> list[GatewayTermOccurrence] | None:
         try:
             parsed_suggestions = MEDICAL_SUGGESTIONS.validate_python(suggestions)
         except ValidationError:
@@ -241,7 +242,7 @@ class GatewayTermVerificationFlow:
                 ))
         return parsed
 
-    def _occurrence(self, phase: str, tool_name: str, start: int, end: int, input_text: str, normalized: str, suggestions: list[GatewaySuggestion], category: TermCategory) -> GatewayTermOccurrence:
+    def _occurrence(self, phase: TermVerificationPhase, tool_name: str, start: int, end: int, input_text: str, normalized: str, suggestions: list[GatewaySuggestion], category: TermCategory) -> GatewayTermOccurrence:
         return GatewayTermOccurrence(phase, tool_name, start, end, input_text, normalized, tuple(suggestions[:self.MAX_SUGGESTIONS]), category=category)
 
     @staticmethod

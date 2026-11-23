@@ -1,7 +1,20 @@
 """Isolated synthetic benchmark. Run with python -m benchmark.bench --help."""
 from __future__ import annotations
-import argparse, collections, hashlib, json, math, os, platform, random, statistics, subprocess, sys, time, uuid
-from datetime import datetime, timezone
+
+import argparse
+import collections
+import hashlib
+import json
+import math
+import os
+import platform
+import random
+import statistics
+import subprocess
+import sys
+import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,7 +129,7 @@ def run(args):
     dirty=bool(subprocess.run(['git','status','--porcelain'],cwd=ROOT,capture_output=True,text=True).stdout.strip())
     hashes={str(p.relative_to(ROOT)):digest(p) for p in sorted((ROOT/'forms').glob('*/form.json'))}
     config=settings.get()
-    write_json(out/'manifest.json',{'run_id':args.run_id,'created_at':datetime.now(timezone.utc).isoformat(),
+    write_json(out/'manifest.json',{'run_id':args.run_id,'created_at':datetime.now(UTC).isoformat(),
                'dataset':manifest,'git_commit':commit,'dirty':dirty,'form_hashes':hashes,'repeat':args.repeat,
                'timeout_seconds':args.timeout,'concurrency':1,'tool_mode':'no-tools-v1',
                'platform':platform.platform(),'machine':platform.machine(),'processor':platform.processor(),'python':platform.python_version(),
@@ -226,7 +239,7 @@ def main():
             m, rows, _=validate(args.dataset); print(json.dumps({'count':len(rows),'categories':dict(collections.Counter(x['category'] for x in rows)), 'review_status':m['review_status']},ensure_ascii=False)); return 0
         if args.command=='run':
             if args.repeat<1 or args.timeout<=0: raise ValueError('repeat and timeout must be positive')
-            args.run_id=args.run_id or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+uuid.uuid4().hex[:8]
+            args.run_id=args.run_id or datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')+'-'+uuid.uuid4().hex[:8]
             if not args.run_id or Path(args.run_id).name!=args.run_id or args.run_id in ('.','..'): raise ValueError('invalid run id')
             return run(args)
         return score(args) if args.command=='score' else compare(args)

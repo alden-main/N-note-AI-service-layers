@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 ValidationItemStatus = Literal["satisfied", "missing", "insufficient", "uncertain"]
+ReportValidationStatus = Literal["ok", "unavailable", "unsupported", "skipped"]
 
 
 @dataclass(frozen=True)
@@ -33,7 +34,7 @@ class ReportValidationCriterion:
 class ReportValidationResult:
     """Gateway 보고서 검증 단계 결과다. 결과는 사람 검토 전용이며 초안을 바꾸지 않는다."""
 
-    status: Literal["ok", "unavailable", "unsupported", "skipped"]
+    status: ReportValidationStatus
     criteria: tuple[ReportValidationCriterion, ...] = ()
     summary: dict[str, int] | None = None
     tool_name: str | None = None

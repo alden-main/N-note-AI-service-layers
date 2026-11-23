@@ -61,7 +61,7 @@ class DraftDocument:
     spans: tuple[FieldSpan, ...]
 
     @classmethod
-    def build(cls, schema: FormSchema, fields: dict[str, Any]) -> "DraftDocument":
+    def build(cls, schema: FormSchema, fields: dict[str, Any]) -> DraftDocument:
         parts: list[str] = []
         spans: list[FieldSpan] = []
         length = 0

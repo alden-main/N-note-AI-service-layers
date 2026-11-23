@@ -105,7 +105,7 @@ def template_fields(template: dict) -> list[dict]:
 
 def split_sentences(text: str) -> list[str]:
     """전사문을 근거 단위 문장으로 나눈다. 각 문장은 전사문의 부분 문자열 그대로다."""
-    sentences = []
+    sentences: list[str] = []
     for part in _SENTENCE_BREAK.split(text):
         pieces = _CLAUSE_BREAK.split(part) if len(part) > MAX_SENTENCE_CHARS else [part]
         sentences.extend(piece.strip() for piece in pieces if piece.strip())
@@ -117,6 +117,7 @@ def _value_schema(field: dict) -> dict:
     kind = field["field_type"]
     if kind == "text":
         return {"type": "string"}
+    value: dict[str, Any]
     if kind == "radio":
         key, value = "status", {"type": "string", "enum": list(dict.fromkeys([*field["options"], ""]))}
     else:
@@ -170,9 +171,11 @@ def extract(sentences: list[str], template: dict, hints: tuple[dict, ...], refer
 
 def normalize(template: dict, sentences: list[str], result: dict) -> dict:
     """LLM 결과를 응답 계약 모양으로 정리한다(options 밖의 값·범위 밖 문장 번호·보호 토큰 제거)."""
-    values = result.get("fields") if isinstance(result.get("fields"), dict) else {}
-    evidence = result.get("relatedSentences") if isinstance(result.get("relatedSentences"), dict) else {}
-    fields, related = {}, {}
+    raw_values, raw_evidence = result.get("fields"), result.get("relatedSentences")
+    values: dict[str, Any] = raw_values if isinstance(raw_values, dict) else {}
+    evidence: dict[str, Any] = raw_evidence if isinstance(raw_evidence, dict) else {}
+    fields: dict[str, Any] = {}
+    related: dict[str, list[str]] = {}
     for field in template_fields(template):
         key, kind = field["field_id"], field["field_type"]
         value = values.get(key)

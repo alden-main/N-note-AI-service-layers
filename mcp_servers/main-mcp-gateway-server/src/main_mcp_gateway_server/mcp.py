@@ -1,15 +1,14 @@
 """MCP JSON-RPC 호출, 서비스 catalog, 도구 중계의 결정적 로직을 구현한다."""
 
+import asyncio
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 import json
 from importlib import metadata
 import uuid
 import logging
-from threading import Lock
 from time import monotonic
-from typing import Any, Protocol
+from typing import Any
 
 import httpx2
 
@@ -42,97 +41,70 @@ class McpSessionExpired(OSError):
     """세션 ID를 보낸 요청에 upstream이 404로 답했다(upstream 재시작 등). 다시 초기화해야 한다."""
 
 
-class Transport(Protocol):
-    """HTTP 구현을 교체할 수 있도록 MCP 및 health 요청을 추상화한다."""
-
-    def request_json(
-        self, url: str, payload: dict[str, Any], request_id: str | None = None, session_id: str | None = None
-    ) -> "McpResponse": ...
-
-    def send_notification(self, url: str, payload: dict[str, Any], session_id: str | None = None) -> None: ...
-
-    def healthy(self, url: str) -> bool: ...
+def upstream_client(timeout: float = DEFAULT_UPSTREAM_TIMEOUT_SECONDS, max_idle_connections: int = DEFAULT_MAX_IDLE_CONNECTIONS) -> httpx2.AsyncClient:
+    """upstream MCP·health 요청에 쓰는 비동기 HTTP 클라이언트다. 연결 풀로 keep-alive 연결을 모든 요청이 공유한다."""
+    # upstream은 내부망이므로 프록시 환경 변수를 따르지 않는다.
+    return httpx2.AsyncClient(timeout=timeout, limits=httpx2.Limits(max_keepalive_connections=max_idle_connections), trust_env=False)
 
 
-@dataclass(frozen=True)
-class McpResponse:
-    """JSON-RPC 본문과 Streamable HTTP가 할당한 선택적 MCP 세션 ID다."""
+async def post_json(
+    client: httpx2.AsyncClient, url: str, payload: dict[str, Any], request_id: str | None = None, session_id: str | None = None
+) -> tuple[dict[str, Any], str | None]:
+    """JSON-RPC payload를 POST하고 JSON object 응답과 Streamable HTTP가 할당한 선택적 MCP 세션 ID를 반환한다.
 
-    body: dict[str, Any]
-    session_id: str | None = None
-
-
-class HttpTransport:
-    """Streamable HTTP MCP 서버에 요청한다.
-
-    ``httpx2`` 연결 풀로 upstream keep-alive 연결을 여러 handler 스레드가 공유한다.
-    통신·시간 초과·HTTP 오류는 모두 ``OSError``로 바꾼다.
+    url은 upstream의 `/mcp` 주소여야 하며, 통신·시간 초과·HTTP 오류·JSON 형식 오류는 모두 OSError로 바꾼다.
     """
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if request_id:
+        headers["X-Request-ID"] = request_id
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    if payload.get("method") != "initialize":
+        # initialize 뒤의 모든 요청에는 합의한 프로토콜 버전을 붙인다(MCP 2025-06-18).
+        headers["MCP-Protocol-Version"] = PROTOCOL_VERSION
+    response = await _send(client, "POST", url, json.dumps(payload).encode("utf-8"), headers)
+    if response.status_code == 404 and session_id:
+        # MCP Streamable HTTP: 서버가 세션을 잊으면 404로 답한다. 호출자가 다시 초기화하고 재시도한다.
+        raise McpSessionExpired("upstream MCP session expired")
+    if response.status_code >= 400:
+        raise OSError(f"upstream MCP가 HTTP {response.status_code}를 반환했습니다")
+    try:
+        parsed = _decode_mcp_response(response.content.decode("utf-8"), payload.get("id"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise OSError("upstream MCP 응답 형식이 올바르지 않습니다") from error
+    if "id" in payload and parsed.get("id") != payload["id"]:
+        raise OSError("upstream MCP 응답 id가 요청과 다릅니다")
+    return parsed, response.headers.get("mcp-session-id")
 
-    def __init__(self, timeout: float = DEFAULT_UPSTREAM_TIMEOUT_SECONDS, max_idle_connections: int = DEFAULT_MAX_IDLE_CONNECTIONS) -> None:
-        """upstream MCP·health 요청에 공통으로 적용할 timeout(초)을 설정한다."""
-        # upstream은 내부망이므로 프록시 환경 변수를 따르지 않는다.
-        self._client = httpx2.Client(timeout=timeout, limits=httpx2.Limits(max_keepalive_connections=max_idle_connections), trust_env=False)
 
-    def request_json(
-        self, url: str, payload: dict[str, Any], request_id: str | None = None, session_id: str | None = None
-    ) -> McpResponse:
-        """JSON-RPC payload를 POST하고 JSON object 응답을 반환한다.
+async def send_notification(client: httpx2.AsyncClient, url: str, payload: dict[str, Any], session_id: str | None = None) -> None:
+    """세션을 유지해 MCP notification을 전송한다.
 
-        url은 upstream의 `/mcp` 주소여야 하며, 통신 또는 JSON 형식 오류는 OSError로 바꾼다.
-        """
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
-        if request_id:
-            headers["X-Request-ID"] = request_id
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        if payload.get("method") != "initialize":
-            # initialize 뒤의 모든 요청에는 합의한 프로토콜 버전을 붙인다(MCP 2025-06-18).
-            headers["MCP-Protocol-Version"] = PROTOCOL_VERSION
-        response = self._send("POST", url, json.dumps(payload).encode("utf-8"), headers)
-        if response.status_code == 404 and session_id:
-            # MCP Streamable HTTP: 서버가 세션을 잊으면 404로 답한다. 호출자가 다시 초기화하고 재시도한다.
-            raise McpSessionExpired("upstream MCP session expired")
-        if response.status_code >= 400:
-            raise OSError(f"upstream MCP가 HTTP {response.status_code}를 반환했습니다")
-        try:
-            parsed = _decode_mcp_response(response.content.decode("utf-8"), payload.get("id"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise OSError("upstream MCP 응답 형식이 올바르지 않습니다") from error
-        if "id" in payload and parsed.get("id") != payload["id"]:
-            raise OSError("upstream MCP 응답 id가 요청과 다릅니다")
-        return McpResponse(parsed, response.headers.get("mcp-session-id"))
+    Streamable HTTP 서버는 notification에 빈 202 응답을 반환할 수 있으므로 본문을 JSON으로 해석하지 않는다.
+    """
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": PROTOCOL_VERSION}
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    if (await _send(client, "POST", url, json.dumps(payload).encode("utf-8"), headers)).status_code >= 400:
+        raise OSError("upstream MCP notification 요청에 실패했습니다")
 
-    def send_notification(self, url: str, payload: dict[str, Any], session_id: str | None = None) -> None:
-        """세션을 유지해 MCP notification을 전송한다.
 
-        Streamable HTTP 서버는 notification에 빈 202 응답을 반환할 수 있으므로 본문을 JSON으로 해석하지 않는다.
-        """
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": PROTOCOL_VERSION}
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
-        if self._send("POST", url, json.dumps(payload).encode("utf-8"), headers).status_code >= 400:
-            raise OSError("upstream MCP notification 요청에 실패했습니다")
+async def check_health(client: httpx2.AsyncClient, url: str) -> bool:
+    """비민감 health endpoint가 HTTP 200을 반환하는지 확인한다."""
+    try:
+        return (await _send(client, "GET", url, None, {})).status_code == 200
+    except OSError:
+        return False
 
-    def healthy(self, url: str) -> bool:
-        """비민감 health endpoint가 HTTP 200을 반환하는지 확인한다."""
-        try:
-            return self._send("GET", url, None, {}).status_code == 200
-        except OSError:
-            return False
 
-    def close(self) -> None:
-        """유휴 upstream 연결을 모두 닫는다."""
-        self._client.close()
-
-    def _send(self, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> httpx2.Response:
-        """시간 초과는 호출자의 대기 시간을 두 배로 늘리므로 재시도하지 않는다."""
-        try:
-            return self._client.request(method, url, content=body, headers=headers)
-        except httpx2.TimeoutException as error:
-            raise OSError("upstream 요청 시간이 초과되었습니다") from error
-        except httpx2.TransportError as error:
-            raise OSError("upstream 연결에 실패했습니다") from error
+async def _send(client: httpx2.AsyncClient, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> httpx2.Response:
+    """시간 초과는 호출자의 대기 시간을 두 배로 늘리므로 재시도하지 않는다."""
+    try:
+        return await client.request(method, url, content=body, headers=headers)
+    except httpx2.TimeoutException as error:
+        raise OSError("upstream 요청 시간이 초과되었습니다") from error
+    except httpx2.TransportError as error:
+        raise OSError("upstream 연결에 실패했습니다") from error
 
 
 @dataclass
@@ -152,95 +124,104 @@ class ServiceState:
 class GatewayCatalog:
     """upstream discovery 결과를 단일 MCP 도구 이름 공간으로 합친다.
 
-    도구 호출은 catalog 잠금 밖에서 upstream을 호출하므로 서로 다른 요청의 호출이 동시에 진행된다.
-    discovery는 서비스별로 새 ``ServiceState``를 만든 뒤 교체하므로, 진행 중인 호출은 교체 전 상태(세션)를
-    끝까지 사용하고 discovery 중에도 호출이 막히지 않는다.
+    모든 메서드는 서버 이벤트 루프 하나에서 실행된다. 도구 호출은 discovery 잠금을 잡지 않으므로 서로 다른 요청의
+    호출이 동시에 진행된다. discovery는 서비스별로 새 ``ServiceState``를 만든 뒤 교체하므로, 진행 중인 호출은
+    교체 전 상태(세션)를 끝까지 사용하고 discovery 중에도 호출이 막히지 않는다.
     """
 
     def __init__(
         self,
         upstreams: tuple[UpstreamConfig, ...],
-        transport: Transport | None = None,
+        client: httpx2.AsyncClient | None = None,
+        *,
+        timeout: float = DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
         health_ttl_seconds: float = 0.0,
         batch_max_concurrency: int = DEFAULT_BATCH_MAX_CONCURRENCY,
         catalog_ttl_seconds: float = 0.0,
     ) -> None:
-        self._transport = transport or HttpTransport()
+        """client를 주지 않으면 첫 upstream 요청 때 서버 이벤트 루프에서 만든다. catalog가 client를 소유하고 ``aclose``에서 닫는다."""
+        self._client = client
+        self._timeout = timeout
         self._services = {item.service_id: ServiceState(item) for item in upstreams}
-        # _services 사전 교체·조회만 보호한다. upstream 요청 중에는 잡지 않는다.
-        self._lock = Lock()
-        # 동시에 들어온 tools/list가 discovery를 중복 실행하지 않게 한다.
-        self._discovery_lock = Lock()
+        # 동시에 들어온 tools/list·재discovery가 discovery를 중복 실행하지 않게 한다.
+        self._discovery_lock = asyncio.Lock()
         self._health_ttl_seconds = health_ttl_seconds
-        self._batch_executor = ThreadPoolExecutor(max_workers=max(batch_max_concurrency, 1), thread_name_prefix="gateway-batch")
-        # upstream마다 discovery 왕복(health·initialize·알림·tools/list)을 동시에 보낸다. 전체 시간은 가장 느린 서비스 수준이다.
-        self._discovery_executor = ThreadPoolExecutor(max_workers=max(len(upstreams), 1), thread_name_prefix="gateway-discovery")
+        self._batch_slots = asyncio.Semaphore(max(batch_max_concurrency, 1))
         self._catalog_ttl_seconds = catalog_ttl_seconds
 
-    def discover_all(self) -> None:
+    def _http(self) -> httpx2.AsyncClient:
+        if self._client is None:
+            self._client = upstream_client(self._timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """유휴 upstream 연결을 모두 닫는다."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def discover_all(self) -> None:
         """각 upstream을 독립적으로 health 검사하고 MCP session 및 tools/list를 검증한다.
 
         `2025-06-18` protocol 합의, initialized 알림, name/description/inputSchema 도구 계약이 모두
         성립한 서비스만 active catalog에 넣는다. 하나가 실패해도 다른 서비스 상태에는 영향을 주지 않는다.
         """
-        with self._discovery_lock:
-            self._discover_many(list(self._snapshot().values()))
+        async with self._discovery_lock:
+            await self._discover_many(list(self._services.values()))
 
-    def refresh(self) -> None:
+    async def refresh(self) -> None:
         """tools/list용 갱신이다. 오래된 서비스만 다시 discovery한다.
 
         active 서비스는 ``catalog_ttl_seconds``, 연결되지 않은 서비스는 그보다 짧은 ``REDISCOVERY_INTERVAL_SECONDS``가
         지났을 때만 다시 찾는다. Gateway보다 늦게 뜨거나 복구된 upstream은 다음 tools/list에서 바로 나타난다.
         """
-        with self._discovery_lock:
+        async with self._discovery_lock:
             now = monotonic()
-            stale = [state for state in self._snapshot().values() if now - state.discovered_at >= self._max_age(state)]
-            self._discover_many(stale)
+            await self._discover_many([state for state in self._services.values() if now - state.discovered_at >= self._max_age(state)])
 
     def _max_age(self, state: ServiceState) -> float:
         if state.status == "active":
             return self._catalog_ttl_seconds
         return min(self._catalog_ttl_seconds, REDISCOVERY_INTERVAL_SECONDS)
 
-    def _discover_many(self, states: list[ServiceState]) -> None:
-        """``_discovery_lock`` 안에서 부른다. 서비스별 결과는 끝나는 대로 따로 교체한다."""
-        for discovered in self._discovery_executor.map(lambda state: self._discover(state.config), states):
-            with self._lock:
-                self._services[discovered.config.service_id] = discovered
+    async def _discover_many(self, states: list[ServiceState]) -> None:
+        """``_discovery_lock`` 안에서 부른다. upstream마다 discovery 왕복을 동시에 보내고, 결과는 끝나는 대로 따로 교체한다."""
+        await asyncio.gather(*(self._discover_and_store(state.config) for state in states))
 
-    def _discover(self, config: UpstreamConfig) -> ServiceState:
+    async def _discover_and_store(self, config: UpstreamConfig) -> ServiceState:
+        discovered = await self._discover(config)
+        self._services[config.service_id] = discovered
+        return discovered
+
+    async def _discover(self, config: UpstreamConfig) -> ServiceState:
         state = ServiceState(config, discovered_at=monotonic())
-        if not self._transport.healthy(config.health_url):
+        client = self._http()
+        if not await check_health(client, config.health_url):
             state.status = "unhealthy"
             LOGGER.warning("gateway_discovery_failed service_id=%s stage=health", config.service_id)
             return state
         try:
-            initialize = self._transport.request_json(config.mcp_url, _request("initialize", _initialize_params()))
-            if initialize.body.get("result", {}).get("protocolVersion") != PROTOCOL_VERSION:
+            initialize, session_id = await post_json(client, config.mcp_url, _request("initialize", _initialize_params()))
+            if initialize.get("result", {}).get("protocolVersion") != PROTOCOL_VERSION:
                 raise OSError("upstream MCP protocol version이 일치하지 않습니다")
-            session_id = initialize.session_id
-            self._transport.send_notification(config.mcp_url, _notification("notifications/initialized"), session_id)
-            response = self._transport.request_json(config.mcp_url, _request("tools/list", {}), session_id=session_id)
-            tools = response.body.get("result", {}).get("tools", [])
+            await send_notification(client, config.mcp_url, _notification("notifications/initialized"), session_id)
+            response, _ = await post_json(client, config.mcp_url, _request("tools/list", {}), session_id=session_id)
+            tools = response.get("result", {}).get("tools", [])
             if not isinstance(tools, list):
                 raise OSError("tools/list 형식이 올바르지 않습니다")
             valid = {tool["name"]: tool for tool in tools if _is_valid_tool(tool)}
             if len(valid) != len(tools):
                 raise OSError("tools/list 도구 계약이 올바르지 않습니다")
-        except (OSError, KeyError, TypeError) as error:
+        except (OSError, KeyError, TypeError, AttributeError) as error:
             state.status = "unhealthy"
             LOGGER.warning("gateway_discovery_failed service_id=%s stage=mcp_handshake reason=%s", config.service_id, error)
             return state
         return replace(state, status="active", tools=valid, session_id=session_id, healthy_until=monotonic() + self._health_ttl_seconds)
 
-    def _snapshot(self) -> dict[str, ServiceState]:
-        with self._lock:
-            return dict(self._services)
-
     def list_tools(self) -> list[dict[str, Any]]:
         """현재 active 서비스 도구를 `<service_id>__<name>` 형태로 반환한다."""
         exposed: list[dict[str, Any]] = []
-        for service_id, state in self._snapshot().items():
+        for service_id, state in self._services.items():
             if state.status != "active":
                 continue
             for name, tool in state.tools.items():
@@ -249,13 +230,13 @@ class GatewayCatalog:
 
     def route(self, external_name: str) -> tuple[ServiceState, str] | None:
         """외부 도구 이름을 정확한 service 상태와 upstream 도구명으로 역해석한다."""
-        for service_id, state in self._snapshot().items():
+        for service_id, state in self._services.items():
             prefix = f"{service_id}__"
             if external_name.startswith(prefix):
                 return state, external_name.removeprefix(prefix)
         return None
 
-    def call(self, external_name: str, arguments: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
+    async def call(self, external_name: str, arguments: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         """등록된 도구 호출을 한 upstream에만 전달하고 MCP result 또는 오류를 만든다.
 
         알 수 없는 이름은 upstream 요청 없이 not_found가 되며, health 실패는 catalog를 유지한 채
@@ -268,79 +249,74 @@ class GatewayCatalog:
         state, upstream_name = target
         if upstream_name not in state.tools and state.status != "active":
             # Gateway보다 늦게 준비됐거나 복구된 upstream은 tools/list를 기다리지 않고 여기서 다시 찾는다.
-            state = self._rediscover_if_stale(state)
+            state = await self._rediscover_if_stale(state)
         if upstream_name not in state.tools:
             return self._finish_call(state, upstream_name, request_id, started_at, _tool_error("not_found", "등록되지 않은 Gateway 도구입니다", False))
-        if not self._healthy(state):
+        if not await self._healthy(state):
             state.status = "unhealthy"
             return self._finish_call(state, upstream_name, request_id, started_at, _tool_error("upstream_unavailable", "upstream 서비스가 준비되지 않았습니다", True))
         try:
             try:
-                response = self._send_call(state, upstream_name, arguments, request_id)
+                response = await self._send_call(state, upstream_name, arguments, request_id)
             except McpSessionExpired:
                 # upstream이 재시작해 세션이 사라졌다. 그 서비스만 다시 discovery하고 한 번 재시도한다.
-                state = self._rediscover(state)
+                state = await self._rediscover(state)
                 if state.status != "active" or upstream_name not in state.tools:
                     raise
-                response = self._send_call(state, upstream_name, arguments, request_id)
+                response = await self._send_call(state, upstream_name, arguments, request_id)
         except OSError:
             state.status = "unhealthy"
             state.healthy_until = 0.0
             return self._finish_call(state, upstream_name, request_id, started_at, _tool_error("upstream_unavailable", "upstream MCP 호출에 실패했습니다", True))
-        result = response.body.get("result")
+        result = response.get("result")
         if not _is_valid_tool_result(result):
             result = _tool_error("internal_error", "upstream MCP 도구 응답 계약이 올바르지 않습니다", True)
         return self._finish_call(state, upstream_name, request_id, started_at, result)
 
-    def call_many(self, calls: Sequence[Any], request_id: str | None = None) -> list[dict[str, Any]]:
+    async def call_many(self, calls: Sequence[Any], request_id: str | None = None) -> list[dict[str, Any]]:
         """여러 도구 호출을 동시에 upstream으로 보내고 입력 순서대로 MCP result를 반환한다.
 
+        동시에 진행하는 호출 수는 ``batch_max_concurrency``로 제한한다(Gateway 전체 batch 요청이 공유한다).
         각 항목은 ``{"name": str, "arguments": object}``이며, 형식이 틀린 항목은 upstream 없이
         ``invalid_params`` 오류 result가 된다. 한 호출의 실패는 다른 호출에 영향을 주지 않는다.
         """
-        def run(item: Any) -> dict[str, Any]:
+        async def run(item: Any) -> dict[str, Any]:
             if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("arguments", {}), dict):
                 return _tool_error("invalid_params", "batch 항목에는 name 문자열과 arguments 객체가 필요합니다", False)
-            return self.call(item["name"], item.get("arguments", {}), request_id)
-        if len(calls) <= 1:
-            return [run(item) for item in calls]
-        return list(self._batch_executor.map(run, calls))
+            async with self._batch_slots:
+                return await self.call(item["name"], item.get("arguments", {}), request_id)
+        return list(await asyncio.gather(*(run(item) for item in calls)))
 
-    def _send_call(self, state: ServiceState, upstream_name: str, arguments: dict[str, Any], request_id: str | None) -> McpResponse:
-        return self._transport.request_json(
-            state.config.mcp_url, _request("tools/call", {"name": upstream_name, "arguments": arguments}), request_id, state.session_id,
+    async def _send_call(self, state: ServiceState, upstream_name: str, arguments: dict[str, Any], request_id: str | None) -> dict[str, Any]:
+        body, _ = await post_json(
+            self._http(), state.config.mcp_url, _request("tools/call", {"name": upstream_name, "arguments": arguments}), request_id, state.session_id,
         )
+        return body
 
-    def _rediscover(self, state: ServiceState) -> ServiceState:
-        """서비스 하나를 바로 다시 discovery한다(세션 만료). 다른 스레드가 먼저 새 세션을 받았으면 그것을 쓴다."""
-        with self._discovery_lock:
-            current = self._snapshot()[state.config.service_id]
+    async def _rediscover(self, state: ServiceState) -> ServiceState:
+        """서비스 하나를 바로 다시 discovery한다(세션 만료). 다른 호출이 먼저 새 세션을 받았으면 그것을 쓴다."""
+        async with self._discovery_lock:
+            current = self._services[state.config.service_id]
             if current.session_id != state.session_id and current.status == "active":
                 return current
-            discovered = self._discover(current.config)
-            with self._lock:
-                self._services[current.config.service_id] = discovered
-            return discovered
+            return await self._discover_and_store(current.config)
 
-    def _rediscover_if_stale(self, state: ServiceState) -> ServiceState:
+    async def _rediscover_if_stale(self, state: ServiceState) -> ServiceState:
         """연결되지 않은 서비스 하나를 ``REDISCOVERY_INTERVAL_SECONDS``에 한 번까지만 다시 discovery한다."""
         if monotonic() - state.discovered_at < REDISCOVERY_INTERVAL_SECONDS:
             return state
-        with self._discovery_lock:
-            # 기다리는 동안 다른 스레드가 이미 다시 찾았을 수 있다.
-            current = self._snapshot()[state.config.service_id]
+        async with self._discovery_lock:
+            # 기다리는 동안 다른 호출이 이미 다시 찾았을 수 있다.
+            current = self._services[state.config.service_id]
             if monotonic() - current.discovered_at < REDISCOVERY_INTERVAL_SECONDS:
                 return current
-            discovered = self._discover(current.config)
-            with self._lock:
-                self._services[current.config.service_id] = discovered
-            return discovered
+            return await self._discover_and_store(current.config)
 
-    def _healthy(self, state: ServiceState) -> bool:
+    async def _healthy(self, state: ServiceState) -> bool:
         """health 확인 결과를 ``health_ttl_seconds`` 동안 재사용해 호출마다 왕복하지 않는다."""
         if monotonic() < state.healthy_until:
             return True
-        if not self._transport.healthy(state.config.health_url):
+        if not await check_health(self._http(), state.config.health_url):
             return False
         state.healthy_until = monotonic() + self._health_ttl_seconds
         return True

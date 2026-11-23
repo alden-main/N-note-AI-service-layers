@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from n_note_ai_service_layers import run_model_eval

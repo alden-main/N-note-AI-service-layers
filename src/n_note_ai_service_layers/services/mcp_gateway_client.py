@@ -111,6 +111,12 @@ class McpGatewayClient:
         # 다른 작업을 기다리지 않으므로, 위 계층(초안 검토 등)이 기다려도 교착이 생기지 않는다.
         self._pool = ContextThreadPoolExecutor(max_workers=max(1, pool_workers), thread_name_prefix="gateway-call")
 
+    def close(self) -> None:
+        """HTTP 연결 풀과 일괄 호출 스레드 풀을 닫는다. 닫은 뒤에는 쓰지 않는다."""
+        self._pool.shutdown(wait=False)
+        if self._http is not None:
+            self._http.close()
+
     @property
     def catalog(self) -> tuple[dict[str, Any], ...]:
         """Return the last Gateway-provided catalog without inventing tool definitions."""
@@ -215,7 +221,7 @@ class McpGatewayClient:
                 pending.append(index)
         if pending:
             outcomes = self._batches([calls[index] for index in pending], request_id)
-            for index, outcome in zip(pending, outcomes):
+            for index, outcome in zip(pending, outcomes, strict=True):
                 results[index] = outcome
         return results  # type: ignore[return-value]
 
@@ -335,6 +341,7 @@ class McpGatewayClient:
 
     def _http_post(self, url: str, body: bytes, headers: Mapping[str, str], timeout: float) -> tuple[int, Mapping[str, str], bytes]:
         """POST over the shared connection pool; transport failures surface as ``OSError``/``TimeoutError``."""
+        assert self._http is not None  # transport를 주지 않았을 때만 이 함수를 쓴다.
         try:
             response = self._http.post(url, content=body, headers=dict(headers), timeout=timeout)
         except httpx2.TimeoutException as exc:

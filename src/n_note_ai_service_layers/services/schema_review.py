@@ -8,14 +8,12 @@ from datetime import datetime
 
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, VersionConflict
 from n_note_ai_service_layers.contracts.codec import from_json_dict, to_json_dict
-from n_note_ai_service_layers.contracts.form_schema import (
-    ChangeLogEntry, FormField, FormSchema, SchemaCandidate, SchemaReview, SchemaStatus,
-)
+from n_note_ai_service_layers.contracts.form_schema import ChangeLogEntry, FormField, FormSchema, SchemaCandidate, SchemaReview, SchemaStatus
 from n_note_ai_service_layers.observability import get_logger, log_event
+from n_note_ai_service_layers.services.schema_validation import ensure_approvable
 
 TEMPLATE_COLLECTION = "form_templates"
 _logger = get_logger("templates")
-from n_note_ai_service_layers.services.schema_validation import ensure_approvable
 
 
 def _store_key(schema_id: str, version: str) -> str:

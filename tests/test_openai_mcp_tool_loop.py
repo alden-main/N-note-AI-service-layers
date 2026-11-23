@@ -6,11 +6,12 @@ import json
 import threading
 import unittest
 
+from llm_support import FakeServer, adapter, function_outputs, responses
 from n_note_ai_service_layers import prompts
 from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions, model_tool_output
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
-from llm_support import FakeServer, adapter, function_outputs, responses
-from support import FakeGateway as _Gateway, sample_form_schema
+from support import FakeGateway as _Gateway
+from support import sample_form_schema
 
 FINAL = '{"proposed_fields":{"assessment.pain_score":2},"evidence_refs":[{"field_id":"assessment.pain_score","refs":["tool:1"]}],"needs_confirmation":true}'
 EMPTY = '{"proposed_fields":{},"evidence_refs":[],"needs_confirmation":false}'

@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from n_note_ai_service_layers import settings
+from n_note_ai_service_layers.api.schemas import TemplateRegistrationRequest
 from n_note_ai_service_layers.contracts.codec import from_json_dict, to_json_dict
 from n_note_ai_service_layers.contracts.draft_review import DraftCandidate, DraftReviewRecord, FinalizedNursingNote
 from n_note_ai_service_layers.contracts.form_schema import FormSchema, SchemaStatus
 from n_note_ai_service_layers.contracts.report_validation import ReportValidationResult
-from n_note_ai_service_layers.api.schemas import TemplateRegistrationRequest
 from n_note_ai_service_layers.services.draft_document import ordered_fields, ordered_sections
 
 

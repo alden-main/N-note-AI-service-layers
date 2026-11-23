@@ -16,9 +16,9 @@ from n_note_ai_service_layers.contracts.numeric_verification import NumericFindi
 from n_note_ai_service_layers.contracts.report_validation import ReportValidationResult
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
 from n_note_ai_service_layers.observability import get_logger, log_event, span, stage
+from n_note_ai_service_layers.services import work_loop
 from n_note_ai_service_layers.services.clock import now_local
 from n_note_ai_service_layers.services.draft_document import DraftDocument, is_filled
-from n_note_ai_service_layers.services import work_loop
 from n_note_ai_service_layers.services.draft_token_scrub import scrub_privacy_tokens
 from n_note_ai_service_layers.services.gateway_term_verification import GatewayTermVerificationFlow
 from n_note_ai_service_layers.services.llm_payload import LlmPayloadProjector

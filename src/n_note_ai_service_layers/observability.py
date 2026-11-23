@@ -21,10 +21,13 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from opentelemetry import trace
 from opentelemetry.trace import Span, Status, StatusCode
+
+if TYPE_CHECKING:
+    from fastapi.telemetry import TelemetryConfig
 
 LOGGER_NAME = "n_note"
 TRACER_NAME = "n_note"
@@ -111,7 +114,7 @@ def configure_tracing(enabled: bool, capture_content: bool = False) -> bool:
 UNTRACED_PATHS = frozenset({"/healthz", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"})
 
 
-def fastapi_telemetry() -> dict[str, Any]:
+def fastapi_telemetry() -> TelemetryConfig:
     """FastAPI 내장 OpenTelemetry(0.142+) 설정이다. ``FastAPI(telemetry=...)``에 넘긴다.
 
     FastAPI는 전역 tracer provider가 설치되면(``configure_tracing``) 요청 span을 만든다. 요청 span은 남기고

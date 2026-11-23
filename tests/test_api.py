@@ -8,8 +8,8 @@ from n_note_ai_service_layers.contracts.audio import Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
 from n_note_ai_service_layers.contracts.term_verification import GatewayTermVerificationResult
-from support import sample_form_schema
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflowResult
+from support import sample_form_schema
 
 # 테스트가 상태를 직접 확인·초기화하는 저장소다.
 store = get_services().handoff_store

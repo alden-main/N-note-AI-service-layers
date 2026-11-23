@@ -4,17 +4,16 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from llm_support import FakeServer, chat, responses
 from n_note_ai_service_layers import prompts
 from n_note_ai_service_layers.adapters import model_providers
+from n_note_ai_service_layers.api import deps
 from n_note_ai_service_layers.api.app import create_app
 from n_note_ai_service_layers.api.deps import get_gateway_client, get_speech_to_text_provider, get_transcript_redactor
-from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
-from n_note_ai_service_layers.contracts.term_verification import GatewayTermOccurrence, GatewaySuggestion, GatewayTermVerificationResult
-from n_note_ai_service_layers.api import deps
-from n_note_ai_service_layers.services import form_extraction
 from n_note_ai_service_layers.contracts.audio import Transcript
-from n_note_ai_service_layers.services import nursing_note_workflow
-from llm_support import FakeServer, chat, responses
+from n_note_ai_service_layers.contracts.term_verification import GatewaySuggestion, GatewayTermOccurrence, GatewayTermVerificationResult
+from n_note_ai_service_layers.services import form_extraction, nursing_note_workflow
+from n_note_ai_service_layers.services.transcript_redaction import TranscriptRedactor
 
 
 def fake_review(verify):

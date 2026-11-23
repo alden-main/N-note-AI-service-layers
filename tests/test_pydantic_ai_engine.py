@@ -13,15 +13,13 @@ from unittest.mock import patch
 
 import httpx2
 
-from tracing_support import all_attribute_text, by_name, recorded_spans
-
+from llm_support import FakeServer, adapter, chat, responses
 from n_note_ai_service_layers import prompts, settings
 from n_note_ai_service_layers.adapters import model_providers
-from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions, ToolExecutor
+from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions
 from n_note_ai_service_layers.adapters.pydantic_ai_completion import PydanticAiCompletion
-from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
-from llm_support import FakeServer, adapter, chat, responses
 from support import LOOKUP_TOOL, FakeGateway, sample_form_schema
+from tracing_support import all_attribute_text, by_name, recorded_spans
 
 FINAL = {"proposed_fields": {"assessment.pain_score": 2}, "evidence_refs": [{"field_id": "assessment.pain_score", "refs": ["transcript"]}], "needs_confirmation": False}
 PRIVATE = "환자가 오늘 흉통을 호소함"

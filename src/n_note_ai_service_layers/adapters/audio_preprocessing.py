@@ -71,7 +71,7 @@ def decode_to_pcm(content: bytes, max_seconds: float) -> np.ndarray:
     total = 0
     try:
         with av.open(BytesIO(content), mode="r") as container:
-            stream = next((item for item in container.streams if item.type == "audio"), None)
+            stream = next(iter(container.streams.audio), None)
             if stream is None:
                 raise AudioDecodeError("no audio stream")
             resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)

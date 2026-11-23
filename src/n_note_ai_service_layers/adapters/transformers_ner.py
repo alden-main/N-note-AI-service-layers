@@ -50,10 +50,12 @@ class TransformersNerRecognizer:
         if not text.strip():
             return []
         self.load()
+        pipeline = self._pipeline
+        assert pipeline is not None  # load()가 채운다.
         spans: list[EntitySpan] = []
         for offset, chunk in self._chunks(text):
             with self._lock:
-                entities = self._pipeline(chunk)
+                entities = pipeline(chunk)
             for entity in entities:
                 label = str(entity.get("entity_group") or entity.get("entity") or "").upper().removeprefix("B-").removeprefix("I-")
                 score = float(entity.get("score", 0.0))

@@ -145,6 +145,7 @@ class FormSchemaContractTests(unittest.TestCase):
 
     def test_replace_revalidates(self):
         from dataclasses import replace
+
         from n_note_ai_service_layers.contracts.form_schema import FormField, FormSection
         schema = self._schema(FormField("a"), FormField("b"))
         with self.assertRaisesRegex(ValueError, "unique"):
@@ -153,6 +154,7 @@ class FormSchemaContractTests(unittest.TestCase):
 
     def test_registration_api_uses_the_same_contract(self):
         from fastapi.testclient import TestClient
+
         from n_note_ai_service_layers.api import app
         field = {"field_id": "x", "type": "enum", "options": ["예", 1]}
         payload = {"schema_id": "contract-test", "version": "v1", "purpose": "CONTRACT_TEST", "sections": [{"section_id": "s", "fields": [field]}]}

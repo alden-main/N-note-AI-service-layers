@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from n_note_ai_service_layers.contracts.clinical_context import (
-    ClinicalContextQuery, ClinicalContextSnapshot, ClinicalDataRepository, ClinicalFactNormalizer,
-)
+from n_note_ai_service_layers.adapters.clinical_normalizer import CodeMappingNormalizer
+from n_note_ai_service_layers.contracts.clinical_context import ClinicalContextQuery, ClinicalContextSnapshot, ClinicalDataRepository, ClinicalFactNormalizer
 from n_note_ai_service_layers.services.access_policy import PurposeAccessPolicy
 from n_note_ai_service_layers.services.context_assembler import ClinicalContextAssembler
 from n_note_ai_service_layers.services.schema_review import FormSchemaRegistry
-from n_note_ai_service_layers.adapters.clinical_normalizer import CodeMappingNormalizer
 
 
 class ClinicalContextFlow:

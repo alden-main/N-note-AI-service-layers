@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 
 from pypdf import PdfReader
 
+from n_note_ai_service_layers import settings
 from n_note_ai_service_layers.adapters.note_artifact_store import FileNursingNoteStore
 from n_note_ai_service_layers.adapters.pdf_renderer import NursingNotePdfRenderer, PdfConfigurationError
 from n_note_ai_service_layers.contracts.draft_review import DraftCandidate, FinalizedNursingNote
 from n_note_ai_service_layers.contracts.form_schema import FormField, FormSchema, FormSection, PdfPlacement, SchemaStatus
 from n_note_ai_service_layers.services.draft_review import DraftAlreadyFinalized, DraftReviewStore
-from n_note_ai_service_layers import settings
 
 SCHEMA = FormSchema(
     "daily", "daily/v1", "DAILY",
@@ -63,7 +63,7 @@ class DraftReviewTests(unittest.TestCase):
 
 
 def _note(fields):
-    return FinalizedNursingNote("6f9c2a8e-1d7b-4a43-9a43-3b8e7f0c2d11", "draft-1", 2, SCHEMA.schema_id, SCHEMA.version, SCHEMA.display_title, "patient-1", "encounter-1", fields, {}, {}, "nurse-1", datetime(2026, 10, 26, 9, 30, tzinfo=timezone.utc), "trace")
+    return FinalizedNursingNote("6f9c2a8e-1d7b-4a43-9a43-3b8e7f0c2d11", "draft-1", 2, SCHEMA.schema_id, SCHEMA.version, SCHEMA.display_title, "patient-1", "encounter-1", fields, {}, {}, "nurse-1", datetime(2026, 10, 26, 9, 30, tzinfo=UTC), "trace")
 
 
 def _text(pdf: bytes) -> str:

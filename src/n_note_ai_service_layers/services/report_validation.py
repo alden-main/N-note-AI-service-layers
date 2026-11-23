@@ -6,16 +6,18 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from n_note_ai_service_layers.settings import DEFAULT_REPORT_VALIDATION_TOOL
-from n_note_ai_service_layers.contracts.gateway_payloads import ReportEvaluation
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
+from n_note_ai_service_layers.contracts.gateway_payloads import ReportEvaluation
 from n_note_ai_service_layers.contracts.report_validation import (
     ReportValidationCriterion,
     ReportValidationElement,
     ReportValidationResult,
+    ReportValidationStatus,
+    ValidationItemStatus,
 )
 from n_note_ai_service_layers.services.draft_document import DraftDocument, ordered_fields, ordered_sections
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient, McpGatewayError
+from n_note_ai_service_layers.settings import DEFAULT_REPORT_VALIDATION_TOOL
 
 STANDARD_SCHEMA_VERSION = "report-validation-standard/v1"
 RESULT_POLICY = "candidate_only_human_review_required"
@@ -63,7 +65,7 @@ class FormReportValidationFlow:
                 for field in required
             )
             filled = sum(element.status == "satisfied" for element in elements)
-            status = "satisfied" if filled == len(elements) else "insufficient" if filled else "missing"
+            status: ValidationItemStatus = "satisfied" if filled == len(elements) else "insufficient" if filled else "missing"
             criteria.append(ReportValidationCriterion(
                 f"section:{section.section_id}", f"{section.label or section.section_id}의 필수 항목이 작성되어야 한다.", status, elements,
             ))
@@ -72,7 +74,7 @@ class FormReportValidationFlow:
     def _remote(
         self, criteria: list[dict[str, Any]], schema: FormSchema, document: DraftDocument, request_id: str | None,
         catalog: tuple[dict[str, Any], ...] | None, gateway_available: bool,
-    ) -> tuple[str, tuple[ReportValidationCriterion, ...]]:
+    ) -> tuple[ReportValidationStatus, tuple[ReportValidationCriterion, ...]]:
         """양식별 추가 기준을 report 도구로 검증한다. 반환: (상태, 기준 결과)."""
         if not self.tool_name:
             return "skipped", ()
@@ -121,7 +123,8 @@ class FormReportValidationFlow:
         for criterion in standard["criteria"]:
             elements = []
             for element in criterion.get("required_elements", []):
-                span = document.span_for(element.get("field_id")) if isinstance(element, dict) and element.get("field_id") else None
+                field_id = element.get("field_id") if isinstance(element, dict) else None
+                span = document.span_for(field_id) if isinstance(field_id, str) and field_id else None
                 if span is None:
                     continue
                 quote = document.text[span.start:span.end]

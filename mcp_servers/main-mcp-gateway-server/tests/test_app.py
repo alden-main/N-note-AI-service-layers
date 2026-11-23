@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import uvicorn
 
-from main_mcp_gateway_server.app import GatewayService, _upstream_timeout_seconds, configure_logging, create_app
+from main_mcp_gateway_server.app import _upstream_timeout_seconds, configure_logging, create_app
 
 
 class RecordingCatalog:
@@ -22,21 +22,29 @@ class RecordingCatalog:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict, str | None]] = []
         self.discovery_calls = 0
+        self.started = False
+        self.closed = False
 
-    def refresh(self) -> None:
+    async def discover_all(self) -> None:
+        self.started = True
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    async def refresh(self) -> None:
         self.discovery_calls += 1
 
     def list_tools(self) -> list[dict]:
         """테스트용 catalog다."""
         return [{"name": "a__lookup", "description": "lookup", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}]
 
-    def call(self, name: str, arguments: dict, request_id: str | None = None) -> dict:
+    async def call(self, name: str, arguments: dict, request_id: str | None = None) -> dict:
         """호출 기록을 남기고 계약에 맞는 성공 tool result를 반환한다(content 없이 구조화 결과만)."""
         self.calls.append((name, arguments, request_id))
         return {"structuredContent": {"ok": True}, "isError": False}
 
-    def call_many(self, calls: list, request_id: str | None = None) -> list[dict]:
-        return [self.call(item["name"], item.get("arguments", {}), request_id) for item in calls]
+    async def call_many(self, calls: list, request_id: str | None = None) -> list[dict]:
+        return [await self.call(item["name"], item.get("arguments", {}), request_id) for item in calls]
 
 
 BATCH = "/v1/tools/batch-call"
@@ -47,11 +55,10 @@ class GatewayHandlerTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.catalog = RecordingCatalog()
-        self.service = GatewayService(self.catalog, max_request_body_bytes=256)
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
-        self.server = uvicorn.Server(uvicorn.Config(create_app(self.service), host="127.0.0.1", port=self.port, log_level="warning"))
+        self.server = uvicorn.Server(uvicorn.Config(create_app(self.catalog, max_request_body_bytes=256, max_batch_calls=2), host="127.0.0.1", port=self.port, log_level="warning"))
         self.thread = threading.Thread(target=self.server.run, daemon=True)
         self.thread.start()
         deadline = time.monotonic() + 5
@@ -61,6 +68,9 @@ class GatewayHandlerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.server.should_exit = True
         self.thread.join(timeout=5)
+        # lifespan이 시작 때 discovery하고 종료 때 upstream 연결을 닫는다.
+        self.assertTrue(self.catalog.started)
+        self.assertTrue(self.catalog.closed)
 
     def _post(self, payload: dict, request_id: str = "test-request") -> tuple[int, dict]:
         """테스트 서버로 JSON-RPC POST를 보내고 HTTP status와 JSON 응답을 반환한다."""
@@ -125,7 +135,6 @@ class GatewayHandlerTest(unittest.TestCase):
 
     def test_batch_call_rejects_empty_or_oversized_batches(self) -> None:
         """빈 batch와 상한을 넘는 batch는 upstream 호출 없이 400이다."""
-        self.service.max_batch_calls = 2
         self.assertEqual(self._post_path("/v1/tools/batch-call", {"calls": []})[0], 400)
         calls = [{"name": "a__one", "arguments": {}}] * 3
         self.assertEqual(self._post_path("/v1/tools/batch-call", {"calls": calls})[0], 400)

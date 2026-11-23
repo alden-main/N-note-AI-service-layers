@@ -155,7 +155,7 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d -
 | `N_NOTE_REPORT_VALIDATION_TOOL` | `report__evaluate_report_against_standard` | 양식별 추가 기준 검증 도구. 비우면 추가 기준 검증을 생략(필수 항목 판정은 계속) |
 | `N_NOTE_STATE_DB` | 없음(메모리) · Docker는 `/var/lib/n-note/state/state.sqlite3` | 초안·핸드오프·감사 이력·양식 상태 SQLite. 미설정이면 재시작 시 사라지고 worker 간에 공유되지 않는다 |
 | `N_NOTE_WORKERS` | `1` | uvicorn worker 수. 녹음 세션이 프로세스 메모리에 있으므로 1을 권장합니다. 2 이상은 `N_NOTE_STATE_DB`와 세션 단위 sticky 라우팅이 함께 필요합니다 |
-| `N_NOTE_DRAFT_RETENTION_HOURS` | `72` | 확정 전 초안(전사문·환자 ID 포함) 보관 시간 |
+| `N_NOTE_DRAFT_RETENTION_HOURS` | `72` | 확정 전 초안(전사문·환자 ID 포함) 보관 시간. 감사 이력(`audit_events`)은 기한 없이 남깁니다(식별자·동작·시각만 있고 본문은 없음) |
 | `N_NOTE_TIMEZONE` | `Asia/Seoul` | 구술 시각("오후 2시")·감사 시각을 해석하는 병동 시간대. 컨테이너 시간대(UTC)와 무관 |
 | `N_NOTE_STT_TIMEOUT_SECONDS` / `N_NOTE_LLM_TIMEOUT_SECONDS` | `60` / `90` | STT·LLM 요청 한 번의 제한 시간 |
 | `N_NOTE_MODEL_MAX_RETRIES` | `1` | STT·LLM SDK 재시도 횟수 |
@@ -165,6 +165,8 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d -
 | `MCP_GATEWAY_CATALOG_TTL_SECONDS` | `300` | Gateway 도구 catalog 재사용 시간(요청마다 initialize·tools/list 왕복 생략) |
 | `N_NOTE_JOB_CONCURRENCY` / `N_NOTE_JOB_MAX_PENDING` | `4` / `32` | worker당 초안 생성 작업 동시 실행 수 / 대기열 상한(넘으면 429) |
 | `N_NOTE_FORM_CONCURRENCY` / `N_NOTE_MAX_FORMS_PER_JOB` | `3` / `7` | 여러 양식 작업(`schema_ids`)에서 동시에 초안을 만들 양식 수 / 작업 하나에 요청할 수 있는 양식 수. worker당 LLM 동시 호출은 최대 `JOB_CONCURRENCY × FORM_CONCURRENCY` |
+
+작업 실행 구조: 초안 생성 작업·양식별 초안·동기 서식 추출(`/internal/v1`)은 worker마다 하나인 작업 이벤트 루프([services/work_loop.py](src/n_note_ai_service_layers/services/work_loop.py))에서 asyncio로 돕니다. API 이벤트 루프는 HTTP만 처리합니다. LLM 요청은 이 루프에서 비동기로 보내고, 동기 경계(STT·비식별화·Gateway·SQLite)는 같은 루프의 스레드 풀(`asyncio.to_thread`)에서 실행합니다. 풀 크기는 `JOB_CONCURRENCY × (2 + FORM_CONCURRENCY × 6)`(최소 16)입니다.
 | `N_NOTE_JOB_TIMEOUT_SECONDS` | `600` | 작업 상태가 이 시간 동안 갱신되지 않으면 `interrupted`로 실패 처리 |
 | `N_NOTE_NER_MODEL` | 없음(규칙만) | 로컬 NER 비식별화 모델. 예: `Leo97/KoELECTRA-small-v3-modu-ner`. `uv sync --extra ner`(Docker는 `N_NOTE_INSTALL_NER=true` 빌드) 필요. 설정했는데 못 올리면 기동 실패 |
 | `N_NOTE_NER_MIN_SCORE` / `N_NOTE_NER_LABELS` / `N_NOTE_NER_THREADS` | `0.8` / `PS,PER,PERSON` / `2` | NER 최소 신뢰도 / 사람 라벨 / CPU 스레드 |

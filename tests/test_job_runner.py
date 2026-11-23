@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 import unittest
+import unittest.mock
 
 from n_note_ai_service_layers.adapters.document_store import InMemoryDocumentStore
 from n_note_ai_service_layers.services.jobs import JobFailure, JobRunner, JobStore
@@ -78,3 +79,35 @@ class JobRunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JobSubscriptionTests(unittest.TestCase):
+    def test_subscribers_are_notified_on_update_until_unsubscribed(self) -> None:
+        jobs = JobStore(InMemoryDocumentStore(), timeout_seconds=60)
+        job_id = jobs.create("test", "trace", {})[0]["job_id"]
+        calls: list[int] = []
+        unsubscribe = jobs.subscribe(job_id, lambda: calls.append(1))
+        jobs.update(job_id, status="running")
+        jobs.stage(job_id, "stt")
+        unsubscribe()
+        jobs.update(job_id, status="succeeded")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(jobs._listeners, {})
+
+    def test_sse_delivers_a_same_worker_change_without_waiting_for_the_recheck_interval(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from n_note_ai_service_layers.api.app import create_app
+        from n_note_ai_service_layers.api.routes import workflow_jobs
+        from n_note_ai_service_layers.api.state import get_services
+
+        jobs = get_services().jobs
+        job_id = jobs.create("test", "trace", {})[0]["job_id"]
+        with unittest.mock.patch.object(workflow_jobs, "_SSE_RECHECK_SECONDS", 30.0), TestClient(create_app()) as client:
+            threading.Timer(0.3, lambda: jobs.update(job_id, status="succeeded", result={})).start()
+            started = time.monotonic()
+            with client.stream("GET", f"/v1/nursing-note-jobs/{job_id}/events") as stream:
+                body = "".join(stream.iter_text())
+            elapsed = time.monotonic() - started
+        self.assertIn("event: succeeded", body)
+        self.assertLess(elapsed, 5.0)  # 재확인 간격(30초)이 아니라 변경 알림으로 깨어난다

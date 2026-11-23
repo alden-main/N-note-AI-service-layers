@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from xml.sax.saxutils import escape
 
 from n_note_ai_service_layers.contracts.draft_review import FinalizedNursingNote
@@ -54,7 +54,7 @@ class NursingNotePdfRenderer:
             raise ValueError("note does not belong to this form version")
         self._register_font()
         if schema.pdf_template:
-            return self._render_on_template(schema, note)
+            return self._render_on_template(schema, note, schema.pdf_template)
         return self._render_generated(schema, note, [])
 
     def _register_font(self) -> None:
@@ -72,12 +72,12 @@ class NursingNotePdfRenderer:
 
     # --- 양식 PDF 합성 -------------------------------------------------
 
-    def _render_on_template(self, schema: FormSchema, note: FinalizedNursingNote) -> bytes:
+    def _render_on_template(self, schema: FormSchema, note: FinalizedNursingNote, template: str) -> bytes:
         from pypdf import PdfReader, PdfWriter
         from pypdf.generic import ArrayObject, NameObject
         from reportlab.pdfgen import canvas
 
-        reader = PdfReader(schema.pdf_template)
+        reader = PdfReader(template)
         widgets = _widget_boxes(reader)
         values = {field.field_id: (field.label or field.field_id, format_value(note.fields.get(field.field_id)), field.pdf) for field in schema.fields}
         values.update({f"meta.{key}": (META_LABELS[key], value, placement) for key, value, placement in _meta_items(schema, note)})
@@ -104,12 +104,12 @@ class NursingNotePdfRenderer:
         overlay.save()
         overlay_reader = PdfReader(BytesIO(overlay_buffer.getvalue()))
 
-        writer = PdfWriter(clone_from=schema.pdf_template)
+        writer = PdfWriter(clone_from=template)
         for index, page in enumerate(writer.pages):
             page.merge_page(overlay_reader.pages[index])
             # 빈 입력 위젯이 합성한 글자를 가리지 않도록 양식 필드를 평면화한다.
             if "/Annots" in page:
-                annots = [item for item in page["/Annots"] if item.get_object().get("/Subtype") != "/Widget"]
+                annots = [item for item in cast(ArrayObject, page["/Annots"]) if item.get_object().get("/Subtype") != "/Widget"]
                 if annots:
                     page[NameObject("/Annots")] = ArrayObject(annots)
                 else:
@@ -221,9 +221,11 @@ def _resolve_box(placement: PdfPlacement, widgets: dict[str, _Box], page_count: 
             raise PdfConfigurationError(f"PDF template has no form field named {placement.field_name!r}")
         return _Box(widget.page, widget.x, widget.y, widget.width, widget.height, placement.font_size)
     if placement.has_box:
-        if not 1 <= placement.page <= page_count:
-            raise PdfConfigurationError(f"PDF placement page {placement.page} is outside the template")
-        return _Box(placement.page - 1, placement.x, placement.y, placement.width, placement.height, placement.font_size)
+        page, x, y, width, height = placement.page, placement.x, placement.y, placement.width, placement.height
+        assert page is not None and x is not None and y is not None and width is not None and height is not None  # has_box가 보장한다.
+        if not 1 <= page <= page_count:
+            raise PdfConfigurationError(f"PDF placement page {page} is outside the template")
+        return _Box(page - 1, x, y, width, height, placement.font_size)
     return None
 
 

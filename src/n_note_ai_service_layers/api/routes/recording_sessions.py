@@ -14,10 +14,20 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 
-from n_note_ai_service_layers.api.deps import get_nursing_note_workflow, get_speech_to_text_provider, get_transcript_redactor, get_workflow_context_flow, read_validated_audio
+from n_note_ai_service_layers.api.deps import (
+    get_nursing_note_workflow,
+    get_speech_to_text_provider,
+    get_transcript_redactor,
+    get_workflow_context_flow,
+    read_validated_audio,
+)
 from n_note_ai_service_layers.api.routes.workflow_jobs import job_response, prepare_workflow_forms, submit_workflow_job
 from n_note_ai_service_layers.api.schemas import (
-    RecordingChunkResponse, RecordingSessionCreateRequest, RecordingSessionResponse, RecordingWorkflowRequest, WorkflowJob,
+    RecordingChunkResponse,
+    RecordingSessionCreateRequest,
+    RecordingSessionResponse,
+    RecordingWorkflowRequest,
+    WorkflowJob,
 )
 from n_note_ai_service_layers.api.state import get_services
 from n_note_ai_service_layers.contracts.ai_provider import SpeechToTextProvider

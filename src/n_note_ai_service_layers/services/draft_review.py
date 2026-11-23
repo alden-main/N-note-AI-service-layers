@@ -8,20 +8,13 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers.adapters.document_store import DocumentStore, InMemoryDocumentStore, VersionConflict
 from n_note_ai_service_layers.contracts.codec import from_json_dict, to_json_dict
-
-from n_note_ai_service_layers.contracts.draft_review import (
-    CandidateDecision,
-    DraftCandidate,
-    DraftReviewRecord,
-    DraftRevision,
-    FinalizedNursingNote,
-)
+from n_note_ai_service_layers.contracts.draft_review import CandidateDecision, DraftCandidate, DraftReviewRecord, DraftRevision, FinalizedNursingNote
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
 from n_note_ai_service_layers.services.audit import AuditTrail
+from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers.services.draft_document import is_filled
 from n_note_ai_service_layers.services.numeric_verification import NumericVerifier
 
@@ -174,10 +167,12 @@ class DraftReviewStore:
             replacement = selected_suggestions.get(candidate.candidate_id, candidate.suggestions[0] if candidate.suggestions else None)
             if replacement is None or replacement not in candidate.suggestions:
                 raise ValueError(f"candidate {candidate.candidate_id} requires one of its suggestions")
-            value = fields.get(candidate.field_id)
+            field_id = candidate.field_id
+            assert field_id is not None  # to_apply는 field_id가 있는 후보만 담는다.
+            value = fields.get(field_id)
             if not isinstance(value, str) or value[candidate.start_offset:candidate.end_offset] != candidate.input_text:
                 raise ValueError(f"candidate {candidate.candidate_id} no longer matches the draft field")
-            fields[candidate.field_id] = value[:candidate.start_offset] + replacement + value[candidate.end_offset:]
+            fields[field_id] = value[:candidate.start_offset] + replacement + value[candidate.end_offset:]
             applied[candidate.candidate_id] = replacement
             candidates = self._shift(candidates, candidate, len(replacement) - len(candidate.input_text))
         for field_id in edited_fields:

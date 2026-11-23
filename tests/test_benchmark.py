@@ -1,10 +1,13 @@
 from __future__ import annotations
+
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
 from benchmark import bench, worker
+
 
 class BenchmarkTests(unittest.TestCase):
     def test_workflow_runs_with_fixed_reference_and_without_answers(self):

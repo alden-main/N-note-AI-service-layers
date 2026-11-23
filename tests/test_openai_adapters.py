@@ -1,23 +1,24 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import os
+import tempfile
 import unittest
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+
+from dotenv import load_dotenv
 
 from n_note_ai_service_layers.adapters.draft_generation import DraftGenerationAdapter
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
+from n_note_ai_service_layers.contracts.clinical_context import Availability, ClinicalContextQuery, ClinicalFact
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import SchemaStatus
-from support import StaticCompletion, sample_form_schema
 from n_note_ai_service_layers.services.context_assembler import ClinicalContextAssembler
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayConnectionError
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow
-from n_note_ai_service_layers.contracts.clinical_context import Availability, ClinicalContextQuery, ClinicalFact
-from datetime import datetime
-from pathlib import Path
-import os
-import tempfile
-from dotenv import load_dotenv
+from support import StaticCompletion, sample_form_schema
 
 
 class _FakeTranscriptions:

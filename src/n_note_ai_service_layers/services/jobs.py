@@ -66,6 +66,29 @@ class JobStore:
         self.store = store
         self.timeout_seconds = timeout_seconds
         self.retention_hours = retention_hours
+        # 같은 worker 안의 작업 상태 구독자(SSE)다. 다른 worker가 바꾼 상태는 구독자가 주기적으로 다시 읽어 본다.
+        self._listeners: dict[str, set[Callable[[], None]]] = {}
+        self._listeners_lock = threading.Lock()
+
+    def subscribe(self, job_id: str, callback: Callable[[], None]) -> Callable[[], None]:
+        """``job_id`` 상태가 이 worker에서 바뀔 때마다 ``callback()``을 부른다(쓰기 스레드에서). 해지 함수를 돌려준다."""
+        with self._listeners_lock:
+            self._listeners.setdefault(job_id, set()).add(callback)
+
+        def unsubscribe() -> None:
+            with self._listeners_lock:
+                callbacks = self._listeners.get(job_id)
+                if callbacks is not None:
+                    callbacks.discard(callback)
+                    if not callbacks:
+                        del self._listeners[job_id]
+        return unsubscribe
+
+    def _notify(self, job_id: str) -> None:
+        with self._listeners_lock:
+            callbacks = list(self._listeners.get(job_id, ()))
+        for callback in callbacks:
+            callback()
 
     def create(
         self, kind: str, trace_id: str, request: dict[str, Any], idempotency_key: str | None = None, extra: dict[str, Any] | None = None,
@@ -113,6 +136,7 @@ class JobStore:
         stored = self.store.get(JOB_COLLECTION, job_id)
         job = {**(stored.payload if stored else {}), **changes, "updated_at": _now()}
         self.store.put(JOB_COLLECTION, job_id, job)
+        self._notify(job_id)
         return job
 
     def stage(self, job_id: str, stage: str) -> None:
@@ -180,7 +204,10 @@ class JobRunner:
     async def _run_traced(self, job_id: str, work: Callable[[Progress], Any], current: Any) -> None:
         started = time.perf_counter()
         await asyncio.to_thread(self.jobs.update, job_id, status="running", started_at=_now())
-        progress: Progress = lambda stage: self.jobs.stage(job_id, stage)
+
+        def progress(stage: str) -> None:
+            self.jobs.stage(job_id, stage)
+
         try:
             if inspect.iscoroutinefunction(work):
                 result = await work(progress)

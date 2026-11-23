@@ -19,10 +19,11 @@ LLM은 '혈압 백에 육십'을 160/100으로 쓰거나, 구술에 없는 기�
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable
+from typing import Any
 
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
 from n_note_ai_service_layers.contracts.numeric_verification import NumericFinding
@@ -106,10 +107,10 @@ def _spoken(word: str) -> _Spoken | None:
         length += 1
     if not length:
         return None
-    value, smallest, has_unit = _sino(word[:length])
-    if value is None:
+    sino_value, smallest, has_unit = _sino(word[:length])
+    if sino_value is None:
         return None
-    return _Spoken(value, smallest, has_unit, length == len(word), word[length:])
+    return _Spoken(sino_value, smallest, has_unit, length == len(word), word[length:])
 
 
 def source_numbers(texts: Iterable[str]) -> set[Decimal]:
@@ -118,9 +119,9 @@ def source_numbers(texts: Iterable[str]) -> set[Decimal]:
     for raw in texts:
         text = PRIVACY_TOKEN.sub(" ", raw)
         for match in ARABIC_NUMBER.finditer(text):
-            value = _number(match.group())
-            if value is not None:
-                numbers.update({value, Decimal(int(value))})
+            arabic = _number(match.group())
+            if arabic is not None:
+                numbers.update({arabic, Decimal(int(arabic))})
         words = WORD.findall(text)
         index = 0
         while index < len(words):
@@ -145,7 +146,7 @@ def source_numbers(texts: Iterable[str]) -> set[Decimal]:
                 numbers.add(Decimal(value - value % 10))
             fraction = _fraction(words, index + consumed - 1)
             if fraction is not None:
-                numbers.add(_number(f"{value}.{fraction}"))
+                numbers.add(Decimal(f"{value}.{fraction}").normalize())
             if _is_hour(words, index + consumed - 1) and 1 <= value <= 11 and any(word in PM_WORDS for word in words[max(0, index - 2):index]):
                 numbers.add(Decimal(value + 12))
             index += consumed

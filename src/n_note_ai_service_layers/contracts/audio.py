@@ -14,7 +14,7 @@ class AudioDecodeError(ValueError):
 class AudioInput:
     """전사 제공자에 전달할 음성 파일을 표현한다.
 
-    입력: 음성 바이트, 파일명, MIME 형식, 추적 ID와 선택 언어 힌트이다.
+    입력: 음성 바이트, 파일명, MIME 형식(업로드에 없으면 ``None``), 추적 ID와 선택 언어 힌트이다.
     ``preceding_text``는 녹음 세션에서 바로 앞 청크까지 전사된 문장의 끝부분이다. STT가 청크 경계에서
     문맥을 이어 받도록 프롬프트 뒤에 붙인다(원본 전사문이므로 로컬 STT 경계 밖으로 보내지 않는다).
     ``recorded_at``은 음성이 녹음된 시각이다(요청 값 → 음성 파일 메타데이터 → 접수 시각 순으로 API가 정한다,
@@ -23,7 +23,7 @@ class AudioInput:
     """
     content: bytes
     filename: str
-    mime_type: str
+    mime_type: str | None
     trace_id: str
     language_hint: str | None = None
     preceding_text: str | None = None

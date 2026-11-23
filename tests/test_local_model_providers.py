@@ -5,13 +5,14 @@ import os
 import unittest
 from unittest.mock import patch
 
+from llm_support import FakeServer, adapter, chat
 from n_note_ai_service_layers import prompts, settings
 from n_note_ai_service_layers.adapters import model_providers
 from n_note_ai_service_layers.adapters.llm_completion import GenerationOptions
 from n_note_ai_service_layers.adapters.pydantic_ai_completion import PydanticAiCompletion
 from n_note_ai_service_layers.services.mcp_gateway_client import McpGatewayClient
-from llm_support import FakeServer, adapter, chat
-from support import LOOKUP_TOOL, FakeGateway as _Gateway, sample_form_schema
+from support import LOOKUP_TOOL, sample_form_schema
+from support import FakeGateway as _Gateway
 
 FINAL_OUTPUT_INSTRUCTION = prompts.get().structured_output.final_output
 FINAL_TURN_INSTRUCTION = prompts.get().structured_output.final_turn

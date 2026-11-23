@@ -11,12 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from n_note_ai_service_layers.adapters.note_artifact_store import FileNursingNoteStore
 from n_note_ai_service_layers.adapters.pdf_renderer import NursingNotePdfRenderer, PdfConfigurationError
 from n_note_ai_service_layers.api import mappers
-from n_note_ai_service_layers.api.deps import (
-    get_authenticated_user,
-    get_note_store,
-    get_pdf_renderer,
-    resolve_actor,
-)
+from n_note_ai_service_layers.api.deps import get_authenticated_user, get_note_store, get_pdf_renderer, resolve_actor
 from n_note_ai_service_layers.api.schemas import DraftFinalizeRequest, DraftRevisionRequest
 from n_note_ai_service_layers.api.state import get_services
 from n_note_ai_service_layers.contracts.draft_review import FinalizedNursingNote

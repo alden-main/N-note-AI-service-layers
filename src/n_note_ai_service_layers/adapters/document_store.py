@@ -8,13 +8,17 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+
+# ``list(where=...)``에 쓸 수 있는 필드 이름이다(SQL에 넣으므로 식별자만 허용한다).
+_FIELD_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class VersionConflict(RuntimeError):
@@ -38,7 +42,9 @@ class DocumentStore(Protocol):
 
     def delete(self, collection: str, key: str) -> bool: ...
 
-    def list(self, collection: str) -> list[StoredDocument]: ...
+    def list(self, collection: str, where: Mapping[str, str] | None = None) -> list[StoredDocument]:
+        """컬렉션 문서를 갱신 순서로 돌려준다. ``where``는 최상위 문자열 필드가 모두 같은 문서만 고른다."""
+        ...
 
     def clear(self, collection: str) -> None: ...
 
@@ -57,7 +63,8 @@ class InMemoryDocumentStore:
         self._lock = threading.Lock()
 
     def get(self, collection: str, key: str) -> StoredDocument | None:
-        return self._items.get(collection, {}).get(key)
+        with self._lock:
+            return self._items.get(collection, {}).get(key)
 
     def put(self, collection: str, key: str, payload: dict[str, Any], expected_version: int | None = None) -> int:
         # JSON 왕복으로 SQLite 구현과 같은 직렬화 제약을 갖게 한다.
@@ -75,8 +82,11 @@ class InMemoryDocumentStore:
         with self._lock:
             return self._items.get(collection, {}).pop(key, None) is not None
 
-    def list(self, collection: str) -> list[StoredDocument]:
-        return list(self._items.get(collection, {}).values())
+    def list(self, collection: str, where: Mapping[str, str] | None = None) -> list[StoredDocument]:
+        with self._lock:
+            items = list(self._items.get(collection, {}).values())
+        items.sort(key=lambda item: (item.updated_at, item.key))
+        return [item for item in items if all(item.payload.get(field) == value for field, value in (where or {}).items())]
 
     def clear(self, collection: str) -> None:
         with self._lock:
@@ -91,8 +101,9 @@ class InMemoryDocumentStore:
             return len(expired)
 
     def fingerprint(self, collection: str) -> tuple[int, float]:
-        items = self._items.get(collection, {})
-        return len(items), max((item.updated_at for item in items.values()), default=0.0)
+        with self._lock:
+            items = list(self._items.get(collection, {}).values())
+        return len(items), max((item.updated_at for item in items), default=0.0)
 
 
 class SqliteDocumentStore:
@@ -188,8 +199,16 @@ class SqliteDocumentStore:
         with self._lock:
             return self._connection.execute("DELETE FROM documents WHERE collection = ? AND key = ?", (collection, key)).rowcount > 0
 
-    def list(self, collection: str) -> list[StoredDocument]:
-        rows = self._rows("SELECT key, version, payload, updated_at FROM documents WHERE collection = ? ORDER BY updated_at, key", (collection,))
+    def list(self, collection: str, where: Mapping[str, str] | None = None) -> list[StoredDocument]:
+        """``where`` 조건은 SQLite에서 거른다(``json_extract``). 조건 문서만 역직렬화한다."""
+        sql = "SELECT key, version, payload, updated_at FROM documents WHERE collection = ?"
+        params: list[Any] = [collection]
+        for field, value in (where or {}).items():
+            if not _FIELD_NAME.fullmatch(field):
+                raise ValueError(f"unsupported filter field: {field!r}")
+            sql += f" AND json_extract(payload, '$.{field}') = ?"
+            params.append(value)
+        rows = self._rows(sql + " ORDER BY updated_at, key", tuple(params))
         return [StoredDocument(row[0], row[1], json.loads(row[2]), row[3]) for row in rows]
 
     def clear(self, collection: str) -> None:

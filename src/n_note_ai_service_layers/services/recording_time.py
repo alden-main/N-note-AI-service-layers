@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from n_note_ai_service_layers import settings
@@ -23,7 +23,7 @@ RecordingTimeSource = Literal["request", "audio_metadata", "received_at", "recor
 # 클라이언트·서버 시계 차이로 미래가 되는 녹음 시각을 얼마나 허용할지다.
 _FUTURE_TOLERANCE = timedelta(minutes=5)
 # mp4는 생성 시각이 없으면 1904-01-01, 일부 기기는 1970-01-01을 넣는다.
-_EARLIEST = datetime(2000, 1, 1, tzinfo=timezone.utc)
+_EARLIEST = datetime(2000, 1, 1, tzinfo=UTC)
 
 
 @dataclass(frozen=True)

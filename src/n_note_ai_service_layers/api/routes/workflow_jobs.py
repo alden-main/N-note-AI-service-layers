@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -21,10 +22,8 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
-from n_note_ai_service_layers.adapters.audio_preprocessing import audio_creation_time
-from n_note_ai_service_layers.services.clock import now_local, now_utc
-from n_note_ai_service_layers.services.recording_time import parse_recorded_at, resolve_recording_time
 from n_note_ai_service_layers import settings
+from n_note_ai_service_layers.adapters.audio_preprocessing import audio_creation_time
 from n_note_ai_service_layers.api import mappers
 from n_note_ai_service_layers.api.deps import get_nursing_note_workflow, get_workflow_context_flow, read_validated_audio
 from n_note_ai_service_layers.api.schemas import WorkflowJob
@@ -32,15 +31,18 @@ from n_note_ai_service_layers.api.state import get_services
 from n_note_ai_service_layers.contracts.audio import AudioInput, PreTranscribedAudio
 from n_note_ai_service_layers.contracts.clinical_context import ClinicalContextQuery
 from n_note_ai_service_layers.contracts.form_schema import FormSchema, SchemaStatus
+from n_note_ai_service_layers.observability import get_logger, log_event
+from n_note_ai_service_layers.services.clock import now_local, now_utc
 from n_note_ai_service_layers.services.context_flow import ClinicalContextFlow
 from n_note_ai_service_layers.services.jobs import TERMINAL_STATUSES, JobFailure, JobQueueFull, Progress
-from n_note_ai_service_layers.observability import get_logger, log_event
 from n_note_ai_service_layers.services.nursing_note_workflow import NursingNoteWorkflow, NursingNoteWorkflowResult, WorkflowStageError
+from n_note_ai_service_layers.services.recording_time import parse_recorded_at, resolve_recording_time
 
 router = APIRouter(tags=["nursing-note"])
 JOB_KIND = "nursing_note_workflow"
 QUEUE_FULL_RETRY_SECONDS = 5
-_SSE_POLL_SECONDS = 0.5
+# 이 worker 밖(다른 worker)에서 바뀐 작업 상태를 다시 읽어 보는 간격이다. 이 worker의 변경은 바로 알린다.
+_SSE_RECHECK_SECONDS = 2.0
 _SSE_KEEPALIVE_SECONDS = 15.0
 # 실패 단계별 오류 코드다. 본문·예외 메시지는 노출하지 않는다.
 _logger = get_logger("workflow_jobs")
@@ -169,8 +171,9 @@ def _multi_form_workflow_job(
             if isinstance(outcome, NursingNoteWorkflowResult):
                 try:
                     on_stage(index, "saving_draft")
-                    responses[index] = _save_draft(outcome, schema, audio.trace_id, patient_id, encounter_id)
-                    update_form(index, status="succeeded", stage=None, draft_id=responses[index]["draft_id"])
+                    response = _save_draft(outcome, schema, audio.trace_id, patient_id, encounter_id)
+                    responses[index] = response
+                    update_form(index, status="succeeded", stage=None, draft_id=response["draft_id"])
                     return
                 except Exception as exc:
                     outcome = exc
@@ -196,7 +199,7 @@ def _multi_form_workflow_job(
                     "status": "succeeded" if response else "failed",
                     "result": response, "error": None if response else states[index].get("error"),
                 }
-                for index, ((schema, _), response) in enumerate(zip(forms, responses))
+                for index, ((schema, _), response) in enumerate(zip(forms, responses, strict=True))
             ],
         }
     return work
@@ -269,6 +272,7 @@ async def prepare_workflow_forms(
     """요청한 양식의 활성 버전과 임상 문맥을 준비한다. 쓸 수 없는 양식은 작업을 만들기 전에 422로 거부한다."""
     trace_id = trace_id or str(uuid4())
     check_form_selection(schema_id, schema_ids, schema_version)
+    requested: list[tuple[str | None, str | None]]
     if schema_ids:
         requested = [(form_id, None) for form_id in requested_form_ids(schema_ids)]
     else:
@@ -311,15 +315,15 @@ def submit_workflow_job(
             for schema, _ in forms
         ]
         job, created = services.jobs.create(JOB_KIND, plan.trace_id, request, idempotency_key, {"forms": initial_forms})
-        work = lambda: _multi_form_workflow_job(workflow, forms, source, plan.patient_id, plan.encounter_id, job["job_id"])
+        work = _multi_form_workflow_job(workflow, forms, source, plan.patient_id, plan.encounter_id, job["job_id"]) if created else None
     else:
         schema, snapshot = plan.forms[0]
         request = {"schema_id": schema.schema_id, "schema_version": schema.version, "purpose": plan.purpose}
         job, created = services.jobs.create(JOB_KIND, plan.trace_id, request, idempotency_key)
-        work = lambda: _workflow_job(workflow, snapshot, source, schema, plan.patient_id, plan.encounter_id)
-    if created:
+        work = _workflow_job(workflow, snapshot, source, schema, plan.patient_id, plan.encounter_id) if created else None
+    if work is not None:
         try:
-            services.job_runner.submit(job["job_id"], work())
+            services.job_runner.submit(job["job_id"], work)
         except JobQueueFull as exc:
             services.jobs.update(job["job_id"], status="failed", error={"code": "queue_full", "message": str(exc)})
             raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": str(QUEUE_FULL_RETRY_SECONDS)}) from exc
@@ -343,26 +347,39 @@ async def stream_nursing_note_job(job_id: str, request: Request) -> StreamingRes
         raise HTTPException(status_code=404, detail="nursing note job not found")
 
     async def events() -> AsyncIterator[str]:
-        last: tuple[Any, Any] | None = None
-        idle = 0.0
-        while not await request.is_disconnected():
-            job = await run_in_threadpool(jobs.get, job_id)
-            if job is None:
-                return
-            # 여러 양식 작업은 양식별 진행(먼저 끝난 초안의 draft_id 포함)이 바뀌어도 알린다.
-            forms = tuple((form.get("status"), form.get("stage"), form.get("draft_id")) for form in job.get("forms") or ())
-            current = (job["status"], job["stage"], forms)
-            terminal = job["status"] in TERMINAL_STATUSES
-            if current != last:
-                last, idle = current, 0.0
-                event = job["status"] if terminal else "progress"
-                yield f"event: {event}\ndata: {json.dumps(job_response(job), ensure_ascii=False, default=str)}\n\n"
-                if terminal:
+        # 이 worker에서 상태가 바뀌면 바로 깨어난다. 다른 worker(다중 worker)가 바꾼 상태는 _SSE_RECHECK_SECONDS마다 읽어 본다.
+        loop = asyncio.get_running_loop()
+        changed = asyncio.Event()
+        def notify() -> None:
+            loop.call_soon_threadsafe(changed.set)
+
+        unsubscribe = jobs.subscribe(job_id, notify)
+        try:
+            last: tuple[Any, ...] | None = None
+            last_sent = time.monotonic()
+            while not await request.is_disconnected():
+                changed.clear()
+                job = await run_in_threadpool(jobs.get, job_id)
+                if job is None:
                     return
-            elif idle >= _SSE_KEEPALIVE_SECONDS:
-                idle = 0.0
-                yield ": keep-alive\n\n"
-            await asyncio.sleep(_SSE_POLL_SECONDS)
-            idle += _SSE_POLL_SECONDS
+                # 여러 양식 작업은 양식별 진행(먼저 끝난 초안의 draft_id 포함)이 바뀌어도 알린다.
+                forms = tuple((form.get("status"), form.get("stage"), form.get("draft_id")) for form in job.get("forms") or ())
+                current = (job["status"], job["stage"], forms)
+                terminal = job["status"] in TERMINAL_STATUSES
+                if current != last:
+                    last, last_sent = current, time.monotonic()
+                    event = job["status"] if terminal else "progress"
+                    yield f"event: {event}\ndata: {json.dumps(job_response(job), ensure_ascii=False, default=str)}\n\n"
+                    if terminal:
+                        return
+                elif time.monotonic() - last_sent >= _SSE_KEEPALIVE_SECONDS:
+                    last_sent = time.monotonic()
+                    yield ": keep-alive\n\n"
+                try:
+                    await asyncio.wait_for(changed.wait(), timeout=_SSE_RECHECK_SECONDS)
+                except TimeoutError:
+                    pass
+        finally:
+            unsubscribe()
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

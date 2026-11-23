@@ -7,7 +7,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from n_note_ai_service_layers.adapters.document_store import SqliteDocumentStore, VersionConflict
+from n_note_ai_service_layers.adapters.document_store import InMemoryDocumentStore, SqliteDocumentStore, VersionConflict
 
 
 class SqliteDocumentStoreTests(unittest.TestCase):
@@ -40,6 +40,24 @@ class SqliteDocumentStoreTests(unittest.TestCase):
         self.store.put("c", "k", {"v": 2}, expected_version=version)
         with self.assertRaises(VersionConflict):
             self.store.put("c", "k", {"v": 3}, expected_version=version)
+
+
+class ListFilterTests(unittest.TestCase):
+    def test_both_stores_filter_by_top_level_field_in_update_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for store in (InMemoryDocumentStore(), SqliteDocumentStore(Path(directory) / "s.sqlite")):
+                with self.subTest(store=type(store).__name__):
+                    store.put("h", "a", {"delivery_status": "pending", "n": 1})
+                    store.put("h", "b", {"delivery_status": "accepted", "n": 2})
+                    store.put("h", "c", {"delivery_status": "pending", "n": 3})
+                    self.assertEqual([item.key for item in store.list("h", {"delivery_status": "pending"})], ["a", "c"])
+                    self.assertEqual([item.key for item in store.list("h")], ["a", "b", "c"])
+
+    def test_filter_field_must_be_an_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteDocumentStore(Path(directory) / "s.sqlite")
+            with self.assertRaises(ValueError):
+                store.list("h", {"x') OR 1=1 --": "y"})
 
 
 if __name__ == "__main__":

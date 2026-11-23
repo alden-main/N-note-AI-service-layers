@@ -9,8 +9,8 @@ from fastapi.testclient import TestClient
 from n_note_ai_service_layers.adapters.openai_stt import OpenAiSpeechToTextAdapter
 from n_note_ai_service_layers.api import app, get_nursing_note_workflow, get_services, get_speech_to_text_provider, get_workflow_context_flow
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
-from n_note_ai_service_layers.services.recording_sessions import RecordingSessionStore
-from test_multi_form_workflow import BASE, _Context, _Stt, _job_result, _workflow
+from n_note_ai_service_layers.services.recording_sessions import RecordingSessionError, RecordingSessionStore
+from test_multi_form_workflow import BASE, _Context, _job_result, _Stt, _workflow
 
 # 테스트가 상태를 직접 확인·초기화하는 저장소다.
 store = get_services().handoff_store
@@ -125,8 +125,9 @@ class RecordingSessionStoreTests(unittest.TestCase):
         now = [0.0]
         sessions = RecordingSessionStore(idle_seconds=10, max_sessions=1, max_chunks=5, clock=lambda: now[0])
         first = sessions.create("p", "e", None)
-        with self.assertRaises(Exception):
+        with self.assertRaises(RecordingSessionError) as raised:
             sessions.create("p", "e", None)
+        self.assertEqual(raised.exception.code, "too_many_sessions")
         now[0] = 11
         self.assertIsNone(sessions.get(first.session_id))
         self.assertIsNotNone(sessions.create("p", "e", None))

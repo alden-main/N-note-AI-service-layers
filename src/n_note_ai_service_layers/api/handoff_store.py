@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers.adapters.document_store import DocumentStore
 from n_note_ai_service_layers.api.schemas import BridgeHandoffRequest, HandoffEnvelope
+from n_note_ai_service_layers.services.clock import now_utc
 
 HANDOFF_COLLECTION = "bridge_handoffs"
 
@@ -36,8 +36,9 @@ class HandoffStore:
         return HandoffEnvelope.model_validate(stored.payload) if stored else None
 
     def list(self, delivery_status: str) -> list[HandoffEnvelope]:
-        items = (HandoffEnvelope.model_validate(item.payload) for item in self.store.list(HANDOFF_COLLECTION))
-        return sorted((item for item in items if item.delivery_status == delivery_status), key=lambda item: item.created_at)
+        """상태별 핸드오프를 생성 시각순으로 돌려준다. 상태 조건은 저장소가 거른다(다른 상태 문서는 읽지 않는다)."""
+        items = (HandoffEnvelope.model_validate(item.payload) for item in self.store.list(HANDOFF_COLLECTION, {"delivery_status": delivery_status}))
+        return sorted(items, key=lambda item: item.created_at)
 
     def update(self, envelope: HandoffEnvelope) -> HandoffEnvelope:
         self.store.put(HANDOFF_COLLECTION, envelope.handoff_id, envelope.model_dump(mode="json"))

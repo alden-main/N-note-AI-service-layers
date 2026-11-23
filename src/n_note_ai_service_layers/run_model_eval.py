@@ -22,11 +22,11 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 
-from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers import prompts, settings
 from n_note_ai_service_layers.contracts.audio import AudioInput, Transcript
 from n_note_ai_service_layers.contracts.draft import DraftResult
 from n_note_ai_service_layers.contracts.form_schema import FormSchema
+from n_note_ai_service_layers.services.clock import now_utc
 from n_note_ai_service_layers.services.draft_document import format_value, is_filled
 
 AUDIO_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".webm": "audio/webm", ".ogg": "audio/ogg", ".flac": "audio/flac"}
@@ -163,7 +163,7 @@ def run_case(case: EvalCase, stt_provider: Any | None = None) -> dict[str, Any]:
     context_flow = api.get_workflow_context_flow()
     snapshot = context_flow.build(ClinicalContextQuery("EVAL-PATIENT", "EVAL-ENCOUNTER", purpose, now_utc(), schema_id, trace_id, None))
     schema = context_flow.registry.resolve_active(schema_id, purpose, None)
-    if uses_audio:
+    if case.audio_path is not None:
         audio = AudioInput(case.audio_path.read_bytes(), case.audio_path.name, AUDIO_TYPES[case.audio_path.suffix.lower()], trace_id, case.language_hint)
     else:
         audio = AudioInput(b"transcript-fixture", "transcript.txt", "audio/wav", trace_id, case.language_hint)
